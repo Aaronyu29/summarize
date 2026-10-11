@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # summarize release helper
-# Phases: gates | build | bun | chrome | firefox | verify | publish | publish-cli | smoke | promote | tag | github | homebrew | deprecate | all
+# Phases: gates | build | bun | chrome | firefox | pack | verify | smoke | promote | tag | github | homebrew | deprecate | all
 
 # npm@11 warns on unknown env configs; keep CI/logs clean.
 unset npm_config_manage_package_manager_versions || true
@@ -22,16 +22,6 @@ banner() {
 run() {
   echo "+ $*"
   "$@"
-}
-
-publish_package() {
-  echo "+ pnpm $*"
-  # pnpm 11 requires its OTP argument; append it only after logging.
-  if [ -n "${NPM_CONFIG_OTP:-}" ]; then
-    pnpm "$@" --otp "$NPM_CONFIG_OTP"
-  else
-    pnpm "$@"
-  fi
 }
 
 require_clean_git() {
@@ -92,24 +82,14 @@ if (expectedCoreDep) {
 NODE
 }
 
-ensure_npm_version_absent() {
-  local package_name version
-  package_name="$1"
-  version="$2"
-  if npm view "${package_name}@${version}" version >/dev/null 2>&1; then
-    echo "${package_name}@${version} already exists on npm; never republish an existing version."
-    exit 1
-  fi
-}
-
 require_npm_auth() {
   if npm whoami >/dev/null 2>&1; then
     return
   fi
   cat >&2 <<'EOF'
 npm auth failed.
-Run release publish from the tmux/1Password npm workflow with a temporary npmrc
-(NPM_CONFIG_USERCONFIG) or a valid npm session. Do not use raw `npm publish`.
+Run this emergency deprecation from the tmux/1Password npm workflow with a
+temporary npmrc (NPM_CONFIG_USERCONFIG) or a valid npm session.
 EOF
   exit 1
 }
@@ -161,26 +141,28 @@ phase_bun() {
   run pnpm build:bun:test
 }
 
-phase_verify_pack() {
-  banner "Verify pack"
+phase_pack() {
+  banner "Pack and verify manifests"
   require_lockstep_versions
-  local version tmp_dir tarball core_tarball install_dir node_path slides_dir fixture
-  version="$(node -p 'require("./package.json").version')"
+  local version
+  version="$(package_version)"
+  PACK_DIR="${PACK_DIR:-$(mktemp -d)}"
+  mkdir -p "$PACK_DIR"
+  CORE_TARBALL="$PACK_DIR/steipete-summarize-core-${version}.tgz"
+  CLI_TARBALL="$PACK_DIR/steipete-summarize-${version}.tgz"
+  run pnpm -C packages/core pack --pack-destination "$PACK_DIR"
+  run pnpm pack --pack-destination "$PACK_DIR"
+  verify_package_manifest "$CORE_TARBALL" "@steipete/summarize-core" "$version"
+  verify_package_manifest "$CLI_TARBALL" "@steipete/summarize" "$version" "$version"
+}
+
+phase_verify_pack() {
+  banner "Verify pack installation"
+  phase_pack
+  local tmp_dir core_tarball tarball install_dir node_path slides_dir fixture
   tmp_dir="$(mktemp -d)"
-  core_tarball="${tmp_dir}/steipete-summarize-core-${version}.tgz"
-  tarball="${tmp_dir}/steipete-summarize-${version}.tgz"
-  run pnpm -C packages/core pack --pack-destination "${tmp_dir}"
-  run pnpm pack --pack-destination "${tmp_dir}"
-  if [ ! -f "${core_tarball}" ]; then
-    echo "Missing ${core_tarball}"
-    exit 1
-  fi
-  if [ ! -f "${tarball}" ]; then
-    echo "Missing ${tarball}"
-    exit 1
-  fi
-  verify_package_manifest "${core_tarball}" "@steipete/summarize-core" "${version}"
-  verify_package_manifest "${tarball}" "@steipete/summarize" "${version}" "${version}"
+  core_tarball="$CORE_TARBALL"
+  tarball="$CLI_TARBALL"
   install_dir="${tmp_dir}/install"
   run mkdir -p "${install_dir}"
   run npm install --prefix "${install_dir}" "${core_tarball}" "${tarball}"
@@ -196,7 +178,6 @@ phase_verify_pack() {
     echo "Installed package FFmpeg WebAssembly fallback produced no slides."
     exit 1
   fi
-  VERIFIED_CORE_TARBALL="$core_tarball"
   echo "ok"
 }
 
@@ -238,44 +219,9 @@ phase_firefox() {
   echo "Firefox extension: ${zip_path}"
 }
 
-phase_publish() {
-  banner "Publish to npm"
-  require_clean_git
-  require_lockstep_versions
-  require_npm_auth
-  local version
-  version="$(package_version)"
-  ensure_npm_version_absent "@steipete/summarize-core" "${version}"
-  ensure_npm_version_absent "@steipete/summarize" "${version}"
-  phase_verify_pack
-  publish_package -C packages/core publish --tag next --access public
-  publish_package publish --tag next --access public
-  phase_smoke
-  phase_promote_latest
-}
-
-phase_publish_cli() {
-  banner "Resume CLI publish"
-  require_clean_git
-  require_lockstep_versions
-  require_npm_auth
-  local version expected_integrity published_integrity
-  version="$(package_version)"
-  ensure_npm_version_absent "@steipete/summarize" "${version}"
-  phase_verify_pack
-  expected_integrity="$(node -e '
-    const fs = require("node:fs");
-    const crypto = require("node:crypto");
-    console.log("sha512-" + crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
-  ' "$VERIFIED_CORE_TARBALL")"
-  published_integrity="$(npm view "@steipete/summarize-core@${version}" dist.integrity)"
-  if [ "$published_integrity" != "$expected_integrity" ]; then
-    echo "Published @steipete/summarize-core@${version} does not match the verified local tarball; refusing to resume."
-    exit 1
-  fi
-  publish_package publish --tag next --access public
-  phase_smoke
-  phase_promote_latest
+phase_ci_publish_only() {
+  echo "npm publishing is owned by .github/workflows/release.yml. Push a signed annotated release tag, or rerun the failed Release jobs in GitHub Actions." >&2
+  exit 1
 }
 
 phase_smoke() {
@@ -292,7 +238,7 @@ phase_smoke() {
   fi
   if [ "${core_dep}" != "${version}" ]; then
     echo "Published CLI depends on @steipete/summarize-core=${core_dep:-missing}; expected ${version}"
-    echo "Emergency path: do not tag/release. Deprecate this version and ship a patch."
+    echo "Emergency path: deprecate this version and ship a patch."
     exit 1
   fi
   case "${core_dep}" in
@@ -314,15 +260,19 @@ phase_smoke() {
   echo "ok"
 }
 
-phase_promote_latest() {
-  banner "Promote npm latest"
-  require_npm_auth
-  local version
+phase_verify_dist_tag() {
+  banner "Verify npm release dist-tag (read-only)"
+  local version tag package_name actual
   version="$(package_version)"
-  run npm dist-tag add "@steipete/summarize-core@${version}" latest
-  run npm dist-tag add "@steipete/summarize@${version}" latest
-  run npm view @steipete/summarize dist-tags.latest
-  run npm view @steipete/summarize-core dist-tags.latest
+  tag=latest
+  [[ "$version" != *-* ]] || tag=next
+  for package_name in @steipete/summarize-core @steipete/summarize; do
+    actual="$(npm view "$package_name" "dist-tags.$tag")"
+    [[ "$actual" == "$version" ]] || {
+      echo "$package_name $tag is $actual, expected $version" >&2
+      exit 1
+    }
+  done
 }
 
 phase_deprecate() {
@@ -344,8 +294,8 @@ phase_tag() {
   require_clean_git
   local version
   version="$(node -p 'require("./package.json").version')"
-  run git tag -a "v${version}" -m "v${version}"
-  run git push --tags
+  run git tag -s "v${version}" -m "v${version}"
+  run git push origin "refs/tags/v${version}"
 }
 
 phase_github() {
@@ -415,11 +365,11 @@ case "$PHASE" in
   gates) phase_gates ;;
   build) phase_build ;;
   bun) phase_bun ;;
+  pack) phase_pack ;;
   verify) phase_verify_pack ;;
-  publish) phase_publish ;;
-  publish-cli) phase_publish_cli ;;
+  publish | publish-cli) phase_ci_publish_only ;;
   smoke) phase_smoke ;;
-  promote) phase_promote_latest ;;
+  promote) phase_verify_dist_tag ;;
   deprecate) phase_deprecate ;;
   tag) phase_tag ;;
   github) phase_github ;;
@@ -429,9 +379,9 @@ case "$PHASE" in
   all)
     phase_gates
     phase_build
-    phase_publish
+    phase_verify_pack
     phase_tag
-    echo "Tag pushed. The Release workflow now builds, signs, notarizes, verifies, and publishes the GitHub Release."
+    echo "Tag pushed. The Release workflow now builds, signs, notarizes, verifies, and publishes npm packages and the GitHub Release."
     ;;
   *)
     echo "Usage: scripts/release.sh [phase]"
@@ -441,17 +391,17 @@ case "$PHASE" in
     echo "  build     pnpm build + Bun/Chrome/Firefox artifacts"
     echo "  bun       build + smoke Bun release tarballs"
     echo "  verify    pack + install tarball + --help"
-    echo "  publish   pnpm publish --tag next, smoke exact version, then promote latest"
-    echo "  publish-cli resume after core publish, requiring identical verified core bytes"
+    echo "  pack      pack core + CLI and verify manifests (PACK_DIR selects output)"
+    echo "  publish / publish-cli  retired; publishing runs only in GitHub Actions"
     echo "  smoke     npm exact-version metadata + pnpm dlx --version/--help"
-    echo "  promote   npm dist-tag add current version as latest"
+    echo "  promote   verify current version dist-tag (read-only)"
     echo "  deprecate deprecate @steipete/summarize@BAD_VERSION"
-    echo "  tag       git tag vX.Y.Z + push tags"
+    echo "  tag       signed annotated git tag vX.Y.Z + push exact tag"
     echo "  github    verify the CI-published GitHub Release and required assets"
     echo "  homebrew  verify Homebrew/core formula has current version"
     echo "  chrome    build + zip Chrome extension"
     echo "  firefox   build + zip Firefox extension"
-    echo "  all       gates + build + verify + publish + tag (CI publishes GitHub Release)"
+    echo "  all       gates + build + verify + signed tag (CI publishes npm + GitHub Release)"
     exit 2
     ;;
 esac

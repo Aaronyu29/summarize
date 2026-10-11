@@ -2,6 +2,10 @@
   "name": "@steipete/summarize",
   "version": "0.25.2",
   "description": "Link → clean text → summary.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/steipete/summarize.git"
+  },
   "bin": {
     "summarize": "./dist/cli.js",
     "summarizer": "./dist/cli.js"
@@ -50,7 +54,7 @@
     "lint": "oxlint --type-aware --tsconfig tsconfig.build.json --config .oxlintrc.json .",
     "lint:fix": "oxlint --type-aware --tsconfig tsconfig.build.json --config .oxlintrc.json --fix . && pnpm format",
     "prepare": "pnpm build",
-    "prepublishOnly": "node scripts/require-pnpm-publish.mjs",
+    "prepublishOnly": "node scripts/refuse-source-publish.mjs",
     "release": "bash scripts/release.sh",
     "s": "pnpm dev:cli",
     "summarize": "pnpm dev:cli",

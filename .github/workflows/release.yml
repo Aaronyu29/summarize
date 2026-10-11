@@ -27,7 +27,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate tag, source, npm, and CI
+      - name: Validate tag, source, and CI
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -66,8 +66,6 @@ jobs:
             echo "CHANGELOG.md lacks a dated $version section" >&2
             exit 1
           }
-          [[ "$(npm view "@steipete/summarize@$version" version)" == "$version" ]]
-          [[ "$(npm view "@steipete/summarize-core@$version" version)" == "$version" ]]
           successful_ci=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$target_sha&status=completed&per_page=100" \
             --jq '[.workflow_runs[] | select(.event == "push" and .conclusion == "success")] | length')
@@ -81,6 +79,20 @@ jobs:
           fi
           echo "target-sha=$target_sha" >>"$GITHUB_OUTPUT"
           echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Build and validate npm package state
+        run: |
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+          pnpm build
+          PACK_DIR="$RUNNER_TEMP/npm-pack" scripts/release.sh pack
+          node scripts/npm-release.mjs check "$RUNNER_TEMP/npm-pack"
 
   build:
     name: Build, sign, and notarize
@@ -271,9 +283,44 @@ jobs:
             "$ARCH" \
             "$VERSION"
 
+  npm:
+    name: Publish verified npm packages
+    needs: [validate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout frozen tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.target-sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Build and pack
+        run: |
+          set -euo pipefail
+          # Trusted publishing requires npm >= 11.5.1. Pin the verified CLI.
+          npm install --global npm@11.20.0
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+          pnpm build
+          PACK_DIR="$RUNNER_TEMP/npm-pack" scripts/release.sh pack
+
+      - name: Smoke, publish core then CLI, and verify provenance
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc
+        run: env -u NODE_AUTH_TOKEN -u NPM_TOKEN node scripts/npm-release.mjs publish "$RUNNER_TEMP/npm-pack"
+
   publish:
     name: Publish verified GitHub Release
-    needs: [validate, build, verify]
+    needs: [validate, build, verify, npm]
     runs-on: ubuntu-latest
     permissions:
       actions: read

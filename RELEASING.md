@@ -22,7 +22,7 @@ Homebrew/core autobumps independently. Do not block a completed release on that 
 0. Preflight
    - Clean git: `git status`
    - Auth: `gh auth status`
-   - npm auth must use the `$npm` tmux/1Password workflow with a temporary npmrc (`NPM_CONFIG_USERCONFIG`). Do not use raw `npm publish`.
+   - npm trusted publishers must be configured for both packages: GitHub repository `steipete/summarize`, workflow `release.yml`, no environment. Use the `$npm` tmux/1Password helper for one-time configuration; release publishing needs no npm token.
 
 1. Bump version + notes
    - Update version in:
@@ -51,40 +51,35 @@ Homebrew/core autobumps independently. Do not block a completed release on that 
    - `cd apps/chrome-extension/.output/firefox-mv3 && zip -r -FS ../../../../dist-firefox/summarize-firefox-extension-v<ver>.zip . && cd -`
    - Verify: `unzip -l dist-firefox/summarize-firefox-extension-v<ver>.zip | head -20`
 
-6. Publish to npm + smoke + promote
-   - Use the helper only:
-     ```bash
-     scripts/release.sh publish
-     ```
-   - This publishes core first, then CLI, both with `pnpm publish --tag next`. The CLI's prepublish guard refuses to proceed until that exact core version is visible on npm.
-   - It blocks raw `npm publish` via `prepublishOnly`, verifies tarball metadata has no `workspace:*`, smokes the exact version with `pnpm dlx`, and only then promotes both packages to `latest`.
-   - If core published but the CLI was blocked before upload while npm propagated the new version, resume with `scripts/release.sh publish-cli`. It verifies the packages again, requires the published core integrity to match the local tarball exactly, publishes only the missing CLI version, then smokes and promotes both packages. Use a clean checkout of the same source; a changed core package is refused.
-   - If exact-version smoke fails, do not tag or create a GitHub Release. Deprecate the broken CLI version and ship a patch:
-     ```bash
-     BAD_VERSION=<bad-version> DEPRECATE_MESSAGE="Broken package metadata. Use a newer version." scripts/release.sh deprecate
-     ```
+6. Verify local packages
+   - `scripts/release.sh verify` packs with pnpm, checks both manifests (including the exact core dependency and no `workspace:` references), installs both tarballs into a temporary prefix, and exercises the CLI and FFmpeg fallback.
+   - Local builds are proof only; CI rebuilds the frozen tagged source.
 
-7. Tag
+7. Push a signed annotated tag after the release commit has green push CI
 
    ```bash
-   ver="$(node -p 'require(\"./package.json\").version')"
-   git tag -a "v${ver}" -m "v${ver}"
-   git push --tags
+   scripts/release.sh tag
    ```
 
-   - The tag must be annotated, match all three version sources, point to a commit reachable from `main`, and already have successful push CI.
-   - Pushing the tag triggers `.github/workflows/release.yml`. Do not upload local `dist-bun` artifacts.
+   - Configure Git SSH signing with the `Release - Git tag SSH signing key - all repos` 1Password item through the approved secret workflow. The helper uses `git tag -s` and pushes only the release tag.
+   - The tag must match all three version sources, point to a commit reachable from `main`, and already have successful push CI.
+   - `scripts/release.sh all` runs the local gates, builds proof artifacts, verifies packages, and pushes this signed tag.
 
-8. GitHub Release + assets
+8. CI publishes npm and GitHub Release; verify locally afterward
+   - `.github/workflows/release.yml` validates the tag and npm state, builds and notarizes both macOS binaries, and verifies each archive on its native architecture without signing credentials.
+   - Each verifier checks `otool -l` `LC_BUILD_VERSION` against the macOS 13.0 baseline. Use upstream Bun; Homebrew builds can carry a newer minimum OS version.
+   - After both macOS verifiers pass, the npm job rebuilds and packs core and CLI with the frozen pnpm lockfile. It checks manifests and smoke-installs both exact tarballs before publishing either one.
+   - npm trusted publishing uses GitHub OIDC with Node 24 and npm >=11.5.1, without `NODE_AUTH_TOKEN` or a long-lived npm token. Stable releases publish directly to `latest`; prereleases use `next`. OIDC cannot promote dist-tags afterward.
+   - Existing versions are accepted only when their integrity and downloaded bytes exactly match this run's build. A mismatch or registry error fails the release. A rerun can resume after core succeeds and CLI fails without republishing core.
+   - CI checks both npm provenance attestations and runs `npm audit signatures` before creating the GitHub Release from the exact verified archives and checksums.
+   - Rerun failed Release jobs in GitHub Actions for a partial publication. Never retag a release after any package or artifact has been published; fix forward with a patch release if the frozen source must change.
 
    ```bash
+   scripts/release.sh smoke
+   scripts/release.sh promote # read-only dist-tag verification
    scripts/release.sh github
+   gh release view v<ver> --json body --jq .body
    ```
-
-   - The Release workflow imports the personal Developer ID p12 into an ephemeral keychain, builds and notarizes both Bun executables, freezes all four archives plus checksums into one Actions artifact, and verifies each macOS archive on its native architecture without signing credentials.
-   - Each verifier checks `otool -l` `LC_BUILD_VERSION` and rejects a minimum OS version above the documented macOS 13.0 baseline. Use upstream Bun; Homebrew builds can carry a newer minimum OS version.
-   - A separate publisher creates the GitHub Release only after both verifiers pass. `scripts/release.sh github` is verification-only and refuses a missing or incomplete CI-published release.
-   - Verify notes render with real newlines: `gh release view v<ver> --json body --jq .body`.
 
 9. Optional Homebrew/core follow-up
    - Homebrew/core is autobumped from the GitHub Release; this can lag the npm/GitHub release and does not block closeout.
@@ -97,14 +92,18 @@ Homebrew/core autobumps independently. Do not block a completed release on that 
 
 ## npm (npmjs)
 
-Notes:
+The tag-triggered Release workflow is the only npm publisher. Source-directory publishing and the legacy `publish` / `publish-cli` phases are disabled; there is no local fallback. `pnpm pack` rewrites workspace dependencies before CI publishes the resulting tarballs with `npm publish --ignore-scripts`.
 
-- npm may prompt for browser auth when `npm config get auth-type` is `web`. For scripted publishes, create auth in the `$npm` tmux/1Password workflow and pass a fresh code as `NPM_CONFIG_OTP` or the supported `NPM_OTP` alias only when needed. The helper uses npm's environment setting and pnpm's required publish argument without including the code in command logs.
-- Publishing with raw `npm publish` is forbidden here. Use `pnpm publish` only; it rewrites `workspace:*` dependencies in the packed CLI metadata.
-- `scripts/release.sh publish` uses `next` first, then exact-version smoke, then `latest`. The annotated tag comes after that smoke passes; CI owns the GitHub Release.
-- `prepare` runs `pnpm build` automatically during publish.
+For one-time trusted-publisher setup, run the `$npm` helper in the shared `op-work` tmux task window for each of `@steipete/summarize-core` and `@steipete/summarize`:
 
-Helper: `scripts/release.sh` (phases: `gates|build|bun|chrome|firefox|verify|publish|publish-cli|smoke|promote|tag|github|homebrew|deprecate|all`).
+```bash
+npm-service.sh -- trust github <package> --repo steipete/summarize --file release.yml --allow-publish --yes
+npm-service.sh -- trust list <package> --json
+```
+
+Do not set an environment name unless the workflow also uses that environment. Configuration uses the saved npm session/OTP; CI publication uses OIDC only. `scripts/release.sh smoke`, `promote`, and `github` are read-only verification phases. `deprecate` remains an explicit emergency registry operation and requires the `$npm` credential workflow.
+
+Helper phases: `gates|build|bun|chrome|firefox|pack|verify|smoke|promote|tag|github|homebrew|deprecate|all`.
 
 ## Homebrew (Bun-compiled binary w/ bytecode) - details
 
@@ -126,7 +125,7 @@ Goal:
    - Optional: run one real file/link summary.
 
 3. GitHub Release (when approved)
-   - Push the annotated `v<ver>` tag. The Release workflow is the only supported publisher.
+   - Push the signed annotated `v<ver>` tag. The Release workflow is the only supported publisher.
    - Each Bun executable is signed after compilation with `Developer ID Application: Peter Steinberger (Y5PE65HELJ)`, identifier `com.steipete.summarize.cli`, hardened runtime, a trusted timestamp, and the two Bun JIT entitlements in `scripts/macos-release.entitlements`.
    - Apple notarization is submitted for each signed executable. Raw Mach-O files cannot carry stapled tickets, so both CI verifiers require `codesign --check-notarization -R=notarized` online.
    - The browser extension zips and npm tarballs contain no Mach-O and stay outside Apple signing.

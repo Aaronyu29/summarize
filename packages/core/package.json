@@ -2,6 +2,11 @@
   "name": "@steipete/summarize-core",
   "version": "0.25.2",
   "description": "Summarize core library (content extraction + prompts).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/steipete/summarize.git",
+    "directory": "packages/core"
+  },
   "files": [
     "dist",
     "README.md"
@@ -83,7 +88,7 @@
   "scripts": {
     "build": "pnpm clean && tsc -p tsconfig.build.json && node scripts/package-ffmpeg-wasm.mjs",
     "clean": "node ../../scripts/clean.mjs dist",
-    "prepublishOnly": "node ../../scripts/require-pnpm-publish.mjs",
+    "prepublishOnly": "node ../../scripts/refuse-source-publish.mjs",
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
   },
   "dependencies": {
