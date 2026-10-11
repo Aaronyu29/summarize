@@ -287,7 +287,7 @@ jobs:
     name: Publish verified npm packages
     needs: [validate, verify]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       id-token: write
       contents: read

@@ -37,8 +37,9 @@ export async function checkAll(built, request = fetch) {
   return existing;
 }
 
-async function waitForPackage(pkg) {
-  for (let attempt = 0; attempt < 12; attempt++) {
+export async function waitForPackage(pkg) {
+  // npm processes new publications asynchronously, sometimes for several minutes.
+  for (let attempt = 0; attempt < 120; attempt++) {
     const metadata = await checkExisting(pkg);
     if (metadata) return metadata;
     await new Promise((done) => setTimeout(done, 5000));

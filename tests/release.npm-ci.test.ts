@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { checkAll, checkExisting, integrityOf } from "../scripts/npm-release.mjs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { checkAll, checkExisting, integrityOf, waitForPackage } from "../scripts/npm-release.mjs";
 
 const bytes = Buffer.from("synthetic package");
 const pkg = { name: "@steipete/summarize-core", version: "0.0.0", integrity: integrityOf(bytes) };
@@ -90,5 +90,33 @@ describe("npm release recovery", () => {
     const source = readFileSync(resolve("scripts/release.sh"), "utf8");
     expect(source).not.toContain("npm dist-tag add");
     expect(source).not.toContain("pnpm publish");
+  });
+});
+
+describe("npm publication visibility", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("waits beyond a minute for an asynchronously processed publication", async () => {
+    vi.useFakeTimers();
+    const request = vi.fn();
+    for (let i = 0; i < 24; i++) request.mockResolvedValueOnce(new Response(null, { status: 404 }));
+    request
+      .mockResolvedValueOnce(Response.json(metadata))
+      .mockResolvedValueOnce(new Response(bytes));
+    vi.stubGlobal("fetch", request);
+    const waiting = waitForPackage(pkg);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await expect(waiting).resolves.toEqual(metadata);
+  });
+
+  it("bounds the processing wait at ten minutes", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 404 })));
+    const waiting = expect(waitForPackage(pkg)).rejects.toThrow("not visible after publishing");
+    await vi.advanceTimersByTimeAsync(600_000);
+    await waiting;
   });
 });
