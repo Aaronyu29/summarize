@@ -26,6 +26,18 @@ cat >"$MOCK_BIN/lipo" <<'EOF'
 echo "${MOCK_ARCH:-arm64}"
 EOF
 
+cat >"$MOCK_BIN/otool" <<'EOF'
+#!/bin/sh
+cat <<META
+Load command 1
+      cmd LC_BUILD_VERSION
+  cmdsize 32
+ platform 1
+    minos ${MOCK_MINOS:-13.0}
+      sdk 15.0
+META
+EOF
+
 cat >"$MOCK_BIN/codesign" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -188,5 +200,16 @@ if env \
   "$ROOT/scripts/verify-macos-release.sh" "$TEST_DIR/release.tar.gz" arm64 0.21.6 >/dev/null 2>&1; then
   fail "verifier accepted the wrong embedded requirement"
 fi
+
+for minos in 13.1 14.0 invalid; do
+  if env -u MACOS_SIGNING_P12 -u MACOS_SIGNING_P12_PASSWORD \
+    -u ASC_KEY_ID -u ASC_ISSUER_ID -u ASC_PRIVATE_KEY_P8 \
+    -u CODESIGN_IDENTITY -u CODESIGN_KEYCHAIN -u ASC_PRIVATE_KEY_PATH \
+    PATH="$MOCK_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+    MOCK_LOG="$LOG" MOCK_MINOS="$minos" \
+    "$ROOT/scripts/verify-macos-release.sh" "$TEST_DIR/release.tar.gz" arm64 0.21.6 >/dev/null 2>&1; then
+    fail "verifier accepted unsupported minimum macOS version $minos"
+  fi
+done
 
 echo "macOS release contract tests passed"

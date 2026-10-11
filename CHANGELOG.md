@@ -1,9 +1,15 @@
 # Changelog
 
-## 0.25.2 - Unreleased
+## 0.25.3 - Unreleased
+
+## 0.25.2 - 2026-10-11
+
+**Highlights:** security fixes for Sharp, shell-quote, and source-map-js, plus refreshed provider and browser dependencies.
 
 - Maintenance: update stabilized provider, HTML sanitization, browser media, image tooling, and test dependencies, including security fixes for Sharp, shell-quote, and source-map-js, while retaining Node 24 and the seven-day adoption hold.
 - Maintenance: refresh stabilized provider, browser media, Chrome typings, and Oxc tooling dependencies while retaining Node 24 and the seven-day adoption hold (#508, thanks @dependabot).
+
+- Release: verify that both standalone macOS binaries preserve the documented macOS 13 minimum before publication.
 
 ## 0.25.1 - 2026-10-03
 

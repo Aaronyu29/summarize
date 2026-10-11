@@ -82,6 +82,7 @@ Homebrew/core autobumps independently. Do not block a completed release on that 
    ```
 
    - The Release workflow imports the personal Developer ID p12 into an ephemeral keychain, builds and notarizes both Bun executables, freezes all four archives plus checksums into one Actions artifact, and verifies each macOS archive on its native architecture without signing credentials.
+   - Each verifier checks `otool -l` `LC_BUILD_VERSION` and rejects a minimum OS version above the documented macOS 13.0 baseline. Use upstream Bun; Homebrew builds can carry a newer minimum OS version.
    - A separate publisher creates the GitHub Release only after both verifiers pass. `scripts/release.sh github` is verification-only and refuses a missing or incomplete CI-published release.
    - Verify notes render with real newlines: `gh release view v<ver> --json body --jq .body`.
 
