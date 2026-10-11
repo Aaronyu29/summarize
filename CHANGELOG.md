@@ -2,6 +2,7 @@
 
 ## 0.25.2 - Unreleased
 
+- Maintenance: update stabilized provider, HTML sanitization, browser media, image tooling, and test dependencies, including security fixes for Sharp, shell-quote, and source-map-js, while retaining Node 24 and the seven-day adoption hold.
 - Maintenance: refresh stabilized provider, browser media, Chrome typings, and Oxc tooling dependencies while retaining Node 24 and the seven-day adoption hold (#508, thanks @dependabot).
 
 ## 0.25.1 - 2026-10-03
