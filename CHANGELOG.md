@@ -2,6 +2,8 @@
 
 ## 0.25.3 - Unreleased
 
+- Maintenance: refresh stabilized provider, localization, browser media, Preact, Oxc, and GitHub Actions dependencies; migrate picker style types for Preact 11 while retaining Node 24 and the seven-day adoption hold (#515, #516, thanks @dependabot).
+
 ## 0.25.2 - 2026-10-11
 
 **Highlights:** security fixes for Sharp, shell-quote, and source-map-js, plus refreshed provider and browser dependencies.

@@ -1,4 +1,4 @@
-import type { JSX } from "preact";
+import type { CSSProperties } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveText, type LocalizedText } from "../lib/i18n";
 import { useLocale } from "./localized-text";
@@ -25,7 +25,7 @@ export function useSelect({ id, items, value, onValueChange }: UseSelectArgs) {
   const [open, setOpenState] = useState(false);
   const [selectedValue, setSelectedValue] = useState(value);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
-  const [positionerStyle, setPositionerStyle] = useState<JSX.CSSProperties>({});
+  const [positionerStyle, setPositionerStyle] = useState<CSSProperties>({});
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const positionerRef = useRef<HTMLDivElement | null>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -85,7 +85,7 @@ export function useSelect({ id, items, value, onValueChange }: UseSelectArgs) {
       maxWidth: availableWidth,
       "--reference-width": `${rect.width}px`,
       "--available-width": `${availableWidth}px`,
-    } as JSX.CSSProperties);
+    } as CSSProperties);
   }, []);
 
   const setOpen = useCallback(

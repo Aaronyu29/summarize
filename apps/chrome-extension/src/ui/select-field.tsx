@@ -1,4 +1,4 @@
-import type { ComponentChildren, JSX } from "preact";
+import type { ComponentChildren, CSSProperties, JSX } from "preact";
 import { createPortal } from "preact/compat";
 import { resolveText, type LocalizedText } from "../lib/i18n";
 import { MessageText } from "./localized-text";
@@ -10,7 +10,7 @@ type PopupProps = {
   pickerId?: string;
   variant?: string;
   matchTriggerWidth?: boolean;
-  positionerStyle?: JSX.CSSProperties;
+  positionerStyle?: CSSProperties;
 };
 
 export function SelectPopup({
