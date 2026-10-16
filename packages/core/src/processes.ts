@@ -89,35 +89,42 @@ function registerActiveProcess(proc: ChildProcess, processGroup: boolean): void 
   proc.on("close", cleanup);
 }
 
-export function terminateTrackedProcesses(signal: NodeJS.Signals): void {
-  for (const [proc, metadata] of activeTrackedProcesses) {
-    if (proc.exitCode !== null || proc.signalCode !== null) {
-      activeTrackedProcesses.delete(proc);
-      continue;
-    }
-
-    if (process.platform === "win32" && proc.pid) {
-      const result = spawnSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-      if (result.status === 0) continue;
-    }
-
-    if (metadata.processGroup && proc.pid) {
-      try {
-        process.kill(-proc.pid, signal);
-        continue;
-      } catch {
-        // The group may have exited between the state check and signal.
-      }
-    }
-
+export function signalTrackedProcess(proc: ChildProcess, signal: NodeJS.Signals): void {
+  const metadata = activeTrackedProcesses.get(proc);
+  // Detached children are session leaders. Signaling the pid alone leaves
+  // grandchildren running after a timeout, even after the leader exits.
+  if (metadata?.processGroup && proc.pid) {
     try {
-      proc.kill(signal);
+      process.kill(-proc.pid, signal);
+      return;
     } catch {
-      // Process already exited.
+      // The group may have exited between the state check and signal.
     }
+  }
+
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    if (metadata) activeTrackedProcesses.delete(proc);
+    return;
+  }
+
+  if (process.platform === "win32" && proc.pid) {
+    const result = spawnSync("taskkill", ["/PID", String(proc.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (result.status === 0) return;
+  }
+
+  try {
+    proc.kill(signal);
+  } catch {
+    // Process already exited.
+  }
+}
+
+export function terminateTrackedProcesses(signal: NodeJS.Signals): void {
+  for (const [proc] of activeTrackedProcesses) {
+    signalTrackedProcess(proc, signal);
   }
 }
 
