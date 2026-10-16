@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,8 +34,23 @@ describe("version resolution coverage", () => {
   it("resolves package and Git metadata without an import URL", () => {
     process.env.SUMMARIZE_VERSION = " ";
     process.env.SUMMARIZE_GIT_SHA = " ";
-    expect(resolvePackageVersion()).toBe(FALLBACK_VERSION);
-    expect(resolveGitSha()).toMatch(/^[0-9a-f]{8}$/);
+    const root = makeRoot("summarize-version-cwd");
+    mkdirSync(join(root, ".git"));
+    writeFileSync(join(root, "package.json"), JSON.stringify({ version: FALLBACK_VERSION }));
+    writeFileSync(join(root, ".git", "HEAD"), "1234567890abcdef\n");
+    const moduleUrl = new URL("../src/version.ts", import.meta.url).href;
+    // Native ESM has no __dirname, unlike Vitest's module wrapper.
+    const output = execFileSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `import { resolvePackageVersion, resolveGitSha } from ${JSON.stringify(moduleUrl)};
+         console.log(JSON.stringify([resolvePackageVersion(), resolveGitSha()]));`,
+      ],
+      { cwd: root, env: process.env, encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toEqual([FALLBACK_VERSION, "12345678"]);
   });
 
   it("handles injected, nested, invalid, and fallback package versions", () => {
