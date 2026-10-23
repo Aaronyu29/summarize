@@ -201,7 +201,7 @@ akshare[quotes] @ git+https://github.com/Aaronyu29/akshare.git@cc7e451d7ba372596
 longbridge==5.2.2
 ```
 
-正式发布只使用 GitHub Actions `Investment and finance checks` 成功后的 `rhino-invest-linux-py312-<完整提交号>` 产物。CI 在 Ubuntu 24.04 / Python 3.12 构建应用和全部依赖 wheel，产物清单记录应用提交、AKShare 固定提交与每个文件 SHA-256。Windows/Linux、Python 3.11/3.12 四组测试全部通过后才打包。下载时核实 Actions 的 run/head SHA，服务器再核对清单和文件哈希。
+正式发布只使用 GitHub Actions `Investment and finance checks` 成功后的 `rhino-invest-linux-py312-<完整提交号>` 产物。CI 在 Ubuntu 24.04 / Python 3.12 构建应用和全部依赖 wheel，产物清单记录应用提交、AKShare 固定提交与每个文件 SHA-256。Linux、Python 3.11/3.12 两组测试全部通过后才打包。下载时核实 Actions 的 run/head SHA，服务器再核对清单和文件哈希。
 
 在 `/opt/rhino-invest/releases/<提交号>` 解压 CI 产物，执行 `bash install.sh --execute <完整提交号>`。安装器只创建该版本的虚拟环境，使用 `--no-index --no-deps` 安装 CI wheel 并执行 `pip check`；不会拉源码、联网解析依赖或在服务器构建代码。预先准备的临时环境不作为正式运行环境。
 
