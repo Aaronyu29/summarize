@@ -13,6 +13,7 @@ from rhino_invest.research import ingest_archives, review_plan, register_externa
 from tests_invest.test_decisions import active_plan, market, portfolio
 from rhino_invest.decisions import evaluate
 from rhino_invest.config import Config
+from rhino_invest.common import stable_id
 
 NOW = '2026-10-23T15:00:00+00:00'
 VID = '4_uytm7I_XQ'
@@ -46,6 +47,9 @@ class FixtureModel:
             return {'checks': [{'index': 0, 'verified': True, 'issues': []}]}
         if purpose == 'compile_plan':
             plan = active_plan(symbol)
+            plan['entry'].update(basis='source_level', source_level_ids=[payload['levels'][0]['id']] if payload['levels'] else [],
+                conditions=[payload['levels'][0]['conditions']] if payload['levels'] else [])
+            plan['entry']['amount_usd'] = payload['policy']['amount_usd']
             plan['evidence_refs'] = payload['evidence_ids']
             plan['is_adr'] = self.adr
             plan['price_unit'] = 'per_adr' if self.adr else 'per_share'
@@ -481,8 +485,132 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual(source['transcript']['full_segment_count'], 2)
             self.assertIn('cited', source['transcript']['selection'])
         image_parts = [part for body in requests for part in body['messages'][1]['content'] if part['type'] == 'image_url']
-        self.assertEqual(len(image_parts), 2)
+        self.assertEqual(len(image_parts), 4)
         self.assertTrue(all(part['image_url']['detail'] == 'original' for part in image_parts))
+
+    def test_complete_plan_uses_policy_amount_dates_and_real_review_frames(self):
+        class PolicyModel(FixtureModel):
+            def run(self, purpose, payload, **kwargs):
+                if purpose in {'compile_plan', 'review_plan'}:
+                    self.assert_policy = payload['policy']
+                    assert len(kwargs.get('frames', [])) == 1
+                    assert payload['policy']['cash_verified'] is False
+                    assert payload['policy']['next_review_at'] == '2027-01-21T15:00:00+00:00'
+                result = super().run(purpose, payload, **kwargs)
+                if purpose == 'compile_plan':
+                    result['plan']['entry']['amount_usd'] = None
+                return result
+        model = PolicyModel()
+        result = ingest_archives(self.store, self.db, model=model,
+            fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
+        self.assertEqual(result['errors'], [])
+        plan = result['plans'][0]
+        self.assertEqual(plan['status'], 'active')
+        self.assertEqual(plan['entry']['amount_usd'], '1000')
+        self.assertEqual(plan['thesis_valid_from'], NOW)
+        self.assertEqual(plan['horizon_until'], '2028-10-23T15:00:00+00:00')
+        self.assertEqual(model.frame_counts, [1, 1, 1, 1])
+
+    def test_etf_missing_nav_is_typed_research_gap_without_paid_eps_plan(self):
+        class ETFModel(FixtureModel):
+            def run(self, purpose, payload, **kwargs):
+                assert purpose in {'extract_levels', 'verify_levels'}, 'ETF company-EPS route must not be called'
+                result = super().run(purpose, payload, **kwargs)
+                if purpose == 'extract_levels':
+                    result['levels'][0]['symbol'] = 'SOXX'
+                return result
+        result = ingest_archives(self.store, self.db, model=ETFModel(), fundamentals={'SOXX': {
+            'identity': [{'symbol': 'SOXX.US', 'currency': 'USD', 'name_en': 'iShares Semiconductor ETF'}],
+            'financial_report': {'list': {'IS': {'fund_eps': '-31.118'}}}}}, now=NOW)
+        self.assertEqual(result['errors'], [])
+        plan = result['plans'][0]
+        self.assertEqual(plan['status'], 'needs_review')
+        self.assertEqual(plan['research_gaps'][0]['code'], 'ETF_VALUATION_EVIDENCE_UNAVAILABLE')
+        self.assertEqual(plan['targets'], [])
+        self.assertEqual(plan['entry']['amount_usd'], '1000')
+        self.assertNotIn('horizon_until', plan)
+
+    def test_spliced_creator_entry_and_technical_support_never_become_buy_on_assurance(self):
+        for technical in (False, True):
+            with Store(':memory:') as store:
+                class BadEntryModel(FixtureModel):
+                    def run(self, purpose, payload, **kwargs):
+                        result = super().run(purpose, payload, **kwargs)
+                        if purpose == 'extract_levels' and technical:
+                            result['levels'][0]['kind'] = 'technical_support'
+                        if purpose == 'compile_plan' and not technical:
+                            result['plan']['entry']['high'] = '120'
+                        return result
+                result = ingest_archives(store, self.db, model=BadEntryModel(),
+                    fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
+                self.assertEqual(result['errors'], [])
+                self.assertEqual(result['plans'][0]['status'], 'needs_review')
+                self.assertNotIn('thesis_valid_from', result['plans'][0])
+
+    def test_event_risk_is_independently_sealed_before_plan_invalidation_without_recompile(self):
+        from rhino_invest.decisions import valid_thesis_events
+        plan = ingest_archives(self.store, self.db, model=FixtureModel(),
+            fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)['plans'][0]
+        self.store.put('advice_intent', 'pending', {'plan_id': plan['id'], 'status': 'pending'})
+        self.store.put('reservation', 'cash', {'plan_id': plan['id'], 'status': 'active'})
+        class RiskModel:
+            def __init__(self):
+                self.calls = []
+            def run(self, purpose, payload, **kwargs):
+                self.calls.append(purpose)
+                if purpose == 'event_review':
+                    return {'assessment': {'triggered': True, 'condition': 'cashflow_failed',
+                        'evidence_refs': payload['new_evidence_refs'], 'rationale': 'New original report documents condition'}}
+                assert purpose == 'verify_invalidation'
+                return {'accepted': True, 'condition': 'cashflow_failed',
+                    'evidence_refs': payload['assessment']['evidence_refs'], 'issues': []}
+        model = RiskModel()
+        result = review_plan(self.store, plan, model, event_id='new-cashflow-report',
+            evidence={'source': 'offline-primary-fixture', 'disclosed_cashflow': '-100'}, now=NOW)
+        self.assertEqual(model.calls, ['event_review', 'verify_invalidation'])
+        self.assertEqual(result['status'], 'invalidated')
+        self.assertIsNone(result['revised_plan'])
+        current = self.store.get('plan', plan['id'])
+        self.assertEqual(current['status'], 'invalidated')
+        self.assertEqual(len(valid_thesis_events(self.store, current, NOW)), 1)
+        self.assertEqual(len(self.store.items('plan_revision')), 1)
+        self.assertEqual(self.store.get('advice_intent', 'pending')['status'], 'cancelled')
+        self.assertEqual(self.store.get('reservation', 'cash')['status'], 'released')
+
+    def test_unresolved_sealed_risk_blocks_cached_new_financial_and_new_source_plans(self):
+        from rhino_invest.decisions import record_thesis_risk, valid_thesis_events
+        data = {'NVDA': {'financial_report': {'period': '2025'}}}
+        plan = ingest_archives(self.store, self.db, model=FixtureModel(), fundamentals=data, now=NOW)['plans'][0]
+        self.store.put('external_evidence', 'raw-risk-report', {'source': 'offline original report', 'disclosure': 'condition occurred'}, immutable=True)
+        risk = record_thesis_risk(self.store, plan,
+            {'triggered': True, 'condition': 'cashflow_failed', 'evidence_refs': ['raw-risk-report'], 'rationale': 'Disclosed condition'},
+            {'accepted': True, 'condition': 'cashflow_failed', 'evidence_refs': ['raw-risk-report'], 'issues': []}, now=NOW)
+        original = dict(plan, status='invalidated')
+        self.store.put('plan', plan['id'], original)
+        model = FixtureModel()
+        # A completed old workflow must not return its cached active plan copy.
+        cached = ingest_archives(self.store, self.db, model=model, fundamentals=data, now=NOW)
+        self.assertEqual(cached['plans'], [])
+        self.assertEqual(cached['deferred_unresolved_risk'][0]['risk_evidence_ids'], [risk['id']])
+        # A frozen attempt clock cannot hide an already sealed unresolved risk.
+        changed = {'NVDA': {'financial_report': {'period': '2026'}}}
+        for moment in ['2026-10-23T14:00:00+00:00', '2026-10-24T15:00:00+00:00']:
+            result = ingest_archives(self.store, self.db, model=model, fundamentals=changed, now=moment)
+            self.assertEqual(result['plans'], [])
+            self.assertEqual(result['deferred_unresolved_risk'][0]['code'], 'UNRESOLVED_VERIFIED_THESIS_RISK')
+        self.assertEqual(model.calls, [])
+        self.add_revision()
+        result = ingest_archives(self.store, self.db, model=model, fundamentals=changed, now=NOW)
+        self.assertEqual(result['plans'], [])
+        self.assertEqual(model.calls, ['extract_levels', 'verify_levels'])
+        self.assertEqual(self.store.get('plan', plan['id']), original)
+        self.assertEqual(len(self.store.items('plan_revision')), 1)
+        self.assertEqual(len(valid_thesis_events(self.store, original, NOW)), 1)
+        defer = result['deferred_unresolved_risk'][0]
+        self.assertIn('raw-risk-report', defer['original_evidence_hashes'])
+        review = review_plan(self.store, original, model, event_id='new-facts-after-risk', evidence=changed, now=NOW)
+        self.assertEqual(review['status'], 'deferred')
+        self.assertEqual(model.calls, ['extract_levels', 'verify_levels'])
 
     def test_compile_unknown_scope_does_not_change_with_derived_level_ids(self):
         ingest_archives(self.store, self.db, now=NOW)
@@ -501,6 +629,60 @@ class ResearchTests(unittest.TestCase):
         with self.assertRaises(UnknownModelOutcome):
             _run(ModelGateway(self.store, dict(config, configuration_revision=2), transport),
                 'compile_plan', payload, now='2026-10-24T15:00:00+00:00')
+        self.assertEqual(len(calls), 1)
+
+    def test_legacy_unknown_without_images_blocks_new_image_and_instrument_contract(self):
+        ingest_archives(self.store, self.db, now=NOW)
+        snapshot = self.store.items('research_evidence')[0][1]
+        calls = []
+        def transport(body):
+            calls.append(body)
+            raise TimeoutError()
+        config = {'enabled': True, 'model': 'offline', 'base_url': 'https://offline.invalid',
+            'max_calls_per_day': 8, 'max_cost_usd_per_call': '0.5', 'max_cost_usd_per_day': '4'}
+        payload = {'symbol': 'NVDA', 'source': snapshot, 'levels': [],
+            'fundamentals': {'financial_report': {'period': '2025'}}}
+        with self.assertRaises(UnknownModelOutcome):
+            _run(ModelGateway(self.store, config, transport), 'compile_plan', payload, now=NOW)
+        payload['fundamentals']['instrument_contract'] = {'asset_type': 'equity', 'quote_price_unit': 'per_share'}
+        frame = (100, self.root / VID / 'frames/frame-00100.jpg')
+        with self.assertRaises(UnknownModelOutcome):
+            _run(ModelGateway(self.store, dict(config, configuration_revision=2), transport),
+                'compile_plan', payload, frames=[frame], now='2026-10-24T15:00:00+00:00', store=self.store)
+        self.assertEqual(len(calls), 1)
+
+    def test_plan_frame_limit_is_explicit_and_never_truncates_references(self):
+        from rhino_invest.research import _plan_frames
+        frames = []
+        for second in range(100, 109):
+            path = self.root / VID / f'frames/frame-{second:05}.jpg'
+            path.write_bytes(str(second).encode())
+            frames.append({'timestamp_seconds': second, 'path': f'frames/{path.name}', 'sha256': digest(path)})
+        snapshot = {'source': str(self.root), 'video_id': VID, 'frames': frames}
+        levels = [{'verified': True, 'frame_seconds': second} for second in range(100, 109)]
+        with self.assertRaisesRegex(ValueError, 'more than eight'):
+            _plan_frames(snapshot, levels)
+
+    def test_legacy_live_empty_consensus_flag_cannot_unlock_unknown_after_contract_upgrade(self):
+        ingest_archives(self.store, self.db, now=NOW)
+        snapshot = self.store.items('research_evidence')[0][1]
+        old_fund = {'financial_report': {'period': '2025'}, 'consensus': {'currency': '', 'list': []},
+            'consensus_live_verified': True, 'consensus_normalized': {'forecasts': []}}
+        old_scope = stable_id('research-logical-call', 'compile_plan', snapshot['id'], 'NVDA', old_fund, None, [])
+        calls = []
+        def transport(body):
+            calls.append(body)
+            raise TimeoutError()
+        config = {'enabled': True, 'model': 'offline', 'base_url': 'https://offline.invalid',
+            'max_calls_per_day': 8, 'max_cost_usd_per_call': '0.5', 'max_cost_usd_per_day': '4'}
+        model = ModelGateway(self.store, config, transport)
+        with self.assertRaises(UnknownModelOutcome):
+            model.run('compile_plan', {'old': 'payload'}, call_scope=old_scope)
+        new_fund = dict(old_fund, consensus_live_verified=False, consensus_response_received=True,
+            consensus_normalized={'forecasts': [], 'coverage': {'future_eps_quarters': 0}})
+        payload = {'symbol': 'NVDA', 'source': snapshot, 'levels': [], 'fundamentals': new_fund}
+        with self.assertRaises(UnknownModelOutcome):
+            _run(model, 'compile_plan', payload, frames=[(100, self.root / VID / 'frames/frame-00100.jpg')], store=self.store)
         self.assertEqual(len(calls), 1)
 
 

@@ -41,6 +41,42 @@ class SettingsConfirmationTests(unittest.TestCase):
         self.assertEqual(fields['设置确认状态'], '已应用')
         self.assertNotEqual(fields['设置回执'], first_receipt)
 
+    def test_explicit_drawdown_revocation_is_staged_confirmed_consumed_and_preserves_holdings(self):
+        fields = self.row('账户与资金', {'系统标识': 'real', '账户': 'real', '回撤硬限制设置': '0.2',
+                         '持仓核对设置': '已核对（可空仓）', '设置确认状态': '确认设置'})
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        fields.update({'回撤硬限制设置': '撤销回撤设置', '设置确认状态': '待暂存'})
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        self.assertEqual(self.store.get('account_control', 'real')['drawdown_limit'], '0.2')
+        fields['设置确认状态'] = '确认设置'
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        control = self.store.get('account_control', 'real')
+        self.assertIsNone(control['drawdown_limit'])
+        self.assertTrue(control['holdings_complete'])
+        self.assertEqual(fields['设置确认状态'], '已应用')
+        fields['回撤硬限制设置'] = '0.3'
+        self.client.poll_inputs()
+        self.assertIsNone(self.store.get('account_control', 'real')['drawdown_limit'])
+
+    def test_blank_trade_id_is_backfilled_on_provider_row_and_unlinked_fill_is_idempotent(self):
+        fields = self.row('成交录入', {'账户': 'paper', '类型': '期初持仓', '股票': 'NVDA', '数量': '1',
+                         '成交价美元': '10', '费用美元': '0', '币种': 'USD', '成交时间': '2026-10-23T15:00:00Z',
+                         '确认状态': '待暂存'})
+        table = self.client.tables()['成交录入']
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        identity = fields['系统标识']
+        self.assertTrue(identity.startswith('feishu-'))
+        self.assertEqual(fields['处理状态'], '已暂存')
+        self.assertEqual(len(self.http.rows[table]), 1)
+        fields['确认状态'] = '确认'
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        self.assertEqual(self.client.poll_inputs()['errors'], [])
+        confirmed = [e for e in self.store.events('ledger') if e['id'] == identity]
+        self.assertEqual(len(confirmed), 1)
+        self.assertNotIn('recommendation_id', confirmed[0])
+        self.assertEqual(fields['处理状态'], '已确认')
+        self.assertEqual(len(self.http.rows[table]), 1)
+
     def test_identical_value_reconfirmation_is_consumed_and_new_ack_not_cached(self):
         fields = self.plan()
         self.client.poll_inputs()

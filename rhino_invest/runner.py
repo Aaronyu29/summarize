@@ -4,12 +4,12 @@ from __future__ import annotations
 import signal
 import threading
 
-from .common import utc_now, parse_time, stable_id
+from .common import utc_now, parse_time, stable_id, decimal_value
 from .ledger import portfolio
 from .market import MarketData, quote_gate
 from .research import ingest_archives, review_plan
 from .model import ModelGateway
-from .decisions import evaluate
+from .decisions import evaluate, _has_provenance, valid_thesis_events
 from .paper import paper_account, simulate
 from .watch import evaluate_levels, KINDS as WATCH_KINDS
 from .feishu import Feishu
@@ -87,13 +87,104 @@ class Runner:
         result["errors"].append({"stage": stage, "error": type(exc).__name__})
 
     def _plans(self):
-        return [p for _, p in self.store.items("plan") if p.get("status") not in ("superseded", "invalidated")]
+        inventories = {account: portfolio(self.store, account, now=self.clock()).get("positions", [])
+                       for account in ("real", "paper")}
+        held = {p["symbol"] for account in ("real", "paper")
+                for p in inventories[account]
+                if decimal_value(p.get("quantity") or 0) > 0}
+        recorded = {p["symbol"] for p in inventories["real"]}
+        held.update(p["symbol"] for p in reported_holdings(self.store, now=self.clock())
+                    if p["symbol"] not in recorded and decimal_value(p.get("reported_market_value") or 0) > 0)
+        risks = {r.get("plan_id") for _, r in self.store.items("risk_evidence") if r.get("verified") is True}
+        return [p for _, p in self.store.items("plan") if p.get("status") not in ("superseded", "invalidated")
+                or p.get("symbol") in held or p.get("id") in risks]
 
     def _queue_review(self, key, payload):
         """An already observed event retains its processed receipt across ticks."""
         with self.store.transaction():
             if self.store.get("review_trigger", key) is None:
                 self.store.put("review_trigger", key, dict(payload, id=key, processed=False))
+
+    def _queue_advice_review(self, plan, advice, quote, snapshot, now):
+        """Unapproved drafts are not new facts. External events survive revisions."""
+        reasons = set(r for r in advice.get("reasons", []) if isinstance(r, str))
+        events = []
+        if "scheduled_thesis_review_due" in reasons:
+            events.append(("scheduled_review", plan.get("next_review_at")))
+        if "investment_horizon_expired_requires_new_thesis" in reasons:
+            position = next((p for p in snapshot.get("positions", []) if p.get("symbol") == plan.get("symbol")), {})
+            events.append(("holding_horizon", [position.get("first_fill_at"), plan.get("horizon_months"),
+                                               plan.get("thesis_valid_from"), plan.get("horizon_until")]))
+        # A sealed thesis risk already completed assessment + independent review.
+        # Feeding its own recommendation back into research would manufacture
+        # new risk receipts and spend again without any new external fact.
+        if "confirmed_price_stop" in reasons:
+            close = quote.get("regular_close") or {}
+            # One review per stop condition / actual completed session. Minute
+            # quote timestamps and a model's new revision cannot rearm it.
+            events.append(("confirmed_stop", [plan.get("stop"), close.get("session_date")]))
+        if "take_profit_schedule_reached" in reasons and advice.get("status") == "actionable":
+            intent = self.store.get("advice_intent", advice.get("id", "")) or {}
+            basis = advice.get("take_profit_position_basis") or {}
+            events.append(("take_profit", [snapshot.get("account"), intent.get("tranche"), intent.get("baseline_quantity"),
+                intent.get("id"), basis.get("first_fill_at"), basis.get("structure_hash")]))
+        if "position_structure_changed_requires_take_profit_review" in reasons:
+            basis = advice.get("take_profit_position_basis") or {}
+            if basis.get("structure_hash"):
+                events.append(("position_structure_change", {key: basis.get(key)
+                    for key in ("account", "symbol", "first_fill_at", "structure_hash")}))
+        for kind, evidence_identity in events:
+            key = stable_id("review-fact", plan["id"], kind, evidence_identity)
+            self._queue_review(key, {"symbol": plan["symbol"], "kind": kind, "timestamp": now,
+                "plan_id": plan["id"], "evidence": advice})
+
+    def _consume_legacy_review(self, key, trigger):
+        """Upgrade old queued drafts without deleting their audit or paying again."""
+        reason = None
+        kind = trigger.get("kind")
+        evidence = trigger.get("evidence") or {}
+        reasons = {r for r in evidence.get("reasons", []) if isinstance(r, str)} if isinstance(evidence, dict) else set()
+        external = {"confirmed_price_stop", "scheduled_thesis_review_due", "investment_horizon_expired_requires_new_thesis",
+                    "take_profit_schedule_reached", "position_structure_changed_requires_take_profit_review"}
+        if kind == "verified_thesis_risk":
+            reason = "already_reviewed"
+        elif kind == "risk_change" and not reasons & external:
+            reason = "already_reviewed" if "verified_thesis_invalidation" in reasons else "no_external_fact"
+        if reason is None or not self.execute:
+            return False
+        self.store.put("review_trigger", key, dict(trigger, processed=True, processed_at=self.clock(),
+            status="superseded", reason=reason))
+        return True
+
+    def _risk_report(self, plan, advice, quote, snapshot, now):
+        codes = sorted({r for r in advice.get("reasons", []) if isinstance(r, str)} &
+                       {"confirmed_price_stop", "verified_thesis_invalidation"})
+        if not codes:
+            return None
+        position = next((p for p in snapshot.get("positions", []) if p.get("symbol") == plan["symbol"]), {})
+        note = next((p for p in snapshot.get("reported_holdings", []) if p.get("symbol") == plan["symbol"]), {}) if not position else {}
+        quantity = position.get("quantity")
+        if decimal_value(quantity or 0) <= 0 and decimal_value(note.get("reported_market_value") or 0) <= 0:
+            return None  # Do not tell an unheld-stock viewer to sell imaginary shares.
+        close = quote.get("regular_close") or {}
+        facts = advice.get("risk_evidence_ids") or [plan.get("stop"), close.get("session_date")]
+        identity = stable_id("independent-risk-notice", snapshot["account"], plan["id"], codes, facts,
+                             position.get("first_fill_at"), str(quantity))
+        report_id = stable_id("report", "风险提示", identity, snapshot["account"])
+        if self.store.get("report", report_id):
+            return None
+        report = make_report("风险提示", identity, snapshot, [plan], [advice], now=now)
+        report["risk_info"] = {"symbol": plan["symbol"], "reasons": codes,
+            "quantity": str(quantity) if quantity is not None and decimal_value(quantity) > 0 else None,
+            "reported_market_value": note.get("reported_market_value"), "reported_at": note.get("reported_at"),
+            "quote_executable": (advice.get("market_gate") or {}).get("eligible") is True,
+            "advice_executable": advice.get("status") == "actionable",
+            "ledger_current": snapshot.get("ledger_input_current") is not False,
+            "price_plan_verified": _has_provenance(self.store, plan), "stop": plan.get("stop"),
+            "risk_evidence_ids": advice.get("risk_evidence_ids", [])}
+        report["notification_body"] = notification_text(report)
+        self.store.put("report", report["id"], report, immutable=True)
+        return report
 
     def _paper_skip(self, pending, reason, quote, now):
         key = stable_id("paper-preflight", pending["id"], reason, quote)
@@ -112,6 +203,11 @@ class Runner:
         self.store.put("paper_preflight", key, record, immutable=True)
         self.store.append_event("paper", key, record)
         return record
+
+    def _verified_risk_exit(self, plan, pending, now):
+        refs = set(pending.get("risk_evidence_ids") or [])
+        valid = {event["id"] for event in valid_thesis_events(self.store, plan, now=now)} if plan else set()
+        return bool(refs and pending.get("action") in {"exit", "reduce"} and refs.issubset(valid))
 
     def _schedule_report(self, kind, period, snapshot, plans, recommendations, now):
         report = make_report(kind, period, snapshot, plans, recommendations, now=now)
@@ -247,7 +343,8 @@ class Runner:
                 continue
             plan = current_plans.get(pending.get("plan_id"))
             intent = self.store.get("advice_intent", pending["id"])
-            if (not plan or plan.get("status") != "active" or plan.get("revision") != pending.get("revision")
+            risk_exit = self._verified_risk_exit(plan, pending, now)
+            if (not plan or (plan.get("status") != "active" and not risk_exit) or plan.get("revision") != pending.get("revision")
                     or not intent or intent.get("status") != "pending"):
                 if not self.store.get("paper_cancel", pending["id"]):
                     self.store.put("paper_cancel", pending["id"], {"id": pending["id"], "timestamp": now,
@@ -256,9 +353,10 @@ class Runner:
             try:
                 with self.store.transaction():
                     latest_plan = self.store.get("plan", plan["id"])
-                    if not latest_plan or latest_plan.get("status") != "active" or latest_plan.get("revision") != pending.get("revision"):
+                    risk_exit = self._verified_risk_exit(latest_plan, pending, now)
+                    if not latest_plan or (latest_plan.get("status") != "active" and not risk_exit) or latest_plan.get("revision") != pending.get("revision"):
                         continue
-                    if parse_time(now) >= parse_time(latest_plan.get("next_review_at")):
+                    if not risk_exit and parse_time(now) >= parse_time(latest_plan.get("next_review_at")):
                         self.store.put("paper_cancel", pending["id"], {"id": pending["id"], "timestamp": now,
                             "reason": "plan_review_due_before_execution"}, immutable=True)
                         continue
@@ -307,10 +405,10 @@ class Runner:
                     report = self._schedule_report("重大变化", stable_id(plan["id"], semantic, ledger_hash),
                         snapshots["real"], [plan], [recommendation], now)
                     result["reports"].append(report)
-                if recommendation.get("action") in ("reduce", "exit") or recommendation.get("status") == "needs_review":
-                    self._queue_review(stable_id("risk_change", plan["id"], plan.get("revision"), semantic), {
-                        "symbol": plan["symbol"], "kind": "risk_change", "timestamp": now,
-                        "plan_id": plan["id"], "revision": plan.get("revision"), "evidence": recommendation})
+                self._queue_advice_review(plan, recommendation, quote, snapshots["real"], now)
+                risk_report = self._risk_report(plan, recommendation, quote, snapshots["real"], now)
+                if risk_report:
+                    result["reports"].append(risk_report)
             except Exception as exc:
                 self._error(result, "evaluate:" + plan["id"], exc)
             paper_key = "paper:" + plan["id"]
@@ -318,10 +416,34 @@ class Runner:
             try:
                 advice = evaluate(self.store, plan, quote, snapshots["paper"], now=now)
                 result["paper_recommendations"].append(advice)
+                self._queue_advice_review(plan, advice, quote, snapshots["paper"], now)
+                risk_report = self._risk_report(plan, advice, quote, snapshots["paper"], now)
+                if risk_report:
+                    result["reports"].append(risk_report)
                 self.store.put("evaluation_cursor", paper_key, {"signature": paper_signature,
                     "recommendation_id": advice.get("id"), "timestamp": now})
             except Exception as exc:
                 self._error(result, "paper_evaluate:" + plan["id"], exc)
+        # A verified fact may refer to a superseded immutable plan revision.
+        # Retain that risk context without reactivating its entry recommendations.
+        seen_versions = {(p["id"], p.get("revision")) for p in plans}
+        for _, risk in self.store.items("risk_evidence"):
+            version = (risk.get("plan_id"), risk.get("revision"))
+            if version in seen_versions:
+                continue
+            prior = self.store.get("plan_revision", stable_id(*version))
+            if not prior or not valid_thesis_events(self.store, prior, now=now):
+                continue
+            seen_versions.add(version)
+            try:
+                prior = dict(prior, status="invalidated")
+                for account, snapshot in snapshots.items():
+                    advice = evaluate(self.store, prior, quotes.get(prior["symbol"], {}), snapshot, now=now)
+                    report = self._risk_report(prior, advice, quotes.get(prior["symbol"], {}), snapshot, now)
+                    if report:
+                        result["reports"].append(report)
+            except Exception as exc:
+                self._error(result, "retained_thesis_risk", exc)
         # Reservations can change during evaluation; publish the resulting cash
         # availability rather than the pre-evaluation planning snapshot.
         for account in snapshots:
@@ -347,11 +469,13 @@ class Runner:
                 self.store.put("schedule", marker, {"kind": kind, "period": key, "timestamp": now})
                 if kind == "季度复核":
                     for plan in plans:
-                        self._queue_review(stable_id("quarterly_review", plan["id"], plan.get("revision"), key), {
+                        self._queue_review(stable_id("quarterly_review", plan["id"], key), {
                             "symbol": plan["symbol"], "kind": "quarterly_review", "timestamp": now,
                             "plan_id": plan["id"], "revision": plan.get("revision"), "evidence": {"period": key}})
         for key, trigger in self.store.items("review_trigger"):
-            if trigger.get("processed") or not self.model or not self.execute or self._background_mode:
+            if trigger.get("processed") or self._consume_legacy_review(key, trigger):
+                continue
+            if not self.model or not self.execute or self._background_mode:
                 continue
             try:
                 for plan in plans:
@@ -402,7 +526,9 @@ class Runner:
                     advice = [self.store.get("recommendation", identity) for identity in report.get("recommendation_ids", [])]
                     advice = [rec for rec in advice if rec]
                     delivery_plans = self._plans()
-                    if report.get("kind") == "重大变化" and not any(actionable_notice(rec, delivery_plans, now=now) for rec in advice):
+                    dedicated_risk = any({r for r in rec.get("reasons", []) if isinstance(r, str)} &
+                                         {"confirmed_price_stop", "verified_thesis_invalidation"} for rec in advice)
+                    if report.get("kind") == "重大变化" and (dedicated_risk or not any(actionable_notice(rec, delivery_plans, now=now) for rec in advice)):
                         # Draft validation and routine waiting states stay in the
                         # audit DB and the daily summary, without one alert per stock.
                         if self.execute:
@@ -442,7 +568,8 @@ class Runner:
                 return owner.model.run(*args, **kwargs)
         model = CancellableModel()
         summary = {"timestamp": self.clock(), "status": "completed", "errors": [], "deferred": [],
-                   "ingestion": {"ingested": 0, "unchanged": 0, "plan_count": 0, "deferred_before_since_count": 0},
+                   "ingestion": {"ingested": 0, "unchanged": 0, "plan_count": 0, "deferred_before_since_count": 0,
+                                 "deferred_unresolved_risk_count": 0},
                    "reviewed_count": 0}
         try:
             if self.config.archive_database and not self._stop.is_set():
@@ -450,12 +577,17 @@ class Runner:
                     symbols=symbols or None, fundamentals=fundamentals, now=self.clock(), research_since=self.config.research_since)
                 summary["ingestion"] = {"ingested": ingestion.get("ingested", 0), "unchanged": ingestion.get("unchanged", 0),
                     "plan_count": len(ingestion.get("plans", [])),
-                    "deferred_before_since_count": len(ingestion.get("deferred_before_since", []))}
+                    "deferred_before_since_count": len(ingestion.get("deferred_before_since", [])),
+                    "deferred_unresolved_risk_count": len(ingestion.get("deferred_unresolved_risk", []))}
+                if ingestion.get("deferred_unresolved_risk"):
+                    summary["deferred"].append({"stage": "verified_thesis_risk", "reason": "UNRESOLVED_VERIFIED_THESIS_RISK"})
                 for error in ingestion.get("errors", []):
                     item = {"stage": "archive_ingestion", "error": _safe_error(error.get("error"))}
                     summary["deferred" if item["error"] == "ModelBudgetExceeded" else "errors"].append(item)
             for key, trigger in self.store.items("review_trigger"):
                 if trigger.get("processed") or self._stop.is_set():
+                    continue
+                if self._consume_legacy_review(key, trigger):
                     continue
                 for plan in self._plans():
                     if plan["symbol"] == trigger["symbol"]:
@@ -488,7 +620,9 @@ class Runner:
                 issues.update(("research", _safe_error(e.get("error"))) for e in research.get("errors", []))
                 if not research.get("errors"):
                     issues.add(("research", _safe_error(research.get("error"))))
-            deferred = research_state == "deferred" or any(code == "ModelBudgetExceeded" for _, code in issues)
+            unresolved_risk = bool((research.get("ingestion") or {}).get("deferred_unresolved_risk_count") or
+                                   result.get("ingestion", {}).get("deferred_unresolved_risk"))
+            deferred = research_state == "deferred" or unresolved_risk or any(code == "ModelBudgetExceeded" for _, code in issues)
             failures = sorted((stage, code) for stage, code in issues if code != "ModelBudgetExceeded")
             state = "blocked" if failures else "deferred" if deferred else "healthy"
             signature = stable_id(state, sorted({stage for stage, _ in failures}))
@@ -523,8 +657,9 @@ class Runner:
                 lines.append("影响：" + "；".join(impact[:2]) + "。")
                 lines.append("处理：系统继续检查；结果不明的请求已禁止盲目重试，无需重复提交。非投资建议。")
             elif deferred:
-                lines.append("影响：新研究暂时延后，现有账本保留。")
-                lines.append("处理：等待预算或条件恢复，无需重复提交。非投资建议。")
+                lines.append("影响：已核实风险尚未解除，相关新计划暂缓。" if unresolved_risk else "影响：新研究暂时延后，现有账本保留。")
+                lines.append("处理：等待专门复核风险，无需重复提交。非投资建议。" if unresolved_risk else
+                             "处理：等待预算或条件恢复，无需重复提交。非投资建议。")
             else:
                 lines.append("此前异常已恢复，系统继续跟踪；无需重复操作。非投资建议。")
             self.store.put("ops_notice", key, {"id": key, "status": "pending", "health": state, "timestamp": now})

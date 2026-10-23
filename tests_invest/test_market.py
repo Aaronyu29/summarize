@@ -6,6 +6,26 @@ NOW = '2026-10-23T15:00:00+00:00'
 
 
 class MarketTests(unittest.TestCase):
+    def test_etf_contract_preserves_raw_fund_accounts_without_claiming_company_eps(self):
+        report = {'list': {'IS': {'indicators': [{'accounts': [{'field': 'EPS', 'name': 'Earning Per Share(USD)'}]}]}}}
+        class Client:
+            def query(self, group, method, *args, **kwargs):
+                if method == 'static_info':
+                    return [{'symbol': 'SOXX.US', 'name_en': 'iShares Semiconductor ETF', 'currency': 'USD'}]
+                if method == 'financial_report':
+                    return report
+                if method == 'consensus':
+                    return {'currency': '', 'current_period': 'qf', 'list': []}
+                return {}
+        data = MarketData(client=Client()).fundamentals('SOXX', NOW)
+        self.assertEqual(data['financial_report'], report)
+        self.assertEqual(data['instrument_contract']['asset_type'], 'etf')
+        self.assertFalse(data['instrument_contract']['stock_eps_valuation_applicable'])
+        self.assertIsNone(data['instrument_contract']['quote_price_unit'])
+        self.assertFalse(data['consensus_live_verified'])
+        self.assertTrue(data['consensus_response_received'])
+        self.assertEqual(data['consensus_normalized']['coverage']['future_eps_quarters'], 0)
+
     def test_official_only_and_time_session_gate(self):
         calls = []
         def fetch(symbols, **kwargs):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import calendar
 import hashlib
 import json
 import re
@@ -9,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from datetime import timedelta, datetime, timezone
 from .common import utc_now, stable_id, validate_plan, decimal_value, parse_time
-from .market import symbol_value
+from .market import symbol_value, instrument_contract
 
 
 def _read(path):
@@ -138,17 +139,34 @@ including units, currency, dates, adjustment, horizon and conditions. Return
 {"checks":[{"index":0,"verified":false,"issues":[]}]} with exactly one check per level.
 Missing or ambiguous evidence must be verified=false; never repair by guessing.'''
 COMPILE_TEMPLATE = {'plan': {'symbol': None, 'thesis': None, 'horizon_months': None,
-    'next_review_at': None, 'currency': None, 'price_unit': None, 'is_adr': None,
-    'entry': {'low': None, 'high': None, 'amount_usd': None},
+    'next_review_at': None, 'thesis_valid_from': None, 'horizon_until': None,
+    'currency': None, 'price_unit': None, 'is_adr': None,
+    'entry': {'low': None, 'high': None, 'amount_usd': None, 'basis': None,
+              'source_level_ids': [], 'conditions': []},
     'targets': [{'scenario': scenario, 'price': None, 'horizon_months': None, 'method': 'eps_multiple',
         'assumptions': {'eps': None, 'multiple': None, 'currency': None, 'price_unit': None,
             'forecast_period': None, 'rationale': None, 'evidence_refs': []}, 'evidence_refs': []}
         for scenario in ('base', 'bear')],
     'take_profit': [{'price': None, 'fraction': None}], 'stop': {'price': None, 'confirmation': 'daily_close'},
-    'invalidation_conditions': [], 'time_exit_policy': None, 'valuation_basis': {},
+    'invalidation_conditions': [], 'time_exit_policy': 'Review at next_review_at and horizon_until; renewal requires a new independently accepted thesis.', 'valuation_basis': {},
     'conditions_parsed': False, 'evidence_refs': []}}
 COMPILE = '''Build an INDEPENDENT 12-36 month investment plan from the verified evidence and
 raw financial reports/valuation below. The creator's technical levels are context only.
+Use supplied policy.amount_usd for each buy; it is a strategy setting, never proof of cash.
+Use policy.next_review_at and policy.thesis_valid_from exactly. Choose a supported
+12-36 month horizon and use the matching policy.horizon_until_by_months value.
+time_exit_policy should reference these named fields rather than invent conflicting dates.
+Use exactly one verified creator zone when entry.basis="source_level" and list its
+source_level_ids. Never merge separate tranches into a broad entry band. Technical
+support alone is not a buy condition. Retain panic/add-on/no-position conditions;
+if conditions cannot be evaluated as price-only, leave conditions_parsed false.
+An independently derived entry must use basis="independent_valuation", explicit
+conditions and evidenced valuation rationale rather than relabel technical support.
+Respect instrument_contract: ETF fund statements are not operating-company EPS;
+without NAV/holdings/index-level evidence return a research-only plan with null targets.
+Reviewed identity gives ADR ratio DIRECTION, not an exchange-rate assumption. Never
+silently reinterpret source per_share as per_adr; inspect supplied original frames and
+explicitly reconcile any unit conflict before asserting a plan's unit is verified.
 Return exactly one JSON object following this valid JSON template. Replace nulls only
 with supported values, and set conditions_parsed true only after all conditions are parsed.
 JSON_TEMPLATE_BEGIN
@@ -164,19 +182,35 @@ REVIEW = '''Independently review each target scenario, arithmetic, explicit assu
 financial source periods/units, ADR conversion, downside, entry/stop/TP, thesis invalidation
 and 12-36 month horizon. Return {"accepted":false,"issues":[],"checks":{
 "provenance":false,"currency":false,"unit":false,"adr":false}}. Only accept if all
-material fields have evidence; ambiguous currency/units/ADR forbid activation.'''
+material fields have evidence; ambiguous currency/units/ADR forbid activation.
+Read supplied original images, not just frame metadata. Verify EPS growth arithmetic,
+forecast fiscal years versus holding horizon, exact entry-zone bounds/conditions and
+stop-edge attribution. Review the supplied policy dates and authoritative per-buy amount.
+If current_position_basis is supplied, return position_basis_accepted:true ONLY after
+independently reviewing the TP schedule against that exact current holdings structure.'''
+EVENT_REVIEW = REVIEW + ''' For a risk event, also return assessment:{triggered:false,
+condition:null,evidence_refs:[],rationale:null}. Set triggered true ONLY when the new
+persisted raw evidence proves one EXACT existing plan.invalidation_conditions string.
+Do not invent a new condition or treat price weakness alone as thesis invalidation.'''
+VERIFY_INVALIDATION = '''Independently verify whether the raw new evidence proves the
+assessment.condition, which must EXACTLY equal an existing plan.invalidation_conditions
+string. Return {"accepted":false,"condition":null,"evidence_refs":[],"issues":[]}.
+Accept only with the same original persisted evidence_refs as the assessment; do not
+treat the first model's assertion as evidence. No trade or invented new condition.'''
 
 
-def _run(model, purpose, payload, frames=(), now=None):
+def _run(model, purpose, payload, frames=(), now=None, store=None):
     payload = dict(payload)
     instruction = payload.pop('instruction', None)
     source = payload.get('source')
     plan = payload.get('plan') or {}
     scope = stable_id('research-logical-call', purpose,
         (source or {}).get('id') or plan.get('research_snapshot_id'), payload.get('symbol') or plan.get('symbol'),
-        _stable_fundamentals(payload.get('fundamentals')),
+        _logical_fundamentals(payload.get('fundamentals')),
         payload.get('event_id') or payload.get('review_event_id') or (payload.get('review_context') or {}).get('event_id'),
         [second for second, _ in frames])
+    if store is not None and purpose in {'compile_plan', 'review_plan'}:
+        _guard_plan_scope(store, purpose, payload, frames, scope)
     if source:
         payload['source'] = _model_source(source, full_transcript=purpose in {'extract_levels', 'verify_levels'},
                                           levels=payload.get('levels'))
@@ -198,6 +232,36 @@ def _run(model, purpose, payload, frames=(), now=None):
     return model.run(purpose, payload, frames=frames, now=now, instruction=instruction, call_scope=scope)
 
 
+def _guard_plan_scope(store, purpose, payload, frames, scope):
+    """Adding images/derived contracts cannot retry an unresolved old plan call."""
+    from .model import UnknownModelOutcome
+    source, plan = payload.get('source') or {}, payload.get('plan') or {}
+    phase = stable_id('research-logical-call', purpose, source.get('id') or plan.get('research_snapshot_id'),
+        payload.get('symbol') or plan.get('symbol'), _logical_fundamentals(payload.get('fundamentals')),
+        payload.get('event_id') or payload.get('review_event_id') or (payload.get('review_context') or {}).get('event_id'), [])
+    hashes = [(second, _sha(Path(path))) for second, path in frames]
+    current = stable_id('model-logical-call-v1', scope, hashes)
+    legacy_scopes = {stable_id('model-logical-call-v1', phase, [])}
+    raw_fundamental = payload.get('fundamentals')
+    if isinstance(raw_fundamental, dict) and 'consensus_live_verified' in raw_fundamental:
+        # The old adapter's live-empty flag was an observation flag, not a new
+        # consensus fact. Cover either prior value when migrating that contract.
+        for flag in (False, True):
+            old_fundamental = dict(_logical_fundamentals(raw_fundamental), consensus_live_verified=flag)
+            old_phase = stable_id('research-logical-call', purpose, source.get('id') or plan.get('research_snapshot_id'),
+                payload.get('symbol') or plan.get('symbol'), old_fundamental,
+                payload.get('event_id') or payload.get('review_event_id') or (payload.get('review_context') or {}).get('event_id'), [])
+            legacy_scopes.add(stable_id('model-logical-call-v1', old_phase, []))
+    with store.transaction():
+        scopes = {current} | legacy_scopes | {record['gateway_scope'] for _, record in store.items('research_call_scope')
+            if record.get('logical_scope') == phase}
+        for key, call in store.items('model_call'):
+            if (call.get('call_scope') in scopes and not store.get('model_receipt', key)
+                    and not store.get('model_rejection', key)):
+                raise UnknownModelOutcome('Unresolved logical plan call; original-image or contract changes cannot bypass reconciliation')
+        store.put('research_call_scope', current, {'logical_scope': phase, 'gateway_scope': current}, immutable=True)
+
+
 def _model_level(level):
     fields = ('id', 'symbol', 'kind', 'value', 'low', 'high', 'currency', 'price_unit', 'source_date',
         'adjustment', 'source_horizon', 'timestamp_seconds', 'evidence_segment_ids', 'frame_seconds',
@@ -210,7 +274,8 @@ def _model_plan(plan):
         'horizon_months', 'next_review_at', 'currency', 'price_unit', 'is_adr', 'entry', 'targets',
         'take_profit', 'stop', 'invalidation_conditions', 'time_exit_policy', 'valuation_basis',
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
-        'fundamental_evidence_id', 'source_published_at')
+        'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
+        'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -287,7 +352,7 @@ def _verify_levels(snapshot, extracted, checked):
     return result
 
 
-def _assess_plan(plan, review, evidence_ids, fundamentals):
+def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
     issues = list(review.get('issues', []))
     if review.get('accepted') is not True:
         issues.append('Independent review not accepted')
@@ -295,6 +360,28 @@ def _assess_plan(plan, review, evidence_ids, fundamentals):
     refs = plan.get('evidence_refs') or []
     if not refs or not set(refs).issubset(known):
         issues.append('Unknown plan evidence references')
+    entry = plan.get('entry') or {}
+    if entry.get('basis') == 'source_level':
+        selected = [level for level in levels if level.get('id') in (entry.get('source_level_ids') or [])]
+        if len(selected) != 1 or len(entry.get('source_level_ids') or []) != 1:
+            issues.append('Entry must identify exactly one verified source zone; never splice tranches')
+        elif (not selected[0].get('verified') or selected[0].get('kind') not in {'creator_entry', 'valuation'}):
+            issues.append('Technical context alone is not an evidenced creator entry')
+        else:
+            try:
+                low = selected[0].get('low', selected[0].get('value'))
+                high = selected[0].get('high', selected[0].get('value'))
+                if decimal_value(low) != decimal_value(entry.get('low')) or decimal_value(high) != decimal_value(entry.get('high')):
+                    issues.append('Entry band differs from its single referenced source zone')
+            except ValueError:
+                issues.append('Entry source zone bounds unresolved')
+    elif entry.get('basis') != 'independent_valuation':
+        issues.append('Explicit entry basis required: source_level or independent_valuation')
+    if not isinstance(entry.get('conditions'), list) or not entry['conditions']:
+        issues.append('Explicit entry conditions required')
+    elif entry.get('basis') == 'source_level' and len(selected) == 1:
+        if selected[0].get('conditions') not in entry['conditions']:
+            issues.append('Exact source entry conditions must be retained; conditional support is not an unconditional buy')
     targets = plan.get('targets') or []
     if len(targets) < 2:
         issues.append('Base/downside scenarios required')
@@ -303,7 +390,8 @@ def _assess_plan(plan, review, evidence_ids, fundamentals):
             assumptions = target['assumptions']
             instrument = fundamentals.get('identity') or []
             names = [row.get('name_en', '') for row in instrument if isinstance(row, dict)] if isinstance(instrument, list) else []
-            is_etf = plan.get('symbol') in {'SOXX', 'SMH', 'SPY', 'QQQ', 'IWM'} or any('ETF' in name for name in names)
+            is_etf = ((fundamentals.get('instrument_contract') or {}).get('asset_type') == 'etf'
+                or plan.get('symbol') in {'SOXX', 'SMH', 'SPY', 'QQQ', 'IWM'} or any('ETF' in name for name in names))
             if is_etf:
                 raise ValueError('ETF targets require verified constituent/NAV research; stock EPS multiple is unsupported')
             if target['method'] != 'eps_multiple' or not isinstance(assumptions, dict):
@@ -327,6 +415,11 @@ def _assess_plan(plan, review, evidence_ids, fundamentals):
         plan['verification']['adr'] = bool(fundamentals.get('adr_conversion_verified') is True and checks.get('adr') is True)
     if not fundamentals.get('financial_report'):
         issues.append('Financial report unavailable')
+    identity = fundamentals.get('reviewed_identity') or {}
+    metadata = identity.get('metadata') or {}
+    for key in ('currency', 'price_unit'):
+        if metadata.get(key) and plan.get(key) != metadata[key]:
+            issues.append('Plan ' + key + ' differs from reviewed instrument identity')
     issues.extend(validate_plan(plan))
     return list(dict.fromkeys(issues))
 
@@ -420,42 +513,106 @@ def bind_instrument_identity(store, symbol, metadata, *, evidence_refs, reviewed
     return record
 
 
-def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, context=None, operation_id=None):
+def _logical_fundamentals(fundamental):
+    # A derived contract projection is not a new financial fact and must never
+    # bypass an unresolved paid-call scope from the pre-contract payload.
+    if isinstance(fundamental, dict):
+        fundamental = {key: value for key, value in fundamental.items()
+            if key not in {'instrument_contract', 'consensus_response_received', 'consensus_live_verified'}}
+        if isinstance(fundamental.get('consensus_normalized'), dict):
+            fundamental['consensus_normalized'] = {key: value for key, value in fundamental['consensus_normalized'].items()
+                if key != 'coverage'}
+    return _stable_fundamentals(fundamental)
+
+
+def _horizon_end(moment, months):
+    start = parse_time(moment)
+    if isinstance(months, bool) or not isinstance(months, int) or not 12 <= months <= 36:
+        return None
+    year, month = divmod(start.year * 12 + start.month - 1 + months, 12)
+    return start.replace(year=year, month=month + 1,
+        day=min(start.day, calendar.monthrange(year, month + 1)[1])).isoformat()
+
+
+def _plan_frames(snapshot, levels):
+    seconds = {level.get('frame_seconds') for level in levels if level.get('verified') is True}
+    frames = [(second, path) for second, path in _frames(snapshot) if second in seconds]
+    if len(frames) > 8:
+        raise ValueError('Plan has more than eight referenced original frames; explicit batched evidence review required')
+    return frames
+
+
+def _unresolved_thesis_defer(store, plan, snapshot, fundamentals, moment):
+    if not plan:
+        return None
+    from .decisions import valid_thesis_events
+    # A frozen workflow clock must not hide risk sealed after its first attempt.
+    # A verified risk remains unresolved until a dedicated resolution contract
+    # exists; this conservative guard does not automatically resolve even a
+    # record whose observation timestamp needs reconciliation.
+    risks = valid_thesis_events(store, plan)
+    if not risks:
+        return None
+    raw_hash = stable_id(_logical_fundamentals((fundamentals or {}).get(plan['symbol']) or {}))
+    key = stable_id('unresolved-thesis-defer-v1', snapshot['id'], plan['id'], plan['revision'],
+        sorted(risk['id'] for risk in risks), raw_hash)
+    existing = store.get('research_defer', key)
+    if existing:
+        return existing
+    record = {'id': key, 'code': 'UNRESOLVED_VERIFIED_THESIS_RISK', 'status': 'deferred',
+        'timestamp': moment, 'symbol': plan['symbol'], 'source_id': snapshot['id'],
+        'plan_id': plan['id'], 'plan_revision': plan['revision'], 'plan_hash': plan_fingerprint(plan),
+        'conditions': sorted({risk['condition'] for risk in risks}),
+        'risk_evidence_ids': sorted(risk['id'] for risk in risks),
+        'original_evidence_hashes': {ref: digest for risk in risks for ref, digest in risk['evidence_hashes'].items()},
+        'new_fundamentals_hash': raw_hash, 'original_plan_preserved': True,
+        'required_next_step': 'Dedicated independently verified risk-resolution review; no automatic reactivation'}
+    store.put('research_defer', key, record, immutable=True)
+    return record
+
+
+def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, context=None, operation_id=None, deferred=None):
     moment = now or utc_now()
     symbols = sorted({l['symbol'] for l in levels if re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', str(l.get('symbol', '')))})
     plans = []
     for symbol in symbols:
         plan_id = stable_id('investment-plan', symbol)
         previous = store.get('plan', plan_id)
+        risk_defer = _unresolved_thesis_defer(store, previous, snapshot, fundamentals, moment)
+        if risk_defer:
+            if deferred is not None:
+                deferred.append(risk_defer)
+            continue
         published_at = _published_at(snapshot['metadata'])
         if previous and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
             continue
         fundamental = dict((fundamentals or {}).get(symbol) or {})
+        # The derived contract annotates the native report; it never replaces it.
+        fundamental.setdefault('instrument_contract', instrument_contract(dict(fundamental, symbol=symbol)))
         identity = store.get('instrument_identity', symbol)
         if identity:
             fundamental = dict(fundamental, reviewed_identity=identity,
                 adr_conversion_verified=bool(identity['metadata'].get('is_adr')
                     and identity['metadata'].get('ordinary_shares_per_adr')))
+            fundamental['instrument_contract'] = dict(fundamental['instrument_contract'],
+                quote_currency=identity['metadata'].get('currency'),
+                quote_price_unit=identity['metadata'].get('price_unit'),
+                adr_direction={'ordinary_shares_per_adr': identity['metadata'].get('ordinary_shares_per_adr'),
+                    'meaning': 'one ADR represents this many ordinary shares'},
+                reviewed_identity_evidence_refs=identity.get('evidence_refs', []))
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
         # Workflow discovery changes with the watch list; paid plans depend only
         # on their own immutable source, relevant facts, model and explicit event.
         event_context = None if not context else {
             'event_id': context.get('event_id'),
             'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
-        operation_key = stable_id('plan-operation-v2-symbol', snapshot['id'], symbol, fid,
+        operation_key = stable_id('plan-operation-v3-evidence-contract', snapshot['id'], symbol, fid,
                                   _model_cache_identity(model), event_context)
         committed = store.get('plan_operation', operation_key)
-        legacy_key = stable_id('plan-operation', operation_id, symbol) if operation_id else None
-        if not committed and legacy_key:
-            # Reuse a provably identical pre-upgrade workflow, never infer old
-            # model settings from the current plan or another workflow's output.
-            committed = store.get('plan_operation', legacy_key)
-            if committed:
-                store.put('plan_operation', operation_key, committed, immutable=True)
         if committed:
             plans.append(committed['plan'])
             continue
-        attempt = store.get('plan_attempt', operation_key) or (store.get('plan_attempt', legacy_key) if legacy_key else None)
+        attempt = store.get('plan_attempt', operation_key)
         if not attempt:
             attempt = {'timestamp': moment, 'revision': previous['revision'] + 1 if previous else 1}
             store.put('plan_attempt', operation_key, attempt, immutable=True)
@@ -467,26 +624,72 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             store.put('fundamental_evidence', fid, {'id': fid, 'data': fundamental,
                 'first_observed_at': moment}, immutable=True)
         evidence_ids = [snapshot['id'], fid] + [l['id'] for l in levels if l.get('symbol') == symbol and l.get('verified')]
-        symbol_levels = [l for l in levels if l.get('symbol') == symbol]
+        if identity:
+            evidence_ids.extend(ref for ref in identity.get('evidence_refs', []) if store.get('external_evidence', ref))
+        evidence_ids = list(dict.fromkeys(evidence_ids))
+        symbol_levels = [l for l in levels if l.get('symbol') == symbol and l.get('verified') is True]
+        original_frames = _plan_frames(snapshot, symbol_levels)
+        next_review = (parse_time(plan_moment) + timedelta(days=90)).isoformat()
+        policy = {'amount_usd': '1000', 'amount_basis': 'user-authorized default per buy; no cumulative cap',
+            'cash_verified': False, 'next_review_at': next_review, 'thesis_valid_from': plan_moment,
+            'horizon_until_by_months': {str(months): _horizon_end(plan_moment, months) for months in range(12, 37)},
+            'instrument_contract': fundamental['instrument_contract']}
+        if identity:
+            policy['reviewed_identity'] = identity
+            policy['adr_direction'] = 'one ADR represents ordinary_shares_per_adr ordinary shares; never invert this binding'
+        current_basis = {}
+        from .decisions import take_profit_position_basis
+        from .ledger import portfolio
+        for account in ('real', 'paper'):
+            basis = take_profit_position_basis(store, portfolio(store, account, now=plan_moment), symbol, now=plan_moment)
+            if basis:
+                current_basis[account] = basis
         payload = {'instruction': COMPILE, 'symbol': symbol, 'levels': symbol_levels, 'source': snapshot,
             'fundamentals': fundamental, 'evidence_ids': evidence_ids, 'as_of': plan_moment,
-            'review_context': context}
-        proposed = _run(model, 'compile_plan', payload, now=plan_moment).get('plan', {})
+            'review_context': context, 'policy': policy, 'current_position_basis': current_basis}
+        is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
+        if is_etf:
+            proposed = json.loads(json.dumps(COMPILE_TEMPLATE))['plan']
+            proposed.update(currency=fundamental['instrument_contract'].get('quote_currency'),
+                price_unit='per_share', is_adr=False, evidence_refs=[snapshot['id'], fid], targets=[], take_profit=[])
+        else:
+            proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
         plan = dict(proposed)
         plan.update(symbol=symbol, id=plan_id,
             revision=attempt['revision'], created_at=plan_moment, status='needs_review', source_published_at=published_at)
-        plan['next_review_at'] = (parse_time(plan_moment) + timedelta(days=90)).isoformat()
+        plan['next_review_at'] = next_review
+        plan['thesis_valid_from'] = plan_moment
+        plan['horizon_until'] = _horizon_end(plan_moment, plan.get('horizon_months'))
+        plan['policy'] = {'amount_usd': policy['amount_usd'], 'amount_basis': policy['amount_basis']}
+        if isinstance(plan.get('entry'), dict):
+            plan['entry']['amount_usd'] = policy['amount_usd']
+        if current_basis:
+            plan['take_profit_position_basis'] = current_basis
         plan.setdefault('stop', {})
         if isinstance(plan['stop'], dict):
             plan['stop'].setdefault('confirmation', 'daily_close')
-        review = _run(model, 'review_plan', {'instruction': REVIEW, 'plan': plan,
+        review_payload = {'instruction': REVIEW, 'plan': plan,
             'source': snapshot, 'levels': symbol_levels, 'fundamentals': fundamental,
-            'review_event_id': (context or {}).get('event_id')}, now=plan_moment)
-        issues = _assess_plan(plan, review, evidence_ids, fundamental)
+            'policy': policy, 'current_position_basis': current_basis,
+            'review_event_id': (context or {}).get('event_id')}
+        if is_etf:
+            gap = {'code': 'ETF_VALUATION_EVIDENCE_UNAVAILABLE',
+                'detail': fundamental['instrument_contract']['valuation_gap'],
+                'required': ['NAV', 'holdings', 'constituent/index earnings methodology'], 'evidence_refs': [fid]}
+            plan['research_gaps'] = [gap]
+            review = {'accepted': False, 'checks': {}, 'issues': [gap['code']]}
+        else:
+            review = _run(model, 'review_plan', review_payload, frames=original_frames, now=plan_moment, store=store)
+        issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
         if not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
             issues.append('No individually verified source levels')
         plan['status'] = 'active' if not issues else 'needs_review'
         plan['review_issues'] = issues
+        if issues:
+            plan.pop('thesis_valid_from', None)
+            plan.pop('horizon_until', None)
+        if issues or review.get('position_basis_accepted') is not True:
+            plan.pop('take_profit_position_basis', None)
         plan['research_snapshot_id'] = snapshot['id']
         plan['fundamental_evidence_id'] = fid
         seal_plan_review(store, plan, review, evidence_ids)
@@ -510,7 +713,8 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
     moment = now or utc_now()
     cutoff = parse_time(research_since) if research_since is not None else None
     result = {'ingested': 0, 'unchanged': 0, 'errors': [], 'plans': [], 'deferred_before_since': [],
-              'research_since': cutoff.isoformat() if cutoff else None, 'historical_revisions': []}
+              'research_since': cutoff.isoformat() if cutoff else None, 'historical_revisions': [],
+              'deferred_unresolved_risk': []}
     with contextlib.closing(sqlite3.connect(Path(archive_db).resolve().as_uri() + '?mode=ro', uri=True)) as db:
         rows = db.execute('SELECT video_id,revision,source,title,payload,analysis_sha256 FROM analyses ORDER BY video_id,revision').fetchall()
     latest = _latest_revisions(rows)
@@ -541,12 +745,19 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                     'evidence_id': snapshot['id']})
                 continue
             identities = {key: value['id'] for key, value in store.items('instrument_identity')}
-            workflow_id = stable_id(snapshot['id'], 'workflow-v3-primary-transport', sorted(symbols or []),
+            workflow_id = stable_id(snapshot['id'], 'workflow-v4-evidence-contract', sorted(symbols or []),
                 _stable_fundamentals(fundamentals or {}), identities, _model_cache_identity(model))
             completed = store.get('research_workflow', workflow_id)
             if model is None or completed:
                 if completed:
-                    result['plans'].extend(completed['plans'])
+                    for cached_plan in completed['plans']:
+                        current = store.get('plan', cached_plan['id'])
+                        risk_defer = _unresolved_thesis_defer(store, current, snapshot, fundamentals, moment)
+                        if risk_defer:
+                            result['deferred_unresolved_risk'].append(risk_defer)
+                        else:
+                            result['plans'].append(cached_plan)
+                    result['deferred_unresolved_risk'].extend(completed.get('deferred_unresolved_risk', []))
                 continue
             attempt = store.get('research_attempt', workflow_id)
             if not attempt:
@@ -574,10 +785,14 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 store.put('research_level', level['id'], level, immutable=True)
             if symbols:
                 levels = [l for l in levels if l.get('symbol') in symbols]
-            plans = compile_plan(store, snapshot, levels, model, fundamentals, workflow_moment, operation_id=workflow_id)
+            source_deferred = []
+            plans = compile_plan(store, snapshot, levels, model, fundamentals, workflow_moment,
+                operation_id=workflow_id, deferred=source_deferred)
             store.put('research_workflow', workflow_id, {'id': workflow_id, 'plans': plans,
-                'level_ids': [l['id'] for l in levels], 'completed_at': workflow_moment}, immutable=True)
+                'level_ids': [l['id'] for l in levels], 'completed_at': workflow_moment,
+                'deferred_unresolved_risk': source_deferred}, immutable=True)
             result['plans'].extend(plans)
+            result['deferred_unresolved_risk'].extend(source_deferred)
         except Exception as exc:
             if not seal_validated and row[1] == latest.get(row[0]):
                 _block_old_revision_plans(store, row[0])
@@ -606,9 +821,42 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
         attempt = {'timestamp': moment, 'fundamentals': data, 'evidence': evidence}
         store.put('review_attempt', key, attempt, immutable=True)
     moment, evidence, data = attempt['timestamp'], attempt['evidence'], attempt['fundamentals']
-    result = _run(model, 'event_review', {'instruction': REVIEW, 'plan': plan,
-        'event_id': event_id, 'new_evidence': evidence}, now=moment)
+    raw = {'event_id': event_id, 'symbol': plan['symbol'], 'timestamp': moment, 'raw_evidence': evidence}
+    raw_id = stable_id('review-event-evidence', raw)
+    store.put('review_event_evidence', raw_id, dict(raw, id=raw_id), immutable=True)
     snapshot = store.get('research_evidence', plan.get('research_snapshot_id', ''))
+    risk_defer = _unresolved_thesis_defer(store, plan,
+        snapshot or {'id': plan.get('research_snapshot_id')}, data, moment)
+    if risk_defer:
+        record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
+            'review': {'accepted': False, 'issues': [risk_defer['code']]}, 'revised_plan': None,
+            'status': 'deferred', 'deferred_unresolved_risk': [risk_defer]}
+        store.put('plan_review', key, record, immutable=True)
+        return record
+    result = _run(model, 'event_review', {'instruction': EVENT_REVIEW, 'plan': plan,
+        'event_id': event_id, 'new_evidence': evidence, 'new_evidence_refs': [raw_id]}, now=moment)
+    assessment = result.get('assessment') or {}
+    if assessment.get('triggered') is True:
+        independent = _run(model, 'verify_invalidation', {'instruction': VERIFY_INVALIDATION,
+            'plan': plan, 'event_id': event_id, 'assessment': assessment,
+            'new_evidence': evidence, 'new_evidence_refs': [raw_id]}, now=moment)
+        if independent.get('accepted') is True:
+            from .decisions import record_thesis_risk
+            risk = record_thesis_risk(store, plan, assessment, independent, now=moment)
+            with store.transaction():
+                current = store.get('plan', plan['id'])
+                if current and plan_fingerprint(current) == plan_fingerprint(plan):
+                    store.put('plan', plan['id'], dict(current, status='invalidated'))
+                    for namespace, statuses in [('advice_intent', {'pending', 'suspended'}), ('reservation', {'active'})]:
+                        for intent_key, intent in store.items(namespace):
+                            if intent.get('plan_id') == plan['id'] and intent.get('status') in statuses:
+                                store.put(namespace, intent_key, dict(intent,
+                                    status='cancelled' if namespace == 'advice_intent' else 'released',
+                                    reason='verified_thesis_invalidation'))
+                record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
+                    'review': result, 'risk_evidence_id': risk['id'], 'revised_plan': None, 'status': 'invalidated'}
+                store.put('plan_review', key, record, immutable=True)
+            return record
     revised = None
     if snapshot:
         levels = [v for _, v in store.items('research_level') if snapshot['id'] in v.get('evidence_refs', [])

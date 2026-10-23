@@ -271,10 +271,13 @@ class Feishu:
                     try:
                         settings = {}
                         if f.get("回撤硬限制设置"):
-                            limit = decimal_value(f["回撤硬限制设置"])
-                            if not 0 < limit < 1:
-                                raise ValueError("Drawdown limit must be a decimal fraction between 0 and 1")
-                            settings["drawdown_limit"] = str(limit)
+                            if f["回撤硬限制设置"] == "撤销回撤设置":
+                                settings["drawdown_limit"] = None
+                            else:
+                                limit = decimal_value(f["回撤硬限制设置"])
+                                if not 0 < limit < 1:
+                                    raise ValueError("回撤限制须为0到1之间的小数；撤销时明确填写撤销回撤设置")
+                                settings["drawdown_limit"] = str(limit)
                         if f.get("持仓核对设置"):
                             check = f["持仓核对设置"]
                             if check not in ("已核对", "已核对（可空仓）", "已核对(可空仓)", "未核对"):
@@ -285,12 +288,23 @@ class Feishu:
                         result["errors"].append({"record_id": record["record_id"], "error": str(exc)})
                         self._input_error(table, f.get("系统标识"), str(exc))
                 entry_id = f.get("录入标识") if table == "账户与资金" else f.get("系统标识")
-                if not entry_id or (table == "账户与资金" and not f.get("输入类型")):
+                if table == "账户与资金" and (not entry_id or not f.get("输入类型")):
                     continue
                 status = f.get("确认状态", "")
                 if status not in ("待暂存", "暂存", "确认", "已确认"):
                     continue
                 raw_type = f.get("输入类型") if table == "账户与资金" else f.get("类型")
+                if table == "成交录入" and not entry_id:
+                    if not raw_type:
+                        continue
+                    entry_id = "feishu-" + stable_id(self.app_token, table, record["record_id"])
+                    f["系统标识"] = entry_id
+                    if self.execute:
+                        try:
+                            self._assign_input_identity(table, record["record_id"], entry_id)
+                        except FeishuError as exc:
+                            result["errors"].append({"record_id": record["record_id"], "error": str(exc)})
+                            continue
                 kind = TYPE_NAMES.get(raw_type, raw_type)
                 entry = {"id": entry_id, "account": f.get("账户") or "real", "type": kind,
                          "currency": f.get("币种") or "USD", "timestamp": f.get("录入时间") if table == "账户与资金" else f.get("成交时间")}
@@ -361,6 +375,16 @@ class Feishu:
                     result["errors"].append({"record_id": record["record_id"], "error": str(exc)})
                     self._input_error("投资计划", f.get("系统标识"), str(exc))
         return result
+
+    def _assign_input_identity(self, table, record_id, identity):
+        """Backfill only the managed ID on the original provider row, never POST a copy."""
+        def check():
+            found = [r for r in self.records(table) if r["record_id"] == record_id
+                     and self._text(r.get("fields", {}).get("系统标识")) == identity]
+            return {"record": found[0]} if len(found) == 1 else None
+        path = self._base() + "/tables/" + self.tables()[table] + "/records/" + record_id
+        return self._operation("record:" + table + ":" + identity, "PUT", path,
+                               {"fields": {"系统标识": identity}}, check=check)
 
     def _input_error(self, table, key, message):
         if not self.execute or not key:

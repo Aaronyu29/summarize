@@ -234,5 +234,37 @@ class MarketData:
                          'estimate': metric.get('estimate'), 'is_released': metric.get('is_released')}
                         for metric in row.get('details', []) if metric.get('key') in {'eps', 'normalized_eps', 'revenue'}]}
                     for row in consensus.get('list', [])]}
-            result['consensus_live_verified'] = True
+            forecasts = result['consensus_normalized']['forecasts']
+            result['consensus_response_received'] = True
+            result['consensus_live_verified'] = bool(consensus.get('currency') and forecasts)
+            result['consensus_normalized']['coverage'] = {
+                'available_periods': len(forecasts),
+                'future_eps_quarters': sum(any(m.get('key') == 'eps' and m.get('is_released') is False
+                    and m.get('estimate') is not None for m in row['metrics']) for row in forecasts),
+                'annual_eps_available': False,
+                'basis': 'native quarterly series; never relabel quarterly EPS as annual'}
+        result['instrument_contract'] = instrument_contract(result)
         return result
+
+
+def instrument_contract(fundamentals):
+    """Describe native evidence scope without guessing ADR conversion or ETF EPS."""
+    symbol = fundamentals.get('symbol')
+    identity = fundamentals.get('identity')
+    rows = [row for row in identity if isinstance(row, dict)
+            and row.get('symbol') == symbol + '.US'] if isinstance(identity, list) and symbol else []
+    profile = fundamentals.get('company_profile') or {}
+    profile = profile if isinstance(profile, dict) else {}
+    names = [row.get('name_en', '') for row in rows] + [profile.get('name', '')]
+    is_etf = any('ETF' in str(name).upper().split() for name in names)
+    asset_type = 'etf' if is_etf else 'equity' if profile.get('company_name') else 'unknown'
+    currencies = {row.get('currency') for row in rows if row.get('currency')}
+    from .common import stable_id
+    return {'asset_type': asset_type, 'classification_basis': 'official identity/profile name and legal company name',
+        'identity_sha256': stable_id(identity), 'source': fundamentals.get('source'),
+        'quote_currency': next(iter(currencies)) if len(currencies) == 1 else None,
+        'quote_price_unit': None, 'adr_direction': None,
+        'stock_eps_valuation_applicable': False if is_etf else None,
+        'financial_report_scope': 'fund accounting; not operating-company EPS' if is_etf else
+            'native provider report; period, currency and per-share denominator require verification',
+        'valuation_gap': 'ETF NAV, holdings and constituent/index earnings research unavailable' if is_etf else None}

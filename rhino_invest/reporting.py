@@ -21,6 +21,8 @@ REASONS = {
     "verified_next_regular_close_required": "缺少交易日历确认的下次收盘时间", "plan_not_active": "投资计划尚未通过审核",
     "entry_conditions_unverified": "买入条件尚未核实", "portfolio_drawdown_not_evaluable": "已设置回撤上限，但缺少可比历史净值",
     "portfolio_drawdown_breached": "组合已达到设置的回撤上限", "budget_below_one_share_plus_fee": "预算不足以购买一整股并支付费用",
+    "reported_holding_quantity_unknown_requires_risk_check": "你提供的持仓股数尚未核对，请检查实际持仓风险",
+    "position_structure_changed_requires_take_profit_review": "持仓结构已变化，分批止盈规则需重新核对",
 }
 
 
@@ -87,6 +89,33 @@ def actionable_notice(recommendation, current_plans, *, now=None):
 def notification_text(report, *, current_plans=(), recommendations=(), watch_event=None, now=None, table_url=None):
     """Allowlisted short Chinese delivery, including for legacy audit-only reports."""
     stamp = beijing_time(report.get("timestamp"))
+    if report.get("kind") == "风险提示":
+        info = report.get("risk_info") or {}
+        symbol = _symbol(info.get("symbol"))
+        account = "模拟账户" if report.get("account") == "paper" else "真实账户"
+        reasons = info.get("reasons", [])
+        cause = "原投资逻辑已被新证据否定" if "verified_thesis_invalidation" in reasons else "已确认达到原计划止损条件"
+        lines = [f"【持仓风险·{account}】{stamp}", symbol + "：" + cause + "。"]
+        if info.get("quantity") is not None:
+            lines.append("已确认持仓：" + _number(info["quantity"]) + "股。")
+        else:
+            lines.append("你提供的持仓市值：" + _number(info.get("reported_market_value"), money=True) + "；股数待核对。")
+        if info.get("price_plan_verified") is True and "confirmed_price_stop" in reasons:
+            stop = info.get("stop") or {}
+            mode = {"daily_close": "常规交易日收盘确认", "weekly_close": "本周最后交易日收盘确认", "intraday": "常规时段盘中确认"}.get(stop.get("confirmation"), "确认方式待核对")
+            lines.append("原已审核止损：" + _number(stop.get("price"), money=True) + "，" + mode + "。")
+        if not info.get("quote_executable"):
+            lines.append("当前行情不可用于执行，请核对券商报价和实际持仓。")
+        elif info.get("quantity") is None:
+            lines.append("请先核对股数，再检查券商报价和持仓风险。")
+        elif info.get("ledger_current") is False:
+            lines.append("账本读取暂未完成，请核对实际持仓后检查风险。")
+        elif info.get("advice_executable") is not True:
+            lines.append("原计划需要复核，请人工检查持仓风险。")
+        else:
+            lines.append("请核对券商报价和实际持仓，人工检查退出风险。")
+        lines.append("这是风险核对提醒，不是下单指令。")
+        return "\n".join(lines)
     if report.get("kind") == "价格观察":
         event = watch_event or {}
         if not event:
@@ -158,7 +187,16 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
             lines.append(f"计划持有{horizon_text}；现持{days_text}；建议有效至{beijing_time(rec.get('expires_at'))}。")
     else:
         pending = sum(p.get("status") != "active" for p in current_plans)
-        lines.append("结论：暂无新增操作建议" + (f"；{pending}项研究待核实。" if pending else "。"))
+        risky_symbols = {_symbol(r.get("symbol")) for r in recommendations
+                         if {reason for reason in r.get("reasons", []) if isinstance(reason, str)} &
+                         {"confirmed_price_stop", "verified_thesis_invalidation"}}
+        exposed = {p.get("symbol") for p in positions if decimal_value(p.get("quantity") or 0) > 0}
+        exposed.update(p.get("symbol") for p in snapshot.get("reported_holdings", [])
+                       if decimal_value(p.get("reported_market_value") or 0) > 0)
+        if risky_symbols & exposed:
+            lines.append("结论：持仓风险需人工核查，当前不是下单指令。")
+        else:
+            lines.append("结论：暂无新增操作建议" + (f"；{pending}项研究待核实。" if pending else "。"))
     gaps = []
     if snapshot.get("cash") is None:
         gaps.append("实际现金")
@@ -230,8 +268,9 @@ def reported_holdings(store, account="real", *, now=None):
 
 def with_reported_holdings(store, snapshot):
     """Attach display-only statements, separate from positions and all totals."""
-    return dict(snapshot, reported_holdings=reported_holdings(
-        store, snapshot.get("account", "real"), now=snapshot.get("as_of")))
+    recorded = {position.get("symbol") for position in snapshot.get("positions", [])}
+    return dict(snapshot, reported_holdings=[record for record in reported_holdings(
+        store, snapshot.get("account", "real"), now=snapshot.get("as_of")) if record["symbol"] not in recorded])
 
 
 def portfolio_rows(snapshot):
