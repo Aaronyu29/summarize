@@ -1,0 +1,221 @@
+# 犀牛长期投资工作台
+
+`rhino_invest` 是独立 Python 包和独立服务，复用已经封存的视频证据与已发布的官方行情适配器。它不修改视频采集服务、不连接券商交易接口，也不会替用户下真实订单。飞书多维表格是第一版操作入口；CSV 是补充录入方式，没有网页前端。
+
+## 资金与建议的含义
+
+- 20,000 美元是**实际持仓市值＋实际现金**的目标总额，不是账户已入金金额。未确认期初现金前，真实现金和总权益显示“未知”。
+- 真实持仓也需要明确核对。没有导入股票不等于已经确认空仓；用户需在“账户与资金”中确认“已核对（可空仓）”，才能把真实库存视为完整。未确认时真实买入建议保持拦截。
+- 每次买入 1,000–3,000 美元，同一股票可以在不同人工确认的入场批次继续累积；没有“单股累计只能投 3,000 美元”的限制。默认单次规划 1,000 美元，确认设置可调整到 3,000 美元。
+- 主持有周期是 12–36 个月。计划必须分别给出论据、估值情景与假设、买入区间、分批止盈、价格止损及其确认方式、逻辑失效条件、下次复核和时间到期政策。示例中的 TSM 370/800/270 不会成为实际建议。
+- 最大回撤硬限制默认**未配置**。即使用户填写上限，没有可比历史净值峰值也只能显示“不能评估”，不能说风险检查通过。当前建议保留这个缺口，价格止损金额不等同组合最大回撤。
+- 视频观点、系统独立估值、建议、用户确认的实盘成交、模拟成交分别存储。模型提出的数字是情景假设；未获得原始证据、币种、单位或 ADR 换算支持的计划停留在待复核。
+
+## 配置与只读检查
+
+需要 Python 3.11+。AKShare 必须来自已合并分支的固定提交，部署要求见下文，不能安装同名的普通 PyPI 版本冒充该接口。
+
+复制 `.env.investment.example` 到服务器私有的 `/etc/rhino-invest/investment.env`，或使用显式的私有 JSON 配置文件。不要把密钥填写进示例文件或提交 Git。环境变量优先于私有文件；CLI 不自动搜索视频服务的配置文件。
+
+私有 JSON 的非敏感结构示例：
+
+```json
+{
+  "database": "research-data/investment/investment.sqlite",
+  "archive_database": "research-data/archive.sqlite",
+  "symbols": ["TSM", "SOXX"],
+  "interval_seconds": 60,
+  "model": {
+    "enabled": false,
+    "model": "配置实际多模态模型名",
+    "base_url": "https://实际供应商的兼容接口/v1",
+    "api_key_env": "INVEST_RESEARCH_API_KEY",
+    "max_calls_per_day": 0,
+    "max_cost_usd_per_day": "0",
+    "max_cost_usd_per_call": "0"
+  }
+}
+```
+
+`archive_database` 必须指向视频封存数据库（有 `analyses` 表），不是任务队列 `jobs.sqlite`。数据库以只读模式打开，逐条校验封存分析、manifest、音频、逐字稿、原始帧和视觉缓存的指纹。新封存 revision 会再次进入研究流程；相同输入和已完成的模型响应复用缓存。
+
+```console
+python -m rhino_invest --private-config /etc/rhino-invest/private.json diagnostics
+python -m rhino_invest --private-config /etc/rhino-invest/private.json diagnostics --live
+python -m rhino_invest --private-config /etc/rhino-invest/private.json run-once
+python -m rhino_invest --private-config /etc/rhino-invest/private.json status
+```
+
+默认不会写飞书、不会付费调用模型、不会确认实盘成交。`diagnostics --live` 才读取官方行情、交易日历和飞书字段类型；它不创建或修改表格。诊断会分别显示市场适配器、日历、模型配置、真实现金/成本/费用完整性和未知结果待核对数量。`run-once` 的默认预览会保存本地研究/建议/报告审计与独立模拟状态，但不把任何真实录入确认为成交。
+
+## 飞书表格与录入
+
+多维表格需要自建应用具备应用、表、字段和记录读写权限，并对目标文档有访问权。使用 `chat_id` 消息路线还需要机器人在该群中、发送消息和读取群消息权限；自定义机器人 Webhook 路线的权限和回执含义见下文。`diagnostics --live` 只证明本次读取成功；写权限、真实消息到达仍需上线验收。
+
+```console
+python -m rhino_invest provision
+python -m rhino_invest provision --execute
+```
+
+第一条只展示中文表/字段。第二条才创建独立的“犀牛长期投资”多维表格（或使用 `INVEST_FEISHU_APP_TOKEN` 指定已有表格），并逐表、逐字段回读验证。结果保存在投资数据库，重复执行按名称与系统标识复用，不复制整套表格。重复表名或字段类型不匹配会停止，不能静默选择。
+
+| 表格       | 使用方式                                                                                            |
+| ---------- | --------------------------------------------------------------------------------------------------- |
+| 账户与资金 | 查看真实/模拟现金、总权益、完整性和目标额；录入期初现金/入出金与可选回撤限制                        |
+| 成交录入   | 用户填写真实逐笔成交，先暂存，明确确认后入账                                                        |
+| 持仓总览   | 查看数量、成本、市值、未实现盈亏、持有天数和资产占比                                                |
+| 投资计划   | 查看建议、买入区间、期限、目标情景、止盈/止损、风险金额、到期政策和证据；确认每次金额及新的入场批次 |
+| 复盘报告   | 每日、每周、季度及重大变化的真实/模拟独立报告                                                       |
+
+所有表均有“全部记录”视图，表格本身是可读投影，JSON 不是唯一入口。“系统标识”是去重主键，不应修改或复用。输出字段由系统维护；录入字段与确认字段由用户维护，不被持仓投影覆盖。
+
+在“成交录入”中新建一行：
+
+1. 填写唯一的“系统标识”（**逐笔执行/成交编号**，部分成交分别一行，不能只用订单编号）、账户 `real`、类型 `期初现金/期初持仓/买入/卖出/入金/出金/股息/拆股`。
+2. 填写股票裸代码（如 `TSM`）、数量、实际成交价格、实际费用、币种 `USD`、带时区的成交时间。现金类填写“金额美元”。费用未知时留空，不能用 `0` 掩盖未知；期初持仓成本未知时也可留空，但系统将阻止把净利润说成已知。
+3. “确认状态”填 `待暂存`，worker 仅校验并暂存，真实账户不变。
+4. 核对后改为 `确认`，worker 才确认入账，并回写“处理状态”。重复轮询不会重复入账。已确认内容更正必须走保留原记录的 correction，不能直接改掉历史。
+5. 如该成交执行了系统建议，把“投资计划”中的“推荐标识”和“入场批次”复制到成交行，系统才把对应的建议批次标记为已执行；价格触达、无关持仓变化不是成交凭证。
+
+拆股填写“拆股比例”（如 1 股拆为 2 股填写 `2`）。期初持仓可填写“成本总额美元”和“首次建仓时间”；首次建仓时间未知时保持未知，不从导入日期假装推算长期持有天数。费用仍单列。
+
+飞书也支持审计更正：新建一行，类型=`更正`，系统标识使用新的更正编号，“原成交标识”填原已确认编号，“更正后类型”和成交数量/价格/费用/成交时间填写完整替代内容，“更正时间”填本次更正记录时间。类型=`作废` 则明确撤销原记录。两者均先 `待暂存`，核对后再 `确认`；原历史记录不会被删除。校验失败会回写“错误说明”。
+
+也可以在“账户与资金”的 `real` 行使用“录入标识/输入类型/录入金额美元/录入时间/确认状态”录入期初现金或入出金。每次使用新的录入标识。一个账户只允许一个期初现金基线；应先补齐基线再录后续现金活动。
+
+补齐券商持仓后，在“账户与资金”填写“持仓核对设置”=`已核对（可空仓）`，先用“设置确认状态”=`待暂存`，核对后改成 `确认设置`。“持仓核对状态”展示当前有效结果。真实空仓也需要这一明确确认；填写 `未核对` 并确认可撤销完整性声明。该设置和回撤限制独立合并，不会相互清除。
+
+在“投资计划”填写“单次投入设置美元”（1,000–3,000）与“入场批次设置”，先选“设置确认状态”=`待暂存`，核对后改成 `确认设置`。再次累积同一股票时要明确确认新的批次标识；每分钟的同一价格不会自动产生新批次。已过期建议也不会自动重新激活。回撤硬限制使用 0 到 1 之间的小数，如 `0.2` 表示 20%，仍需 `确认设置`；默认留空。
+
+原有的 `finance_feishu` webhook 只能向外发消息，不能接收成交。这里实际调用 Bitable API 轮询录入，不依赖 webhook 回调。
+
+## 飞书投资通知路线
+
+有 `INVEST_FEISHU_CHAT_ID` 时优先使用可读取群消息的应用路线；没有 `chat_id` 时，可在投资服务的私有环境文件中明确配置：
+
+```text
+INVEST_FEISHU_WEBHOOK_URL=在私有环境中填写已授权的飞书或Lark自定义机器人地址
+INVEST_FEISHU_WEBHOOK_SECRET=仅当该自定义机器人启用签名校验时填写
+INVEST_REUSE_LARK_WEBHOOK=false
+```
+
+可以由部署操作把现有视频通知地址复制到投资专用 `INVEST_FEISHU_WEBHOOK_URL`，这样来源明确，也不需要投资程序读取视频环境文件。只有显式设置 `INVEST_REUSE_LARK_WEBHOOK=true`，才允许从本进程环境的 `LARK_WEBHOOK_URL`（优先）或 `LARK_WEBHOOK` 复用；投资专用 URL 始终优先。投资专用 URL 不会自动套用另一个机器人的 legacy 签名密钥。配置诊断、异常和 outbox 不显示或保存完整 Webhook 地址、签名密钥、签名；只显示路线及配置是否存在。
+
+Webhook 无需应用 `App ID/App Secret` 来发送通知，但多维表格录入仍需其自身凭据。通知默认仍是 dry-run，只有显式执行才外发。应用路线发生失败时不会自动改走 Webhook；同一通知标识在两条路线间共用防重复围栏。
+
+自定义机器人返回 HTTP 200 且业务码为 0，只记录 `provider_ack` / outbox `acknowledged`，含义是**服务商接受了请求**，`readback_verified=false`。这不能证明已从群里回读消息、更不能证明用户已阅读。Webhook 没有消息读取接口，超时、5xx、跳转或畸形响应会保留 `unknown`；重启、改正文或改路线都不会自动重发。`reconcile` 也不会把 Webhook 未知结果改成成功，需操作人员在群里按 `[投资回执:通知标识]` 核对后保留人工验收记录。不要把 Webhook provider ack 写成群消息回读验收通过。
+
+## CSV、确认与审计更正
+
+CSV 接受规范英文表头及适配的中文表头。时间必须包含时区。以下只说明格式，数值不是该用户的实际余额或持仓：
+
+```csv
+id,account,type,timestamp,currency,symbol,quantity,price,fee,amount,recommendation_id,tranche_id
+example-opening-cash,real,opening_cash,2026-10-23T00:00:00Z,USD,,,,,15000,,
+example-opening-position,real,opening_position,2026-10-23T00:00:00Z,USD,TSM,10,200,0,,,
+```
+
+```console
+python -m rhino_invest import-csv broker-fills.csv
+python -m rhino_invest import-csv broker-fills.csv --execute
+python -m rhino_invest confirm fill-001 fill-002
+python -m rhino_invest confirm fill-001 fill-002 --execute
+python -m rhino_invest portfolio --account real
+python -m rhino_invest portfolio --account paper
+```
+
+导入默认仅预览；`import-csv --execute` 也**只暂存**。只有最后的明确确认才写入不可变实盘账本。确认一批编号是事务性的，任何一笔不合规不会留下半批成功。CSV 每行错误单独返回；不得把错误行数当作成功行数。
+
+```console
+python -m rhino_invest correct fill-001 --id correction-001 --timestamp 2026-10-23T14:00:00Z --replacement-csv corrected-one-row.csv
+python -m rhino_invest correct fill-001 --id correction-001 --timestamp 2026-10-23T14:00:00Z --replacement-csv corrected-one-row.csv --execute
+python -m rhino_invest confirm correction-001 --execute
+```
+
+更正表必须只有一条合法替代记录，属于原账户；原始审计记录一直保留。`--void` 可替代 `--replacement-csv` 表示撤销错误记录。更正也先暂存、再明确确认；重试沿用同一更正编号和时间。
+
+历史持仓查询使用当前已确认资料，按成交发生时间重算，标记为 `restated_economic_time`。它不是“当时系统已经知道的持仓”；实际确认时间、晚录入标记与原先发布的不可变报告分别保留。已实现交易盈亏不包含股息，股息净收入单列；费用缺失时净收入保持未知。
+
+## ADR、币种和报价单位的人工证据
+
+ADR 换算不能从股票简称、视频数字或模型自信程度推断。需要人工阅读发行人或其他一手披露，把包含换算比例和币种单位的原文另存为本地 UTF-8 文本/JSON（最多 1 MiB），保留一手来源 HTTPS 链接和披露时间。以下命令只读取本地文件，**不会访问或抓取提供的 URL**：
+
+```console
+python -m rhino_invest import-evidence reviewed-primary-source.txt --source-url https://issuer.example/primary-filing --as-of 2026-10-22T00:00:00Z --reviewed-by 实际核查人
+python -m rhino_invest import-evidence reviewed-primary-source.txt --source-url https://issuer.example/primary-filing --as-of 2026-10-22T00:00:00Z --reviewed-by 实际核查人 --execute
+```
+
+示例域名只是占位符，必须换成实际一手文档链接。第一条仅验证和预览证据标识，第二条才保存不可变证据。记录的“人工核查人”是核查声明，系统不会把一个看起来像 HTTPS 的网址当作自动核实成功。
+
+然后准备本地 `instrument-metadata.json`。下面的比例是待填字段，必须来自刚核查的一手原文，不能直接当作可执行配置：
+
+```json
+{
+  "is_adr": true,
+  "ordinary_shares_per_adr": "填写人工核实后的正数",
+  "underlying_currency": "填写普通股对应币种",
+  "currency": "USD",
+  "price_unit": "per_adr"
+}
+```
+
+```console
+python -m rhino_invest bind-instrument TSM instrument-metadata.json --evidence-id 导入得到的证据标识 --reviewed-by 实际核查人 --reviewed-at 2026-10-23T00:00:00Z
+python -m rhino_invest bind-instrument TSM instrument-metadata.json --evidence-id 导入得到的证据标识 --reviewed-by 实际核查人 --reviewed-at 2026-10-23T00:00:00Z --execute
+```
+
+可以重复 `--evidence-id` 关联多份已导入的一手证据。第一条不会绑定，第二条才保存身份修订和当前绑定，并排入一次新证据复核队列；同一绑定重放不重复排队。两个命令都不会调用付费模型、激活投资计划或修改交易账本。模型配置启用后，由后续 worker 对完整投资计划重新复核；估值、币种、单位等其他缺口仍会阻止激活。
+
+## 持续运行与复盘节奏
+
+图片中的价位观察与长期投资建议分别处理。经过原始证据复核的技术支撑、博主条件入场区间和目标/止损观察位，即使暂时没有可批准的长期估值计划，也会进入价格观察。进入区间或报价跨越区间会生成明确标注“不是买入建议”的报告；同一区间内重复报价保持安静，离开后再次进入可产生新观察。报价直接跳过区间时会说明“未观察到实际触达”。历史报价和估值中枢不会当作技术支撑。
+
+`serve --execute` 在完成运行配置与代码审核后才启动。worker 每轮批量读取官方行情，轮询人工账本，处理新封存版本，分别评估真实和模拟账户。行情失败会把最新状态写成不可用；没有延用旧成功来制造当前可用的假象。
+
+配置了付费模型后，`serve` 使用一个独立研究线程处理原始帧/逐字稿的提取、逐项复核、独立长期估值和新证据复核，避免模型响应阻塞分钟行情。`run-once --execute` 同步完成研究，方便人工核查。模型未配置时，只进行可完成的归档和只读数据工作，不会声称已自动形成长期建议。
+
+每日复盘以最近实际完成的 XNYS 交易时段为准；周复盘以本周最后一个实际交易日为准；季度在该季度最后一个实际交易时段完成后触发。交易日历包含节假日和提前收盘，不采用北京时间固定几点或“每周五必收盘”的假设。重启后周期标识去重。分钟价格变化、基本面变化和真实账本变化触发重新评估；计划复核到期/持有时间到期即使价格未变也会检查。基本面每个交易时段缓存一次，变化、季度和风险事件进入独立复核队列。每个已处理事件保留处理回执，不因下一分钟出现相同待复核状态而重置。网络与同步研究结束后刷新实际时钟和日历，行情/深度新鲜度与模拟成交时间以此为准，不能使用轮次开始时间。
+
+模拟账户单独初始化 20,000 美元虚拟现金，从自己的持仓出发评估买卖。模拟执行只能采用信号**之后**的下一次新鲜常规时段买卖报价；整数股、可见价差、5bp 不利滑点和每笔 1 美元费用分别保留。缺少买卖报价、过期、跳空越过入场区间或未通过当前计划复核时记为跳过，不能用触发价假装成交。模拟盈利不是实际盈利，也不是策略已经被证实可盈利。
+
+## 回执、未知结果与恢复
+
+飞书表格与应用消息写入先写持久 outbox，再请求，并使用稳定记录标识和独立回读确认。网络超时、5xx、无法解析的响应或回读失败均保留“结果未知”围栏，不直接重发。若远端实际已提交，下次精确回读可恢复；如果内容被外部改动，不能以新时间或新正文绕过旧围栏。自定义机器人 Webhook 是只有 provider ack 的单向路线，使用前一节的独立回执语义，不伪装成可回读。
+
+```console
+python -m rhino_invest reconcile
+python -m rhino_invest reconcile --execute
+python -m rhino_invest status
+```
+
+第一条只检查/预览，第二条才确认已被回读证明的结果；它不会把“没有查到”当作安全重发。如果创建应用的响应丢失且本地不知道 app token，需人工在飞书找到已建文档并配置它，再核对，不要再次新建。可选群消息带稳定投资回执标识；未知结果通过群消息读取核对，不能把超时当作发送失败而立即重试。
+
+付费模型同样在请求前持久记录调用、预算上限和输入指纹。未知结果跨重启/跨日仍被围栏阻止。`max_cost_usd_per_call` 是保守预算预留，不是供应商披露的实际费用；真实 usage/cost 与未知金额单列保留，不能把未知填成零。
+
+## 独立部署与验收
+
+部署文件位于 `deploy/investment/`。AKShare 固定为：
+
+```text
+akshare[quotes] @ git+https://github.com/Aaronyu29/akshare.git@cc7e451d7ba372596a70131121323a8b5f15ee73
+longbridge==5.2.2
+```
+
+正式发布只使用 GitHub Actions `Investment and finance checks` 成功后的 `rhino-invest-linux-py312-<完整提交号>` 产物。CI 在 Ubuntu 24.04 / Python 3.12 构建应用和全部依赖 wheel，产物清单记录应用提交、AKShare 固定提交与每个文件 SHA-256。Windows/Linux、Python 3.11/3.12 四组测试全部通过后才打包。下载时核实 Actions 的 run/head SHA，服务器再核对清单和文件哈希。
+
+在 `/opt/rhino-invest/releases/<提交号>` 解压 CI 产物，执行 `bash install.sh --execute <完整提交号>`。安装器只创建该版本的虚拟环境，使用 `--no-index --no-deps` 安装 CI wheel 并执行 `pip check`；不会拉源码、联网解析依赖或在服务器构建代码。预先准备的临时环境不作为正式运行环境。
+
+正式配置是 `/etc/rhino-invest/investment.env`（root 0600），投资数据库在 `/var/lib/rhino-invest`。`current` 链接指向验收版本，systemd 从该版本虚拟环境启动。更新前保存数据库一致性备份和旧版本指针；失败时停止新服务、恢复旧指针并核对数据库兼容性再启动。旧产物保留以供回滚，不清空投资账本。
+
+目标服务器现有证据归属 ubuntu 且以 0600 创建，因此投资服务也使用 ubuntu 读取封存证据；隔离通过独立环境、独立数据库和 systemd 只读文件系统实现。`ProtectHome=true`、视频目录只读、仅投资数据目录可写；CPU 上限 50%，内存上限 768 MiB，避免与原视频转写争抢资源。无需改变视频服务或其定时器。
+
+首次付费研究可设 `INVEST_RESEARCH_SINCE=2026-10-23T02:10:36+00:00`，仅处理这期及之后的视频；较早封存版本仍进行完整性校验和本地留档。默认模板关闭模型，上线按已授权配置启用。设置调用次数与金额预算预留，供应商实际费用未知时不记成零。
+
+离线验收：
+
+```console
+python -m unittest discover -s tests_invest -v
+python -m unittest discover -s scripts -p test_finance_*.py -v
+```
+
+mock 测试覆盖账本确认/更正、现金预留、长期证据门禁、行情退化、模型缓存与未知结果、延后模拟成交、真实/模拟隔离、飞书请求/回读及重启去重。上线验收仍要分别取得：固定发布提交安装证据、实际官方行情及基础字段可用性、飞书权限与中文字段回读、人工确认录入流程、配置模型的真实回执、独立服务持续运行证据。通过本地测试不能替代这些线上证据。

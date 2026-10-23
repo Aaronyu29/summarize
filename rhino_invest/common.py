@@ -1,0 +1,154 @@
+"""Shared deterministic identifiers, exact decimal parsing and plan contracts."""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_time(value) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise ValueError("timestamp must be ISO-8601 text or datetime")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp requires an explicit timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def decimal_value(value, name="value") -> Decimal:
+    if value is None or isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite decimal")
+    try:
+        result = Decimal(str(value))
+    except (ValueError, InvalidOperation, TypeError) as exc:
+        raise ValueError(f"{name} must be a finite decimal") from exc
+    if not result.is_finite():
+        raise ValueError(f"{name} must be a finite decimal")
+    return result
+
+
+def stable_id(*parts) -> str:
+    encoded = json.dumps(parts, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         default=lambda v: str(v) if isinstance(v, Decimal) else _unsupported(v))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _unsupported(value):
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def validate_plan(plan) -> list[str]:
+    """Return actionable omissions; never turn an unparsed condition into a buy.
+
+    Drafts can be stored with these errors. Activation callers must require [].
+    Verification is explicit evidence review, not the existence of a URL.
+    """
+    errors = []
+    if not isinstance(plan, dict):
+        return ["plan must be an object"]
+    for field in ("id", "revision", "symbol", "status", "created_at", "thesis",
+                  "time_exit_policy", "valuation_basis"):
+        if not plan.get(field):
+            errors.append(f"missing {field}")
+    if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", str(plan.get("symbol", ""))) or str(plan.get("symbol", "")).endswith(".US"):
+        errors.append("symbol must be a bare uppercase US symbol")
+    if plan.get("status") not in {"candidate", "needs_review", "active", "superseded", "invalidated"}:
+        errors.append("invalid status")
+    revision = plan.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        errors.append("revision must be a positive integer")
+    for name in ("created_at", "next_review_at"):
+        try:
+            parse_time(plan.get(name))
+        except (ValueError, TypeError):
+            errors.append(f"invalid {name}")
+    try:
+        if parse_time(plan["next_review_at"]) <= parse_time(plan["created_at"]):
+            errors.append("next_review_at must follow created_at")
+    except (ValueError, TypeError, KeyError):
+        pass
+    def horizon(value, label):
+        if isinstance(value, bool) or not isinstance(value, int) or not 12 <= value <= 36:
+            errors.append(f"{label} must be 12–36 months")
+    horizon(plan.get("horizon_months"), "horizon_months")
+    def positive(value, label):
+        try:
+            number = decimal_value(value, label)
+            if number <= 0:
+                raise ValueError()
+            return number
+        except ValueError:
+            errors.append(f"{label} must be positive")
+            return None
+    if not isinstance(plan.get("evidence_refs"), list) or not plan["evidence_refs"]:
+        errors.append("evidence_refs required")
+    entry = plan.get("entry") if isinstance(plan.get("entry"), dict) else {}
+    low = positive(entry.get("low"), "entry.low")
+    high = positive(entry.get("high"), "entry.high")
+    amount = positive(entry.get("amount_usd"), "entry.amount_usd")
+    if low is not None and high is not None and low > high:
+        errors.append("entry.low exceeds entry.high")
+    if amount is not None and not Decimal("1000") <= amount <= Decimal("3000"):
+        errors.append("each buy amount must be 1000–3000 USD")
+    targets = plan.get("targets")
+    if not isinstance(targets, list) or not targets:
+        errors.append("evidenced target scenarios required")
+    else:
+        for i, target in enumerate(targets):
+            if not isinstance(target, dict):
+                errors.append(f"targets[{i}] must be an object")
+                continue
+            positive(target.get("price"), f"targets[{i}].price")
+            horizon(target.get("horizon_months"), f"targets[{i}].horizon_months")
+            for field in ("scenario", "method", "assumptions", "evidence_refs"):
+                if not target.get(field):
+                    errors.append(f"targets[{i}].{field} required")
+    schedule = plan.get("take_profit")
+    if not isinstance(schedule, list) or not schedule:
+        errors.append("take_profit schedule required")
+    else:
+        total = Decimal(0)
+        for i, step in enumerate(schedule):
+            if not isinstance(step, dict):
+                errors.append(f"take_profit[{i}] must be an object")
+                continue
+            positive(step.get("price"), f"take_profit[{i}].price")
+            fraction = positive(step.get("fraction"), f"take_profit[{i}].fraction")
+            if fraction is not None:
+                total += fraction
+        if total > 1:
+            errors.append("take_profit fractions exceed one")
+    stop = plan.get("stop") if isinstance(plan.get("stop"), dict) else {}
+    stop_price = positive(stop.get("price"), "stop.price")
+    if stop.get("confirmation") not in {"intraday", "daily_close"}:
+        errors.append("automatic stop confirmation currently supports intraday/daily_close only")
+    if stop_price is not None and low is not None and stop_price >= low:
+        errors.append("stop.price must be below entry.low")
+    if not isinstance(plan.get("invalidation_conditions"), list) or not plan["invalidation_conditions"] or any(not isinstance(x, str) or not x.strip() for x in plan.get("invalidation_conditions", [])):
+        errors.append("explicit invalidation_conditions required")
+    if not isinstance(plan.get("valuation_basis"), dict):
+        errors.append("valuation_basis must be an object")
+    verification = plan.get("verification") or {}
+    if not isinstance(verification, dict):
+        verification = {}
+    for field in ("provenance", "currency", "unit"):
+        if verification.get(field) is not True:
+            errors.append(f"verification.{field} required")
+    if plan.get("currency") != "USD":
+        errors.append("currency must be USD")
+    if plan.get("price_unit") not in {"per_share", "per_adr"}:
+        errors.append("price_unit must be per_share/per_adr")
+    if (plan.get("is_adr") or plan.get("price_unit") == "per_adr") and verification.get("adr") is not True:
+        errors.append("verification.adr required for ADR")
+    if plan.get("conditions_parsed") is False:
+        errors.append("entry conditions are unparsed")
+    return errors

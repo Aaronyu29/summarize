@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rhino-invest"
+version = "0.1.0"
+description = "Evidence-led manual investment ledger, planning and independent simulation"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.32,<3",
+  "exchange-calendars>=4.5,<5",
+  "akshare[quotes] @ git+https://github.com/Aaronyu29/akshare.git@cc7e451d7ba372596a70131121323a8b5f15ee73",
+  "longbridge==5.2.2",
+]
+
+[project.scripts]
+rhino-invest = "rhino_invest.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["rhino_invest*"]

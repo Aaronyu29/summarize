@@ -1,0 +1,34 @@
+[Unit]
+Description=Rhino manual investment research and Feishu worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/rhino-invest/current
+EnvironmentFile=/etc/rhino-invest/investment.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/rhino-invest/current/venv/bin/python -m rhino_invest serve --execute
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rhino-invest
+ReadOnlyPaths=/opt/rhino-video-digest
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+CPUQuota=50%
+MemoryHigh=512M
+MemoryMax=768M
+MemorySwapMax=128M
+TasksMax=64
+Nice=10
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
