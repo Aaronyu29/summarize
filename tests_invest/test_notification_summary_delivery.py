@@ -36,8 +36,8 @@ class NotificationSummaryTests(unittest.TestCase):
         text = report['notification_body']
         self.assertIn('23:00（北京时间）', text)
         self.assertIn('$20,000.00', text)
-        self.assertIn('GOOGL 用户报市值$750.00，待核对', text)
-        self.assertIn('1项计划待审核', text)
+        self.assertIn('持仓市值（你提供，待核对）：GOOGL $750.00', text)
+        self.assertIn('1项研究待核实', text)
         self.assertIn('暂无新增操作建议', text)
         for forbidden in ('360', '406', '540', '306', '987', 'schema', 'None', 'False', 'needs_review',
                           'raw unapproved', 'a' * 64, 'b' * 64, 'c' * 64, 'd' * 64, '{', '['):
@@ -48,6 +48,25 @@ class NotificationSummaryTests(unittest.TestCase):
         row = plan_row(self.plan(), self.advice())
         for field in ('买入区间', '目标情景', '止损价', '情景年化收益估算'):
             self.assertEqual(row[field], '待审核，暂不展示')
+
+    def test_reported_values_share_labels_and_only_show_dates_when_needed(self):
+        snapshot = self.snapshot()
+        snapshot['reported_holdings'].append({'symbol': 'CRCL', 'reported_market_value': '100',
+                                             'reported_at': '2026-10-23T14:34:00Z'})
+        report = {'kind': '每日复盘', 'timestamp': NOW, 'account': 'real', 'portfolio': snapshot}
+        row = notification_text(report).splitlines()[2]
+        self.assertEqual(row, '持仓市值（你提供，待核对）：GOOGL $750.00；CRCL $100.00')
+        for record in snapshot['reported_holdings']:
+            record['reported_at'] = '2026-10-22T12:00:00Z'
+        row = notification_text(report).splitlines()[2]
+        self.assertEqual(row.count('截至10月22日'), 1)
+        self.assertEqual(row.count('待核对'), 1)
+        snapshot['reported_holdings'][1]['reported_at'] = '2026-10-23T12:00:00Z'
+        row = notification_text(report).splitlines()[2]
+        self.assertIn('GOOGL $750.00（10月22日）', row)
+        self.assertIn('CRCL $100.00（10月23日）', row)
+        self.assertNotIn('截至', row)
+        self.assertEqual(len(notification_text(report).splitlines()), 6)
 
     def test_current_action_has_reason_bounded_prices_and_horizon_without_internal_details(self):
         advice = dict(self.advice(), status='actionable', action='buy', quantity='2', amount_usd='1000',

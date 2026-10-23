@@ -107,11 +107,26 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
     for position in positions[:4]:
         symbol = _symbol(position.get("symbol"))
         holdings.append(f"{symbol} {_number(position.get('quantity'))}股，市值{_number(position.get('market_value'), money=True)}")
-    for record in snapshot.get("reported_holdings", []):
-        if record.get("symbol") in known_symbols or len(holdings) >= 4:
-            continue
-        holdings.append(f"{_symbol(record.get('symbol'))} 用户报市值{_number(record.get('reported_market_value'), money=True)}，待核对（{beijing_time(record.get('reported_at'))}）")
-    lines.append("持仓：" + ("；".join(holdings) if holdings else "已核对为空仓" if snapshot.get("holdings_complete") else "尚未核对"))
+    notes = [record for record in snapshot.get("reported_holdings", [])
+             if record.get("symbol") not in known_symbols][:max(0, 4 - len(holdings))]
+    if notes:
+        def local_date(value):
+            try:
+                return parse_time(value).astimezone(timezone(timedelta(hours=8))).date()
+            except (TypeError, ValueError):
+                return None
+        dates = [local_date(record.get("reported_at")) for record in notes]
+        report_date = local_date(report.get("timestamp"))
+        same_date = len(set(dates)) == 1
+        cutoff = "（截至" + dates[0].strftime("%m月%d日") + "）" if same_date and dates[0] and report_date and dates[0] < report_date else ""
+        values = []
+        for record, date in zip(notes, dates):
+            suffix = ("（" + date.strftime("%m月%d日") + "）") if not same_date and date else "（日期待核对）" if date is None else ""
+            values.append(f"{_symbol(record.get('symbol'))} {_number(record.get('reported_market_value'), money=True)}{suffix}")
+        reported = "持仓市值（你提供，待核对）" + cutoff + "：" + "；".join(values)
+        lines.append(("持仓：" + "；".join(holdings) + "；" if holdings else "") + reported)
+    else:
+        lines.append("持仓：" + ("；".join(holdings) if holdings else "已核对为空仓" if snapshot.get("holdings_complete") else "尚未核对"))
     advice = [r for r in recommendations if actionable_notice(r, current_plans, now=now or report.get("timestamp")) and r.get("account", account) == account]
     if advice:
         for rec in advice[:1]:
@@ -143,7 +158,7 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
             lines.append(f"计划持有{horizon_text}；现持{days_text}；建议有效至{beijing_time(rec.get('expires_at'))}。")
     else:
         pending = sum(p.get("status") != "active" for p in current_plans)
-        lines.append("结论：暂无新增操作建议。" + (f"{pending}项计划待审核，暂不展示草稿价位。" if pending else ""))
+        lines.append("结论：暂无新增操作建议" + (f"；{pending}项研究待核实。" if pending else "。"))
     gaps = []
     if snapshot.get("cash") is None:
         gaps.append("实际现金")
