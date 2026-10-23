@@ -31,6 +31,8 @@ SCHEMA["成交录入"].extend(["拆股比例", "持仓成本总额美元", "成�
 SCHEMA["账户与资金"].append("错误说明")
 SCHEMA["账户与资金"].extend(["持仓核对设置", "持仓核对状态"])
 SCHEMA["投资计划"].append("设置错误说明")
+for _settings_table in ("账户与资金", "投资计划"):
+    SCHEMA[_settings_table].append("设置回执")
 
 TYPE_NAMES = {"期初现金": "opening_cash", "期初持仓": "opening_position", "买入": "buy", "卖出": "sell", "入金": "deposit", "出金": "withdrawal", "股息": "dividend", "拆股": "split", "更正": "correction", "作废": "correction"}
 
@@ -276,8 +278,8 @@ class Feishu:
                             if check not in ("已核对", "已核对（可空仓）", "已核对(可空仓)", "未核对"):
                                 raise ValueError("持仓核对设置须明确填写已核对（可空仓）或未核对")
                             settings["holdings_complete"] = check != "未核对"
-                        self._control(result, "account_control", f.get("账户") or "real", settings, f["设置确认状态"])
-                    except ValueError as exc:
+                        self._control(result, "account_control", f.get("账户") or "real", settings, f["设置确认状态"], source=(table, record))
+                    except (ValueError, FeishuError) as exc:
                         result["errors"].append({"record_id": record["record_id"], "error": str(exc)})
                         self._input_error(table, f.get("系统标识"), str(exc))
                 entry_id = f.get("录入标识") if table == "账户与资金" else f.get("系统标识")
@@ -315,10 +317,22 @@ class Feishu:
                     continue
                 try:
                     staged = stage_entry(self.store, entry)
+                    binding_key = stable_id("feishu-ledger-input", self.app_token, table, record["record_id"])
+                    binding = self.store.get("feishu_ledger_input", binding_key) or {}
+                    entry_hash = stable_id({k: v for k, v in staged.items() if k != "status"})
                     result["staged"].append(staged["id"])
                     if status in ("确认", "已确认"):
-                        confirmed = confirm_entry(self.store, entry_id)
+                        if binding.get("confirmed_entry_id") not in (None, entry_id) and (
+                                binding.get("staged_entry_id") != entry_id or binding.get("staged_hash") != entry_hash):
+                            raise ValueError("此行原成交确认已消费；新的录入标识须先暂存并核对，再明确确认")
+                        with self.store.transaction():
+                            confirmed = confirm_entry(self.store, entry_id)
+                            self.store.put("feishu_ledger_input", binding_key,
+                                {"confirmed_entry_id": entry_id, "confirmed_hash": entry_hash, "timestamp": utc_now()})
                         result["confirmed"].append(confirmed["id"])
+                    else:
+                        self.store.put("feishu_ledger_input", binding_key, dict(binding,
+                            staged_entry_id=entry_id, staged_hash=entry_hash, timestamp=utc_now()))
                     # Acknowledgment updates only managed processing fields; never overwrite user input.
                     key = f.get("系统标识")
                     if key:
@@ -340,8 +354,8 @@ class Feishu:
                     tranche = f.get("入场批次设置") or prior.get("tranche_id") or "entry"
                     if len(tranche) > 64 or any(ord(c) < 32 for c in tranche):
                         raise ValueError("Entry tranche identifier must be at most 64 printable characters")
-                    self._control(result, "plan_control", f["系统标识"], {"amount_usd": str(amount), "tranche_id": tranche}, f["设置确认状态"])
-                except ValueError as exc:
+                    self._control(result, "plan_control", f["系统标识"], {"amount_usd": str(amount), "tranche_id": tranche}, f["设置确认状态"], source=("投资计划", record))
+                except (ValueError, FeishuError) as exc:
                     result["errors"].append({"record_id": record["record_id"], "error": str(exc)})
                     self._input_error("投资计划", f.get("系统标识"), str(exc))
         return result
@@ -355,7 +369,7 @@ class Feishu:
         except FeishuError:
             pass  # The durable outbox already preserves any uncertain acknowledgment.
 
-    def _control(self, result, kind, key, values, status):
+    def _control(self, result, kind, key, values, status, *, source=None):
         if kind == "account_control" and key not in ("real", "paper"):
             raise ValueError("Account settings require real or paper")
         confirmed = status == "确认设置"
@@ -367,11 +381,79 @@ class Feishu:
         if not self.execute:
             result["previews"].append({"setting": kind, "id": key, **payload})
             return
+        if source is not None:
+            table, record = source
+            state_key = stable_id("feishu-setting-confirmation", self.app_token, table, record["record_id"])
+            identity = "setting-confirmation:" + state_key
+            state = self.store.get("feishu_setting_confirmation", state_key) or {}
+            input_hash = stable_id(kind, key, values)
+            if not confirmed:
+                self._write_control(kind + "_staged", key, payload)
+                self.store.put("feishu_setting_confirmation", state_key, dict(state,
+                    phase="staged", staged_hash=input_hash, timestamp=utc_now()))
+                return
+            # A new payload or explicit staging never bypasses an earlier unknown
+            # provider write. Only the old unique receipt can prove that outcome.
+            recovered_ack = False
+            for op_key, operation in self.store.items("feishu_outbox"):
+                if operation.get("identity") != identity or operation.get("status") not in ("pending", "unknown"):
+                    continue
+                expected = operation.get("body", {}).get("fields", {}).get("设置回执")
+                found = [r for r in self.records(table) if r["record_id"] == record["record_id"]
+                         and expected and self._text(r.get("fields", {}).get("设置回执")) == expected]
+                if len(found) != 1:
+                    raise UnknownOutcome("上次设置回执结果未知；须先核实原回执，不能用新数值或新确认绕过")
+                self.store.put("feishu_outbox", op_key, dict(operation, status="delivered",
+                    result={"record": found[0]}, reconciled_at=utc_now()))
+                recovered_ack = True
+            if recovered_ack:
+                # The outer row snapshot may predate the recovered server ack.
+                # Never treat its old confirm text as authority for a new value.
+                self.store.put("feishu_setting_confirmation", state_key, dict(state, phase="applied", acknowledged_at=utc_now()))
+                return
+            prior_op = self.store.get("feishu_outbox", state.get("operation_id", ""))
+            if state.get("phase") == "consumed" and prior_op and prior_op.get("status") == "delivered":
+                self.store.put("feishu_setting_confirmation", state_key, dict(state, phase="applied", acknowledged_at=utc_now()))
+                return
+            if state.get("phase") == "consumed":
+                if state.get("input_hash") != input_hash:
+                    raise ValueError("原设置确认已消费；编辑数值后请先待暂存，再明确确认设置")
+                self._ack_control(table, record["record_id"], state_key, state)
+                return
+            if state.get("phase") == "staged" and state.get("staged_hash") != input_hash:
+                raise ValueError("设置内容已在暂存后变化；请重新待暂存并核对后确认设置")
+            generation = state.get("generation", 0) + 1
+            receipt = stable_id(state_key, generation, input_hash)
+            body = {"fields": {"设置确认状态": "已应用", "设置回执": receipt}}
+            consumed = {"phase": "consumed", "generation": generation, "input_hash": input_hash,
+                        "body": body, "timestamp": utc_now(),
+                        "operation_id": stable_id("feishu", identity, "PUT", body)}
+            # Apply once and consume before external acknowledgement. A lost ack
+            # cannot turn this old confirmation into authority for a new value.
+            with self.store.transaction():
+                self._write_control(kind, key, payload)
+                self.store.put("feishu_setting_confirmation", state_key, consumed)
+            self._ack_control(table, record["record_id"], state_key, consumed)
+            result.setdefault("settings_applied", []).append({"kind": kind, "id": key})
+            return
         namespace = kind if confirmed else kind + "_staged"
+        self._write_control(namespace, key, payload)
+
+    def _write_control(self, namespace, key, payload):
         previous = self.store.get(namespace, key)
         if previous and all(previous.get(k) == v for k, v in payload.items()):
             return
         self.store.put(namespace, key, dict(payload, timestamp=utc_now()))
+
+    def _ack_control(self, table, record_id, state_key, consumed):
+        path = self._base() + "/tables/" + self.tables()[table] + "/records/" + record_id
+        expected = consumed["body"]["fields"]["设置回执"]
+        def check():
+            found = [r for r in self.records(table) if r["record_id"] == record_id
+                     and self._text(r.get("fields", {}).get("设置回执")) == expected]
+            return {"record": found[0]} if len(found) == 1 else None
+        self._operation("setting-confirmation:" + state_key, "PUT", path, consumed["body"], check=check)
+        self.store.put("feishu_setting_confirmation", state_key, dict(consumed, phase="applied", acknowledged_at=utc_now()))
 
     def notify(self, notification_id, text):
         """Optional bot notice with a stable visible receipt and unknown-outcome fence."""
@@ -461,7 +543,16 @@ class Feishu:
                 if operation.get("route") == "webhook":
                     unknown.append({"id": key, "operation": identity, "reason": "webhook_has_no_readback_manual_verification_required"})
                     continue
-                if identity.startswith("record:"):
+                if identity.startswith("setting-confirmation:"):
+                    parts = operation["path"].split("/")
+                    table_id, record_id = parts[-3], parts[-1]
+                    table = next((name for name, tid in self.tables().items() if tid == table_id), None)
+                    expected = operation.get("body", {}).get("fields", {}).get("设置回执")
+                    found = [r for r in self.records(table) if r["record_id"] == record_id
+                             and expected and self._text(r.get("fields", {}).get("设置回执")) == expected] if table else []
+                    if len(found) == 1 and self.execute:
+                        self.store.put("feishu_outbox", key, dict(operation, status="delivered", result={"record": found[0]}, reconciled_at=utc_now()))
+                elif identity.startswith("record:"):
                     _, table, _ = identity.split(":", 2)
                     fields = operation["body"]["fields"]
                     found = [r for r in self.records(table) if all(self._text(r.get("fields", {}).get(k)) == str(v) for k, v in fields.items())]

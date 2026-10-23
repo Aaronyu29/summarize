@@ -9,7 +9,7 @@ import unittest
 
 from rhino_invest.store import Store
 from rhino_invest.model import ModelGateway, UnknownModelOutcome
-from rhino_invest.research import ingest_archives, review_plan, register_external_evidence, bind_instrument_identity
+from rhino_invest.research import ingest_archives, review_plan, register_external_evidence, bind_instrument_identity, _run
 from tests_invest.test_decisions import active_plan, market, portfolio
 from rhino_invest.decisions import evaluate
 from rhino_invest.config import Config
@@ -31,7 +31,7 @@ class FixtureModel:
     def __init__(self, uncertain=False, adr=False):
         self.calls, self.uncertain, self.adr, self.frame_counts = [], uncertain, adr, []
 
-    def run(self, purpose, payload, frames=(), now=None, instruction=None):
+    def run(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None):
         self.calls.append(purpose)
         self.frame_counts.append(len(frames))
         symbol = 'TSM' if self.adr else 'NVDA'
@@ -78,8 +78,11 @@ class ResearchTests(unittest.TestCase):
         write(directory / 'frames.json', [{'timestamp_seconds': 100, 'path': 'frames\\frame-00100.jpg', 'sha256': digest(frame)}])
         write(directory / f'{VID}.info.json', {'id': VID, 'duration': 200, 'upload_date': '20261022'})
         write(directory / 'transcript.asr.json', {'audio_sha256': digest(directory / 'media.f139.m4a'),
-            'segments': [{'id': 35, 'start': 99, 'end': 105, 'text': 'Conditional creator entry, not execution'}]})
-        write(directory / 'visual-000.response.json', {'visual_facts': 'USD per share'})
+            'segments': [{'id': 35, 'start': 99, 'end': 105, 'text': 'Conditional creator entry, not execution'},
+                         {'id': 36, 'start': 180, 'end': 185, 'text': 'Full original transcript remains available, including unrelated context.'}]})
+        write(directory / 'visual-000.response.json', {'choices': [{'message': {
+            'reasoning_content': 'PRIVATE_PROVIDER_REASONING_SENTINEL' * 100,
+            'content': '{"visible_facts":"OLD_DERIVED_VISUAL_FACT_SENTINEL"}'}}], 'usage': {'total_tokens': 99999}})
         analysis = {'video_id': VID, 'claims': [{'evidence_segment_ids': [35], 'frame_seconds': 100}]}
         sealed = self.root / 'analysis-v1.json'
         write(sealed, {'videos': [analysis]})
@@ -92,6 +95,57 @@ class ResearchTests(unittest.TestCase):
             db.execute('CREATE TABLE analyses(video_id,revision,source,title,payload,analysis_sha256)')
             db.execute('INSERT INTO analyses VALUES(?,?,?,?,?,?)', (VID, '1', str(self.root), 'SOXX/TSM archived sample',
                 json.dumps(analysis), digest(sealed)))
+
+    def add_revision(self, revision='2'):
+        analysis = json.loads((self.root / 'analysis-v1.json').read_text(encoding='utf-8'))
+        analysis['revision'] = revision
+        sealed = self.root / f'analysis-v{revision}.json'
+        write(sealed, analysis)
+        manifest = json.loads((self.root / 'manifest-v1.json').read_text(encoding='utf-8'))
+        manifest['analysis_sha256'] = digest(sealed)
+        manifest['artifacts'] = [item for item in manifest['artifacts'] if item['path'] != 'analysis-v1.json']
+        manifest['artifacts'].append({'path': sealed.name, 'sha256': digest(sealed)})
+        write(self.root / f'manifest-v{revision}.json', manifest)
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('INSERT INTO analyses VALUES(?,?,?,?,?,?)', (VID, revision, str(self.root),
+                'Latest sealed revision', json.dumps(analysis['videos'][0]), digest(sealed)))
+        return sealed
+
+    def test_all_revisions_archived_but_only_latest_researched(self):
+        self.add_revision()
+        model = FixtureModel()
+        result = ingest_archives(self.store, self.db, model=model,
+            fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(len(self.store.items('research_evidence')), 2)
+        self.assertEqual([row['revision'] for row in result['historical_revisions']], ['1'])
+        self.assertEqual(len(model.calls), 4)
+        self.assertEqual(len(result['plans']), 1)
+        snapshot = self.store.get('research_evidence', result['plans'][0]['research_snapshot_id'])
+        self.assertEqual(snapshot['revision'], '2')
+
+    def test_corrupt_latest_does_not_fall_back_and_blocks_prior_advice(self):
+        model = FixtureModel()
+        plan = ingest_archives(self.store, self.db, model=model,
+            fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)['plans'][0]
+        self.store.put('advice_intent', 'pending', {'plan_id': plan['id'], 'status': 'pending'})
+        self.store.put('reservation', 'cash', {'plan_id': plan['id'], 'status': 'active'})
+        sealed = self.add_revision()
+        sealed.write_bytes(b'corrupt-latest-seal')
+        result = ingest_archives(self.store, self.db, model=model, now=NOW)
+        self.assertEqual(len(model.calls), 4)
+        self.assertEqual(result['plans'], [])
+        self.assertEqual(result['errors'][0]['revision'], '2')
+        self.assertEqual(self.store.get('plan', plan['id'])['status'], 'needs_review')
+        self.assertEqual(self.store.get('advice_intent', 'pending')['status'], 'cancelled')
+        self.assertEqual(self.store.get('reservation', 'cash')['status'], 'released')
+
+    def test_older_revision_is_still_verified(self):
+        self.add_revision()
+        (self.root / 'analysis-v1.json').write_bytes(b'corrupt-historical-seal')
+        result = ingest_archives(self.store, self.db, now=NOW)
+        self.assertEqual(result['errors'][0]['revision'], '1')
+        self.assertEqual(result['ingested'], 1)
 
     def test_seal_read_only_model_workflow_cache_and_integer_refs(self):
         model = FixtureModel()
@@ -281,7 +335,7 @@ class ResearchTests(unittest.TestCase):
             db.execute('CREATE TABLE analyses(video_id,revision,source,title,payload,analysis_sha256)')
             db.execute('INSERT INTO analyses VALUES(?,?,?,?,?,?)', row)
         class ReplayModel:
-            def run(self, purpose, payload, frames=(), now=None, instruction=None):
+            def run(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None):
                 if purpose == 'extract_levels':
                     available = {second for second, _ in frames}
                     levels = []
@@ -341,6 +395,61 @@ class ResearchTests(unittest.TestCase):
             Config.load(environ={'INVEST_RESEARCH_SINCE': '2026-10-23T10:10:36'})
         with self.assertRaises(ValueError):
             ingest_archives(self.store, self.db, research_since='not-a-date')
+
+    def test_model_transport_uses_primary_evidence_without_archived_provider_reasoning(self):
+        fixture, requests = FixtureModel(), []
+        def transport(body):
+            requests.append(body)
+            message = json.loads(body['messages'][1]['content'][0]['text'])
+            result = fixture.run(message['purpose'], message['evidence'])
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(result)}}]}
+        model = ModelGateway(self.store, {'enabled': True, 'model': 'deepseek-flash', 'base_url': 'https://offline.invalid',
+            'max_calls_per_day': 8, 'max_cost_usd_per_call': '0.5', 'max_cost_usd_per_day': '4',
+            'thinking': 'disabled', 'max_tokens': 12000, 'configuration_revision': 2}, transport)
+        result = ingest_archives(self.store, self.db, model=model,
+            fundamentals={'NVDA': {'financial_report': {'period': '2025', 'currency': 'USD'}}}, now=NOW)
+        self.assertEqual(result['errors'], [])
+        snapshot = self.store.items('research_evidence')[0][1]
+        self.assertIn('PRIVATE_PROVIDER_REASONING_SENTINEL', json.dumps(snapshot['visual_caches']))
+        sent = json.dumps(requests)
+        self.assertNotIn('PRIVATE_PROVIDER_REASONING_SENTINEL', sent)
+        self.assertNotIn('OLD_DERIVED_VISUAL_FACT_SENTINEL', sent)
+        self.assertNotIn('visual_caches', sent)
+        payloads = {json.loads(body['messages'][1]['content'][0]['text'])['purpose']:
+            json.loads(body['messages'][1]['content'][0]['text'])['evidence'] for body in requests}
+        for purpose in ('extract_levels', 'verify_levels'):
+            source = payloads[purpose]['source']
+            self.assertEqual(source['transcript']['segments'], snapshot['transcript']['segments'])
+            self.assertEqual(source['frames'][0]['sha256'], snapshot['frames'][0]['sha256'])
+            self.assertEqual(source['evidence_refs'], [snapshot['id']])
+            self.assertEqual(source['analysis_sha256'], snapshot['analysis_sha256'])
+        for purpose in ('compile_plan', 'review_plan'):
+            source = payloads[purpose]['source']
+            self.assertEqual([v['id'] for v in source['transcript']['segments']], [35])
+            self.assertEqual(source['transcript']['full_segment_count'], 2)
+            self.assertIn('cited', source['transcript']['selection'])
+        image_parts = [part for body in requests for part in body['messages'][1]['content'] if part['type'] == 'image_url']
+        self.assertEqual(len(image_parts), 2)
+        self.assertTrue(all(part['image_url']['detail'] == 'original' for part in image_parts))
+
+    def test_compile_unknown_scope_does_not_change_with_derived_level_ids(self):
+        ingest_archives(self.store, self.db, now=NOW)
+        snapshot = self.store.items('research_evidence')[0][1]
+        calls = []
+        def transport(body):
+            calls.append(body)
+            raise TimeoutError()
+        config = {'enabled': True, 'model': 'deepseek-flash', 'base_url': 'https://offline.invalid',
+            'max_calls_per_day': 8, 'max_cost_usd_per_call': '0.5', 'max_cost_usd_per_day': '4'}
+        payload = {'symbol': 'NVDA', 'source': snapshot, 'levels': [],
+            'fundamentals': {'financial_report': {'period': '2025'}}, 'evidence_ids': ['source', 'old-derived-level']}
+        with self.assertRaises(UnknownModelOutcome):
+            _run(ModelGateway(self.store, config, transport), 'compile_plan', payload, now=NOW)
+        payload['evidence_ids'] = ['source', 'new-derived-level']
+        with self.assertRaises(UnknownModelOutcome):
+            _run(ModelGateway(self.store, dict(config, configuration_revision=2), transport),
+                'compile_plan', payload, now='2026-10-24T15:00:00+00:00')
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == '__main__':

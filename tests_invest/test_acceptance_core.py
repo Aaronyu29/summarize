@@ -266,6 +266,13 @@ class AcceptanceCoreTests(unittest.TestCase):
         client = Feishu(self.store, Config(), execute=True)
         client.records = lambda table: copy.deepcopy(rows) if table == "账户与资金" else []
         client.upsert = lambda table, fields: {"status": "fixture"}
+        def acknowledge_setting(table, record_id, state_key, consumed):
+            # This fixture supplies an in-memory Bitable acknowledgement. It
+            # tests the risk gate, not a real provider write/readback contract.
+            row = next(row for row in rows if row["record_id"] == record_id)
+            row["fields"].update(consumed["body"]["fields"])
+            self.store.put("feishu_setting_confirmation", state_key, dict(consumed, phase="applied"))
+        client._ack_control = acknowledge_setting
         self.assertEqual(client.poll_inputs()["errors"], [])
         self.assertEqual(self.store.get("account_control", "real"), original_control)
         self.assertFalse(self.store.get("account_control_staged", "real")["confirmed"])
@@ -290,6 +297,66 @@ class AcceptanceCoreTests(unittest.TestCase):
         self.assertEqual(real["market_value_scope"], "recorded_positions_only_inventory_incomplete")
         self.assertEqual(self.actionable("real", ("buy", "add")), [])
         self.assertIn("actual_holdings_not_reconciled", result["recommendations"][0]["reasons"])
+
+    def test_late_setting_ack_cannot_authorize_edited_stale_confirmation(self):
+        from tests_invest.test_feishu_delivery import HTTP
+        class LateAcknowledgementHTTP(HTTP):
+            def __init__(self):
+                super().__init__()
+                self.defer_ack = True
+                self.pending_ack = None
+                self.commit_after_snapshot = False
+                self.ack_attempts = 0
+
+            def request(self, method, url, json=None, **kwargs):
+                if method == "PUT" and "设置回执" in (json or {}).get("fields", {}):
+                    self.ack_attempts += 1
+                    if self.defer_ack:
+                        self.defer_ack = False
+                        suffix = url.split("/tables/", 1)[1]
+                        table_id, record_id = suffix.split("/records/", 1)
+                        self.pending_ack = (table_id, record_id, copy.deepcopy(json["fields"]))
+                        raise TimeoutError("offline fixture: provider write still in flight")
+                response = super().request(method, url, json=json, **kwargs)
+                if self.commit_after_snapshot and method == "GET" and url.endswith("/records"):
+                    table_id, record_id, fields = self.pending_ack
+                    if "/tables/" + table_id + "/records" in url:
+                        # The poll already captured the old confirmation/new
+                        # value. Only its later reconciliation read sees this ack.
+                        row = next(row for row in self.rows[table_id] if row["record_id"] == record_id)
+                        row["fields"].update(fields)
+                        self.commit_after_snapshot = False
+                return response
+
+        cases = (("账户与资金", "account_control", "real",
+                  {"系统标识": "real", "账户": "real", "回撤硬限制设置": "0.20"},
+                  {"回撤硬限制设置": "0.10"}, "drawdown_limit", "0.20"),
+                 ("投资计划", "plan_control", "plan-fixture",
+                  {"系统标识": "plan-fixture", "单次投入设置美元": "1000", "入场批次设置": "first"},
+                  {"单次投入设置美元": "3000", "入场批次设置": "unconfirmed-second"}, "amount_usd", "1000"))
+        for table, namespace, key, fields, edited, value_key, original_value in cases:
+            with self.subTest(table=table), Store(":memory:") as store:
+                http = LateAcknowledgementHTTP()
+                config = Config(feishu_app_id="fixture-id", feishu_app_secret="fixture-secret", feishu_app_token="fixture-app")
+                client = Feishu(store, config, http=http, execute=True)
+                client.provision()
+                if namespace == "plan_control":
+                    store.put("plan", key, {"id": key})
+                table_id = client.tables()[table]
+                row = {"record_id": "settings-row", "fields": dict(fields, 设置确认状态="确认设置")}
+                http.rows[table_id].append(row)
+                first = client.poll_inputs()
+                self.assertTrue(first["errors"])
+                self.assertEqual(store.get(namespace, key)[value_key], original_value)
+                row["fields"].update(edited)  # No new confirmation was made.
+                http.commit_after_snapshot = True
+                restarted = Feishu(store, config, http=http, execute=True)
+                restarted.poll_inputs()
+                self.assertEqual(store.get(namespace, key)[value_key], original_value)
+                if namespace == "plan_control":
+                    self.assertEqual(store.get(namespace, key)["tranche_id"], "first")
+                self.assertEqual(http.ack_attempts, 1)
+                self.assertEqual(len(store.items("feishu_setting_confirmation")), 1)
 
 
 if __name__ == "__main__":

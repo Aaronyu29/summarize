@@ -91,6 +91,10 @@ class Config:
         for key, name in (("model", "INVEST_MODEL_NAME"), ("base_url", "INVEST_MODEL_BASE_URL"),
                           ("api_key_env", "INVEST_MODEL_API_KEY_ENV"),
                           ("max_calls_per_day", "INVEST_MODEL_MAX_CALLS_PER_DAY"),
+                          ("max_tokens", "INVEST_MODEL_MAX_TOKENS"),
+                          ("thinking", "INVEST_MODEL_THINKING"),
+                          ("reasoning_effort", "INVEST_MODEL_REASONING_EFFORT"),
+                          ("configuration_revision", "INVEST_MODEL_CONFIGURATION_REVISION"),
                           ("max_cost_usd_per_day", "INVEST_MODEL_MAX_COST_USD_PER_DAY"),
                           ("max_cost_usd_per_call", "INVEST_MODEL_MAX_COST_USD_PER_CALL")):
             if env.get(name):

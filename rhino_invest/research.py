@@ -99,8 +99,34 @@ def _row_order(row):
         return '', row[0], row[1]
 
 
+def _latest_revisions(rows):
+    versions = {}
+    for row in rows:
+        versions.setdefault(row[0], []).append(row[1])
+    return {video: (values[0] if len(values) == 1 else max(values, key=int)
+                    if all(re.fullmatch(r'[0-9]+', value) for value in values) else None)
+            for video, values in versions.items()}
+
+
+def _block_old_revision_plans(store, video_id):
+    """A damaged/ambiguous latest seal cannot leave an older revision actionable."""
+    for plan_id, plan in store.items('plan'):
+        evidence = store.get('research_evidence', plan.get('research_snapshot_id', '')) or {}
+        if evidence.get('video_id') != video_id or plan.get('status') in {'superseded', 'invalidated'}:
+            continue
+        reason = 'latest_sealed_revision_unavailable_requires_review'
+        issues = list(dict.fromkeys(list(plan.get('review_issues', [])) + [reason]))
+        store.put('plan', plan_id, dict(plan, status='needs_review', review_issues=issues))
+        for key, intent in store.items('advice_intent'):
+            if intent.get('plan_id') == plan_id and intent.get('status') in {'pending', 'suspended'}:
+                store.put('advice_intent', key, dict(intent, status='cancelled', reason=reason))
+        for key, reservation in store.items('reservation'):
+            if reservation.get('plan_id') == plan_id and reservation.get('status') == 'active':
+                store.put('reservation', key, dict(reservation, status='released', reason=reason))
+
+
 EXTRACT = '''Extract individual price/valuation/stop/target levels only from the supplied
-sealed transcript, original frames and visual caches. Return {"levels":[{"symbol":"TSM",
+complete sealed transcript and this batch of original frames. Return {"levels":[{"symbol":"TSM",
 "kind":"creator_entry|technical_support|valuation|historical_quote|target|stop",
 "value":null,"low":null,"high":null,"currency":null,"price_unit":null,
 "source_date":null,"adjustment":null,"source_horizon":null,"timestamp_seconds":0,
@@ -133,7 +159,80 @@ material fields have evidence; ambiguous currency/units/ADR forbid activation.''
 def _run(model, purpose, payload, frames=(), now=None):
     payload = dict(payload)
     instruction = payload.pop('instruction', None)
-    return model.run(purpose, payload, frames=frames, now=now, instruction=instruction)
+    source = payload.get('source')
+    plan = payload.get('plan') or {}
+    scope = stable_id('research-logical-call', purpose,
+        (source or {}).get('id') or plan.get('research_snapshot_id'), payload.get('symbol') or plan.get('symbol'),
+        _stable_fundamentals(payload.get('fundamentals')),
+        payload.get('event_id') or payload.get('review_event_id') or (payload.get('review_context') or {}).get('event_id'),
+        [second for second, _ in frames])
+    if source:
+        payload['source'] = _model_source(source, full_transcript=purpose in {'extract_levels', 'verify_levels'},
+                                          levels=payload.get('levels'))
+    if 'levels' in payload:
+        levels = payload['levels']
+        payload['levels'] = ({'levels': [_model_level(v) for v in levels['levels']]}
+            if isinstance(levels, dict) else [_model_level(v) for v in levels])
+    if 'plan' in payload:
+        payload['plan'] = _model_plan(payload['plan'])
+    context = payload.get('review_context')
+    if isinstance(context, dict):
+        context = dict(context)
+        if context.get('prior_plan'):
+            context['prior_plan'] = _model_plan(context['prior_plan'])
+        if context.get('event_review'):
+            context['event_review'] = {k: context['event_review'][k] for k in ('accepted', 'issues', 'checks')
+                                       if k in context['event_review']}
+        payload['review_context'] = context
+    return model.run(purpose, payload, frames=frames, now=now, instruction=instruction, call_scope=scope)
+
+
+def _model_level(level):
+    fields = ('id', 'symbol', 'kind', 'value', 'low', 'high', 'currency', 'price_unit', 'source_date',
+        'adjustment', 'source_horizon', 'timestamp_seconds', 'evidence_segment_ids', 'frame_seconds',
+        'conditions', 'uncertainty', 'verified', 'issues', 'evidence_refs')
+    return {key: level[key] for key in fields if key in level}
+
+
+def _model_plan(plan):
+    fields = ('id', 'revision', 'symbol', 'status', 'created_at', 'evidence_refs', 'thesis',
+        'horizon_months', 'next_review_at', 'currency', 'price_unit', 'is_adr', 'entry', 'targets',
+        'take_profit', 'stop', 'invalidation_conditions', 'time_exit_policy', 'valuation_basis',
+        'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
+        'fundamental_evidence_id', 'source_published_at')
+    return {key: plan[key] for key in fields if key in plan}
+
+
+def _model_source(snapshot, *, full_transcript, levels=None):
+    """Transport primary evidence, never archived provider envelopes or reasoning."""
+    if isinstance(levels, dict):
+        levels = levels.get('levels', [])
+    levels = levels or []
+    segment_ids = {ref for level in levels for ref in level.get('evidence_segment_ids', [])}
+    frame_seconds = {level.get('frame_seconds') for level in levels}
+    transcript = snapshot['transcript']
+    segments = transcript.get('segments', [])
+    selected = segments if full_transcript else [v for v in segments if v['id'] in segment_ids]
+    frames = snapshot['frames'] if full_transcript else [v for v in snapshot['frames'] if v['timestamp_seconds'] in frame_seconds]
+    transcript_hash = next((v['sha256'] for v in snapshot.get('files', [])
+        if v['relative_path'].replace('\\', '/').endswith('/transcript.asr.json')), None)
+    return {'id': snapshot['id'], 'video_id': snapshot['video_id'], 'revision': snapshot['revision'],
+        'title': snapshot['title'], 'metadata': dict(snapshot['metadata']),
+        'source_url': 'https://www.youtube.com/watch?v=' + snapshot['video_id'],
+        'analysis_sha256': snapshot['analysis_sha256'], 'manifest_sha256': snapshot['manifest_sha256'],
+        'evidence_refs': [snapshot['id']],
+        'transcript': {'source': transcript.get('source'), 'audio_sha256': transcript.get('audio_sha256'),
+            'sha256': transcript_hash, 'full_segment_count': len(segments),
+            'selection': 'complete transcript' if full_transcript else 'all complete segments cited by the included levels; full transcript archived locally',
+            'segments': [{key: segment[key] for key in ('id', 'start', 'end', 'text') if key in segment} for segment in selected]},
+        'frames': [{key: frame[key] for key in ('timestamp_seconds', 'sha256', 'source_url') if key in frame}
+                   for frame in frames]}
+
+
+def _model_cache_identity(model):
+    config = getattr(model, 'config', {})
+    return {key: config.get(key) for key in ('base_url', 'model', 'configuration_revision',
+                                            'max_tokens', 'thinking', 'reasoning_effort')}
 
 
 def _frames(snapshot):
@@ -344,7 +443,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             store.put('fundamental_evidence', fid, {'id': fid, 'data': fundamental,
                 'first_observed_at': moment}, immutable=True)
         evidence_ids = [snapshot['id'], fid] + [l['id'] for l in levels if l.get('symbol') == symbol and l.get('verified')]
-        payload = {'instruction': COMPILE, 'symbol': symbol, 'levels': [l for l in levels if l.get('symbol') == symbol],
+        symbol_levels = [l for l in levels if l.get('symbol') == symbol]
+        payload = {'instruction': COMPILE, 'symbol': symbol, 'levels': symbol_levels, 'source': snapshot,
             'fundamentals': fundamental, 'evidence_ids': evidence_ids, 'as_of': plan_moment,
             'review_context': context}
         proposed = _run(model, 'compile_plan', payload, now=plan_moment).get('plan', {})
@@ -356,7 +456,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if isinstance(plan['stop'], dict):
             plan['stop'].setdefault('confirmation', 'daily_close')
         review = _run(model, 'review_plan', {'instruction': REVIEW, 'plan': plan,
-            'source': snapshot, 'levels': levels, 'fundamentals': fundamental}, now=plan_moment)
+            'source': snapshot, 'levels': symbol_levels, 'fundamentals': fundamental,
+            'review_event_id': (context or {}).get('event_id')}, now=plan_moment)
         issues = _assess_plan(plan, review, evidence_ids, fundamental)
         if not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
             issues.append('No individually verified source levels')
@@ -385,10 +486,12 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
     moment = now or utc_now()
     cutoff = parse_time(research_since) if research_since is not None else None
     result = {'ingested': 0, 'unchanged': 0, 'errors': [], 'plans': [], 'deferred_before_since': [],
-              'research_since': cutoff.isoformat() if cutoff else None}
+              'research_since': cutoff.isoformat() if cutoff else None, 'historical_revisions': []}
     with contextlib.closing(sqlite3.connect(Path(archive_db).resolve().as_uri() + '?mode=ro', uri=True)) as db:
         rows = db.execute('SELECT video_id,revision,source,title,payload,analysis_sha256 FROM analyses ORDER BY video_id,revision').fetchall()
+    latest = _latest_revisions(rows)
     for row in sorted(rows, key=_row_order):
+        seal_validated = False
         try:
             snapshot = _snapshot(row, moment)
             store.put('research_archive_seal', stable_id(row[0], row[1], row[2]), {
@@ -401,14 +504,21 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
             else:
                 store.put('research_evidence', snapshot['id'], snapshot, immutable=True)
                 result['ingested'] += 1
+            seal_validated = True
+            if row[1] != latest[row[0]]:
+                result['historical_revisions'].append({'video_id': row[0], 'revision': row[1],
+                    'latest_revision': latest[row[0]], 'evidence_id': snapshot['id']})
+                if latest[row[0]] is None:
+                    _block_old_revision_plans(store, row[0])
+                continue
             if cutoff is not None and parse_time(_published_at(snapshot['metadata'])) < cutoff:
                 result['deferred_before_since'].append({'video_id': snapshot['video_id'],
                     'revision': snapshot['revision'], 'published_at': _published_at(snapshot['metadata']),
                     'evidence_id': snapshot['id']})
                 continue
             identities = {key: value['id'] for key, value in store.items('instrument_identity')}
-            workflow_id = stable_id(snapshot['id'], 'workflow-v2', sorted(symbols or []),
-                _stable_fundamentals(fundamentals or {}), identities)
+            workflow_id = stable_id(snapshot['id'], 'workflow-v3-primary-transport', sorted(symbols or []),
+                _stable_fundamentals(fundamentals or {}), identities, _model_cache_identity(model))
             completed = store.get('research_workflow', workflow_id)
             if model is None or completed:
                 if completed:
@@ -419,8 +529,7 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 attempt = {'timestamp': moment}
                 store.put('research_attempt', workflow_id, attempt, immutable=True)
             workflow_moment = attempt['timestamp']
-            extraction_key = stable_id('source-extraction-v2', snapshot['id'],
-                getattr(model, 'config', {}).get('model'), getattr(model, 'config', {}).get('base_url'))
+            extraction_key = stable_id('source-extraction-v3-primary-transport', snapshot['id'], _model_cache_identity(model))
             extraction = store.get('research_extraction', extraction_key)
             if extraction:
                 levels = extraction['levels']
@@ -446,6 +555,8 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 'level_ids': [l['id'] for l in levels], 'completed_at': workflow_moment}, immutable=True)
             result['plans'].extend(plans)
         except Exception as exc:
+            if not seal_validated and row[1] == latest.get(row[0]):
+                _block_old_revision_plans(store, row[0])
             result['errors'].append({'video_id': row[0], 'revision': row[1], 'error': type(exc).__name__,
                                      'detail': str(exc) if isinstance(exc, ValueError) else 'Research workflow blocked; inspect durable receipts'})
     return result

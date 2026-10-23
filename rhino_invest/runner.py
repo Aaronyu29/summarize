@@ -17,7 +17,7 @@ from .reporting import make_report, report_row, plan_row, portfolio_rows, readab
 
 
 SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
-               "TimeoutError", "ConnectionError", "UnknownModelOutcome", "ModelBudgetExceeded", "FeishuError",
+               "TimeoutError", "ConnectionError", "UnknownModelOutcome", "ModelBudgetExceeded", "ModelOutputInvalid", "ModelRejected", "FeishuError",
                "UnknownOutcome", "RuntimeError", "OperationalError", "JSONDecodeError", "ImportError", "ModuleNotFoundError"}
 
 
