@@ -1,0 +1,12 @@
+[Unit]
+Description=Scan RhinoFinance twice daily (Beijing time)
+
+[Timer]
+OnCalendar=*-*-* 10:45:00 Asia/Shanghai
+OnCalendar=*-*-* 14:30:00 Asia/Shanghai
+Persistent=true
+AccuracySec=1min
+Unit=rhino-video-digest.service
+
+[Install]
+WantedBy=timers.target

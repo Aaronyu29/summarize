@@ -10,6 +10,10 @@ coverage
 .pnpm-store/
 .turbo
 .cache
+/research-data/
+/tools/vendor/
+__pycache__/
+/.env.finance
 .output
 .wxt
 _pack

@@ -1,0 +1,38 @@
+[Unit]
+Description=RhinoFinance video research and Feishu digest
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/rhino-video-digest
+EnvironmentFile=/etc/rhino-video-digest.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=OMP_NUM_THREADS=1
+Environment=HF_HUB_DISABLE_XET=1
+Environment=HF_HOME=/opt/rhino-video-digest/models/hf
+Environment=XDG_CACHE_HOME=/opt/rhino-video-digest/models/cache
+ExecStart=/usr/bin/flock -n /opt/rhino-video-digest/data/worker.lock /opt/rhino-video-digest/venv/bin/python scripts/finance_cloud.py --data /opt/rhino-video-digest/data
+ExecStopPost=/opt/rhino-video-digest/venv/bin/python scripts/finance_alerts.py --data /opt/rhino-video-digest/data
+TimeoutStartSec=6h
+CPUQuota=100%
+MemoryHigh=1300M
+MemoryMax=1600M
+MemorySwapMax=256M
+TasksMax=64
+Nice=15
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/rhino-video-digest/data /opt/rhino-video-digest/models
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
