@@ -123,7 +123,7 @@ class Runner:
     def run_once(self):
         now = self.clock()
         result = {"timestamp": now, "started_at": now, "execute": self.execute, "errors": [], "quotes": [],
-                  "recommendations": [], "reports": [], "previews": []}
+                  "recommendations": [], "paper_recommendations": [], "reports": [], "previews": []}
         # Poll human inputs first so evaluation never uses a stale known ledger.
         input_current = True
         if self.feishu.app_token:
@@ -313,6 +313,7 @@ class Runner:
             paper_signature = stable_id(signature, _stable(snapshots["paper"]))
             try:
                 advice = evaluate(self.store, plan, quote, snapshots["paper"], now=now)
+                result["paper_recommendations"].append(advice)
                 self.store.put("evaluation_cursor", paper_key, {"signature": paper_signature,
                     "recommendation_id": advice.get("id"), "timestamp": now})
             except Exception as exc:
@@ -337,7 +338,8 @@ class Runner:
                 if self.store.get("schedule", marker):
                     continue
                 for account, snapshot in snapshots.items():
-                    result["reports"].append(self._schedule_report(kind, key, snapshot, plans, result["recommendations"], now))
+                    account_advice = result["paper_recommendations"] if account == "paper" else result["recommendations"]
+                    result["reports"].append(self._schedule_report(kind, key, snapshot, plans, account_advice, now))
                 self.store.put("schedule", marker, {"kind": kind, "period": key, "timestamp": now})
                 if kind == "季度复核":
                     for plan in plans:

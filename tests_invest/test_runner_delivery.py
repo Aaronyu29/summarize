@@ -6,6 +6,7 @@ from rhino_invest.config import Config
 from rhino_invest.store import Store
 from rhino_invest.runner import Runner
 from rhino_invest.research import seal_plan_review
+from rhino_invest.ledger import stage_entry, confirm_entry
 from tests_invest.test_acceptance_core import approved_plan, quote, FixtureCalendar
 
 
@@ -133,6 +134,48 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(second['timestamp'], '2026-10-23T15:01:02+00:00')
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0][1]['timestamp'], second['timestamp'])
+
+    def test_each_account_report_uses_its_own_advice_and_cash(self):
+        self._approved_fixture()
+        self.now = '2026-10-23T15:00:00+00:00'
+        self.runner.market.snapshots = lambda symbols, now=None: [quote(now, symbol=s) for s in symbols]
+        class AllReportsCalendar(FixtureCalendar):
+            def state(self, now):
+                return dict(super().state(now), weekly_due=True, quarter_end_due=True)
+        self.runner.calendar = AllReportsCalendar()
+        stage_entry(self.store, {'id': 'known-real-cash', 'account': 'real', 'type': 'opening_cash',
+            'timestamp': '2026-10-22T15:00:00+00:00', 'currency': 'USD', 'amount': '1234'})
+        confirm_entry(self.store, 'known-real-cash')
+        # Cash is confirmed, but the real inventory has deliberately not been
+        # reconciled. The separate paper account starts from known empty holdings.
+        result = self.runner.run_once()
+        self.assertEqual(result['errors'], [])
+        real = result['recommendations']
+        paper = result['paper_recommendations']
+        self.assertEqual(len(real), 1)
+        self.assertEqual(len(paper), 1)
+        self.assertEqual(real[0]['account'], 'real')
+        self.assertIn('actual_holdings_not_reconciled', real[0]['reasons'])
+        self.assertNotIn(real[0]['action'], ('buy', 'add'))
+        self.assertEqual((paper[0]['account'], paper[0]['action']), ('paper', 'buy'))
+        kinds = {'每日复盘', '每周复盘', '季度复核'}
+        reports = [r for r in result['reports'] if r['kind'] in kinds]
+        self.assertEqual(len(reports), 6)
+        for report in reports:
+            with self.subTest(kind=report['kind'], account=report['account']):
+                expected = paper if report['account'] == 'paper' else real
+                other = real if report['account'] == 'paper' else paper
+                self.assertEqual(report['recommendation_ids'], [r['id'] for r in expected])
+                self.assertTrue(set(report['recommendation_ids']).isdisjoint(r['id'] for r in other))
+                self.assertEqual(self.store.get('report', report['id']), report)
+                if report['account'] == 'paper':
+                    self.assertEqual(report['portfolio']['cash'], '20000')
+                    self.assertIn('实际现金：20000 USD', report['body'])
+                    self.assertIn('首次买入', report['body'])
+                    self.assertNotIn('实际现金：1234', report['body'])
+                else:
+                    self.assertEqual(report['portfolio']['cash'], '1234')
+        self.assertEqual(self.store.items('paper_fill'), [])
 
     def test_synchronous_research_elapsed_time_ages_quote_before_decision(self):
         self._approved_fixture()
