@@ -9,6 +9,20 @@ LEGACY = 'https://open.larksuite.com/open-apis/bot/v2/hook/fixture-legacy-hook'
 
 
 class NotificationConfigTests(unittest.TestCase):
+    def test_automatic_notifications_default_compatible_and_explicit_boolean_switch(self):
+        self.assertTrue(Config.load(environ={}).notifications_enabled)
+        for value in ('false', '0', 'off', 'no'):
+            config = Config.load(environ={'INVEST_NOTIFICATIONS_ENABLED': value})
+            self.assertFalse(config.notifications_enabled)
+            self.assertFalse(config.diagnostics()['notifications_enabled'])
+        for value in ('true', '1', 'on', 'yes'):
+            self.assertTrue(Config.load(environ={'INVEST_NOTIFICATIONS_ENABLED': value}).notifications_enabled)
+        for value in ('maybe', 'null'):
+            with self.assertRaises(ValueError):
+                Config.load(environ={'INVEST_NOTIFICATIONS_ENABLED': value})
+        with self.assertRaises(ValueError):
+            Config(notifications_enabled=1)
+
     def test_legacy_environment_is_not_implicitly_authorized(self):
         config = Config.load(environ={'LARK_WEBHOOK': LEGACY, 'LARK_WEBHOOK_SECRET': 'legacy-signing-secret'})
         self.assertIsNone(config.feishu_webhook_url)

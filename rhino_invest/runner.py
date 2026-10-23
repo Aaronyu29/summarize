@@ -168,12 +168,17 @@ class Runner:
             return None  # Do not tell an unheld-stock viewer to sell imaginary shares.
         close = quote.get("regular_close") or {}
         facts = advice.get("risk_evidence_ids") or [plan.get("stop"), close.get("session_date")]
-        identity = stable_id("independent-risk-notice", snapshot["account"], plan["id"], codes, facts,
-                             position.get("first_fill_at"), str(quantity))
+        fact_id = stable_id("independent-risk-notice", snapshot["account"], plan["id"], codes, facts,
+                            position.get("first_fill_at"), str(quantity))
+        policy = self.store.get("notification_policy", "automatic") or {}
+        generation = policy.get("generation", 0)
+        identity = stable_id(fact_id, "activation", generation) if generation else fact_id
         report_id = stable_id("report", "风险提示", identity, snapshot["account"])
         if self.store.get("report", report_id):
             return None
         report = make_report("风险提示", identity, snapshot, [plan], [advice], now=now)
+        report["risk_fact_id"] = fact_id
+        report["notification_generation"] = generation
         report["risk_info"] = {"symbol": plan["symbol"], "reasons": codes,
             "quantity": str(quantity) if quantity is not None and decimal_value(quantity) > 0 else None,
             "reported_market_value": note.get("reported_market_value"), "reported_at": note.get("reported_at"),
@@ -219,6 +224,13 @@ class Runner:
 
     def run_once(self):
         now = self.clock()
+        if self.execute:
+            with self.store.transaction():
+                previous = self.store.get("notification_policy", "automatic") or {}
+                enabled = self.config.notifications_enabled
+                generation = previous.get("generation", 0) + int(enabled and previous.get("enabled") is False)
+                self.store.put("notification_policy", "automatic", {"enabled": enabled,
+                    "generation": generation, "timestamp": now})
         result = {"timestamp": now, "started_at": now, "execute": self.execute, "errors": [], "quotes": [],
                   "recommendations": [], "paper_recommendations": [], "reports": [], "previews": []}
         # Poll human inputs first so evaluation never uses a stale known ledger.
@@ -517,6 +529,23 @@ class Runner:
         for key, report in report_items:
             if not self.store.get("notification", key):
                 try:
+                    if not self.config.notifications_enabled:
+                        if self.execute:
+                            self.store.put("notification", key, {"report_id": key, "status": "suppressed",
+                                "reason": "notifications_disabled", "timestamp": now}, immutable=True)
+                        continue
+                    if report.get("kind") == "风险提示" and report.get("risk_fact_id"):
+                        # A new activation is not permission to bypass an earlier
+                        # uncertain send for the same risk fact.
+                        related = {"notice:" + old_id for old_id, old in report_items
+                                   if old_id != key and old.get("kind") == "风险提示"
+                                   and (old.get("risk_fact_id") or old.get("period")) == report["risk_fact_id"]}
+                        if any(op.get("identity") in related and op.get("status") in {"pending", "unknown"}
+                               for _, op in self.store.items("feishu_outbox")):
+                            if self.execute:
+                                self.store.put("notification", key, {"report_id": key, "status": "suppressed",
+                                    "reason": "prior_risk_notice_outcome_unknown", "timestamp": now}, immutable=True)
+                            continue
                     group = (report.get("kind"), report.get("account", "real"))
                     if report.get("kind") in scheduled_kinds and latest_scheduled[group][1] != key:
                         if self.execute:
@@ -547,6 +576,7 @@ class Runner:
                 except Exception as exc:
                     self._error(result, "notification:" + key, exc)
         self.store.put("worker", "latest", {"timestamp": now, "execute": self.execute,
+            "notifications_enabled": self.config.notifications_enabled,
             "quote_count": len(result["quotes"]), "errors": result["errors"], "report_count": len(result["reports"]),
             "recommendation_count": len(result["recommendations"])})
         self._observe_health(result, now)
@@ -625,28 +655,48 @@ class Runner:
             deferred = research_state == "deferred" or unresolved_risk or any(code == "ModelBudgetExceeded" for _, code in issues)
             failures = sorted((stage, code) for stage, code in issues if code != "ModelBudgetExceeded")
             state = "blocked" if failures else "deferred" if deferred else "healthy"
-            signature = stable_id(state, sorted({stage for stage, _ in failures}))
+            # Deduplicate user-visible impact, not changing exception names or
+            # alternating pipeline stages that all mean research is paused.
+            categories = {"research": "research_paused", "archive_ingestion": "research_paused",
+                          "sealed_archive": "research_paused", "review": "research_paused",
+                          "retained_thesis_risk": "research_paused"}
+            impacts = {categories.get(stage, stage) for stage, _ in failures}
+            if deferred:
+                impacts.add("research_paused")
+            signature = stable_id("operations-impact", sorted(impacts))
             previous = self.store.get("ops_health", "latest")
             if not self.execute:
                 return
+            if previous and not self.config.notifications_enabled:
+                previous = dict(previous, notice_attempted=False)
+                self.store.put("ops_health", "latest", previous)
             observation = self.store.get("ops_observation", "latest") or {}
             consecutive = observation.get("consecutive", 0) + 1 if observation.get("signature") == signature else 1
             self.store.put("ops_observation", "latest", {"signature": signature, "consecutive": consecutive,
                 "status": state, "timestamp": now})
             if previous and previous.get("signature") == signature:
+                self.store.put("ops_health", "latest", dict(previous, status=state, timestamp=now,
+                    issues=[{"stage": a, "error": b} for a, b in failures]))
                 return
             urgent = research_state == "blocked" or any(code in {"UnknownModelOutcome", "UnknownOutcome"} for _, code in failures)
             if state == "blocked" and not urgent and consecutive < 2:
                 return  # One transient poll/transport error stays in the audit log.
             sequence = (previous or {}).get("sequence", 0) + 1
             transition = {"signature": signature, "status": state, "sequence": sequence,
-                          "timestamp": now, "issues": [{"stage": a, "error": b} for a, b in failures]}
+                          "timestamp": now, "issues": [{"stage": a, "error": b} for a, b in failures],
+                          "notice_attempted": False}
             # Save before attempting delivery: transport uncertainty must not cause
             # a new operational notice on every subsequent quote tick.
             self.store.put("ops_health", "latest", transition)
             if previous is None and state == "healthy":
                 return
             key = stable_id("investment-operations", sequence, signature)
+            if not self.config.notifications_enabled:
+                self.store.put("ops_notice", key, {"id": key, "status": "suppressed", "health": state,
+                    "timestamp": now, "reason": "notifications_disabled"})
+                return
+            if state == "healthy" and previous and previous.get("notice_attempted") is False:
+                return  # No recovery alert for an incident the user never received.
             title = "运行异常" if state == "blocked" else "研究延后" if state == "deferred" else "运行已恢复"
             lines = ["【犀牛投资·运维通知】" + title + " · " + beijing_time(now)]
             if failures:
@@ -663,6 +713,7 @@ class Runner:
             else:
                 lines.append("此前异常已恢复，系统继续跟踪；无需重复操作。非投资建议。")
             self.store.put("ops_notice", key, {"id": key, "status": "pending", "health": state, "timestamp": now})
+            self.store.put("ops_health", "latest", dict(transition, notice_attempted=True))
             try:
                 receipt = self.feishu.notify(key, "\n".join(lines))
                 self.store.put("ops_notice", key, {"id": key, "status": "disabled" if receipt.get("status") == "disabled" else "acknowledged",

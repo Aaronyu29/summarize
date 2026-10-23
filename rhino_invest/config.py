@@ -18,6 +18,7 @@ class Config:
     research_since: str | None = None
     symbols: tuple[str, ...] = ()
     interval_seconds: int = 60
+    notifications_enabled: bool = True
     feishu_app_id: str | None = field(default=None, repr=False)
     feishu_app_secret: str | None = field(default=None, repr=False)
     feishu_app_token: str | None = field(default=None, repr=False)
@@ -30,6 +31,13 @@ class Config:
     model: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
+        if isinstance(self.notifications_enabled, str):
+            value = self.notifications_enabled.strip().lower()
+            if value not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+                raise ValueError("INVEST_NOTIFICATIONS_ENABLED must be an explicit boolean")
+            self.notifications_enabled = value in {"true", "1", "yes", "on"}
+        elif not isinstance(self.notifications_enabled, bool):
+            raise ValueError("notifications_enabled must be a boolean")
         if self.research_since is not None:
             self.research_since = parse_time(self.research_since).isoformat()
         if self.feishu_webhook_url:
@@ -57,6 +65,7 @@ class Config:
             "database": "INVEST_DATABASE", "archive_database": "INVEST_ARCHIVE_DATABASE",
             "research_since": "INVEST_RESEARCH_SINCE",
             "symbols": "INVEST_SYMBOLS", "interval_seconds": "INVEST_INTERVAL_SECONDS",
+            "notifications_enabled": "INVEST_NOTIFICATIONS_ENABLED",
             "feishu_app_id": "INVEST_FEISHU_APP_ID", "feishu_app_secret": "INVEST_FEISHU_APP_SECRET",
             "feishu_app_token": "INVEST_FEISHU_APP_TOKEN", "feishu_chat_id": "INVEST_FEISHU_CHAT_ID",
             "feishu_webhook_url": "INVEST_FEISHU_WEBHOOK_URL", "feishu_webhook_secret": "INVEST_FEISHU_WEBHOOK_SECRET",
@@ -121,6 +130,7 @@ class Config:
             "database": self.database, "archive_configured": bool(self.archive_database),
             "research_since": self.research_since,
             "symbols": list(self.symbols), "interval_seconds": self.interval_seconds,
+            "notifications_enabled": self.notifications_enabled,
             "feishu_credentials_configured": bool(self.feishu_app_id and self.feishu_app_secret),
             "feishu_bitable_configured": bool(self.feishu_app_token),
             "feishu_chat_configured": bool(self.feishu_chat_id),
