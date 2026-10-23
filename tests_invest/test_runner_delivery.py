@@ -1,4 +1,5 @@
 import unittest
+import json
 from unittest.mock import patch
 
 from rhino_invest.config import Config
@@ -162,6 +163,67 @@ class RunnerTests(unittest.TestCase):
             self.now = '2026-10-23T20:11:00Z'
             self.runner.run_once()
         self.assertEqual(self.store.get('review_trigger', key), processed)
+
+    def test_background_ingestion_errors_are_blocked_with_sanitized_counts(self):
+        self.config.archive_database = 'fixture-archive.sqlite'
+        self.runner.model = object()
+        payload = {'ingested': 2, 'unchanged': 3, 'plans': [{'id': 'p'}], 'deferred_before_since': ['old'],
+                   'errors': [{'error': 'ValueError', 'detail': 'SECRET_PRIVATE_CONFIGURATION'}]}
+        with patch('rhino_invest.runner.ingest_archives', return_value=payload):
+            self.runner._research_cycle(['TSM'], {})
+        health = self.store.get('research_worker', 'latest')
+        self.assertEqual(health['status'], 'blocked')
+        self.assertEqual(health['error_count'], 1)
+        self.assertEqual(health['ingestion']['ingested'], 2)
+        self.assertEqual(health['ingestion']['plan_count'], 1)
+        self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(health))
+
+    def test_budget_deferral_is_not_falsely_completed_or_failed(self):
+        self.config.archive_database = 'fixture-archive.sqlite'
+        self.runner.model = object()
+        with patch('rhino_invest.runner.ingest_archives', return_value={
+                'errors': [{'error': 'ModelBudgetExceeded', 'detail': 'private'}], 'plans': []}):
+            self.runner._research_cycle(['TSM'], {})
+        health = self.store.get('research_worker', 'latest')
+        self.assertEqual(health['status'], 'deferred')
+        self.assertEqual(health['error_count'], 0)
+        self.assertEqual(health['deferred_count'], 1)
+
+    def test_operational_health_alerts_are_state_change_only_and_recovery_once(self):
+        notices = []
+        self.feishu.notify = lambda key, text: notices.append((key, text)) or {'status': 'provider_ack'}
+        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'ValueError'}]})
+        self.runner.run_once()
+        operational = [n for n in notices if '运维通知' in n[1]]
+        self.assertEqual(len(operational), 1)
+        self.assertIn('非投资建议', operational[0][1])
+        self.runner.run_once()
+        self.assertEqual(len([n for n in notices if '运维通知' in n[1]]), 1)
+        self.store.put('research_worker', 'latest', {'status': 'completed', 'errors': []})
+        self.runner.run_once()
+        self.runner.run_once()
+        operational = [n for n in notices if '运维通知' in n[1]]
+        self.assertEqual(len(operational), 2)
+        self.assertIn('运行已恢复', operational[-1][1])
+
+    def test_operational_notification_failure_never_recurses_or_retries_same_state(self):
+        attempts = []
+        def failing_notice(key, text):
+            attempts.append(key)
+            raise TimeoutError('SECRET_PRIVATE_CONFIGURATION')
+        self.feishu.notify = failing_notice
+        result = {'errors': [{'stage': 'official_quotes:private-id', 'error': 'ConnectionError'}]}
+        self.runner._observe_health(result, self.now)
+        self.runner._observe_health(result, self.now)
+        restarted = Runner(self.store, self.config, market=self.market, feishu=self.feishu,
+                           calendar=Calendar(), execute=True, clock=lambda: self.now)
+        restarted._observe_health(result, self.now)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result['errors'], [{'stage': 'official_quotes:private-id', 'error': 'ConnectionError'}])
+        record = self.store.items('ops_notice')[0][1]
+        self.assertEqual(record['status'], 'unknown')
+        self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(record))
+        self.assertNotIn('private-id', json.dumps(self.store.get('ops_health', 'latest')))
 
 
 if __name__ == '__main__':

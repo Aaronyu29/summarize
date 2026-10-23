@@ -16,6 +16,15 @@ from .feishu import Feishu
 from .reporting import make_report, report_row, plan_row, portfolio_rows, readable
 
 
+SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
+               "TimeoutError", "ConnectionError", "UnknownModelOutcome", "ModelBudgetExceeded", "FeishuError",
+               "UnknownOutcome", "RuntimeError", "OperationalError", "JSONDecodeError", "ImportError", "ModuleNotFoundError"}
+
+
+def _safe_error(value):
+    return value if isinstance(value, str) and value in SAFE_ERRORS else "ComponentError"
+
+
 def _stable(value):
     if isinstance(value, dict):
         return {k: _stable(v) for k, v in value.items() if k not in ("as_of", "timestamp", "quote_time", "fetched_at", "ingested_at", "updated_at")}
@@ -379,6 +388,7 @@ class Runner:
         self.store.put("worker", "latest", {"timestamp": now, "execute": self.execute,
             "quote_count": len(result["quotes"]), "errors": result["errors"], "report_count": len(result["reports"]),
             "recommendation_count": len(result["recommendations"])})
+        self._observe_health(result, now)
         if self._background_mode and self.execute and self.model:
             if not self._research_thread or not self._research_thread.is_alive():
                 self._research_thread = threading.Thread(target=self._research_cycle,
@@ -390,29 +400,99 @@ class Runner:
     def _research_cycle(self, symbols, fundamentals):
         owner = self
         class CancellableModel:
-            config = owner.model.config
+            config = getattr(owner.model, "config", {})
             def run(self, *args, **kwargs):
                 if owner._stop.is_set():
                     raise RuntimeError("Investment worker is stopping; no new paid call started")
                 return owner.model.run(*args, **kwargs)
         model = CancellableModel()
+        summary = {"timestamp": self.clock(), "status": "completed", "errors": [], "deferred": [],
+                   "ingestion": {"ingested": 0, "unchanged": 0, "plan_count": 0, "deferred_before_since_count": 0},
+                   "reviewed_count": 0}
         try:
             if self.config.archive_database and not self._stop.is_set():
-                ingest_archives(self.store, self.config.archive_database, model=model,
+                ingestion = ingest_archives(self.store, self.config.archive_database, model=model,
                     symbols=symbols or None, fundamentals=fundamentals, now=self.clock(), research_since=self.config.research_since)
+                summary["ingestion"] = {"ingested": ingestion.get("ingested", 0), "unchanged": ingestion.get("unchanged", 0),
+                    "plan_count": len(ingestion.get("plans", [])),
+                    "deferred_before_since_count": len(ingestion.get("deferred_before_since", []))}
+                for error in ingestion.get("errors", []):
+                    item = {"stage": "archive_ingestion", "error": _safe_error(error.get("error"))}
+                    summary["deferred" if item["error"] == "ModelBudgetExceeded" else "errors"].append(item)
             for key, trigger in self.store.items("review_trigger"):
                 if trigger.get("processed") or self._stop.is_set():
                     continue
                 for plan in self._plans():
                     if plan["symbol"] == trigger["symbol"]:
                         review_plan(self.store, plan, model, event_id=key, evidence=trigger["evidence"], now=self.clock())
+                        summary["reviewed_count"] += 1
                 self.store.put("review_trigger", key, dict(trigger, processed=True, processed_at=self.clock()))
-            self.store.put("research_worker", "latest", {"timestamp": self.clock(), "status": "completed"})
+            summary.update(timestamp=self.clock(), error_count=len(summary["errors"]), deferred_count=len(summary["deferred"]),
+                           status="blocked" if summary["errors"] else "deferred" if summary["deferred"] else "completed")
+            self.store.put("research_worker", "latest", summary)
         except Exception as exc:
             try:
-                self.store.put("research_worker", "latest", {"timestamp": self.clock(), "status": "blocked", "error": type(exc).__name__})
+                code = _safe_error(type(exc).__name__)
+                summary["deferred" if code == "ModelBudgetExceeded" else "errors"].append({"stage": "research_worker", "error": code})
+                summary.update(timestamp=self.clock(), error_count=len(summary["errors"]), deferred_count=len(summary["deferred"]),
+                               status="blocked" if summary["errors"] else "deferred")
+                self.store.put("research_worker", "latest", summary)
             except Exception:
                 pass  # Process shutdown retains pre-call outbox/model fences.
+
+    def _observe_health(self, result, now):
+        """One operational notice per durable health transition, never advice."""
+        try:
+            issues = {(str(e.get("stage", "worker")).split(":", 1)[0], _safe_error(e.get("error")))
+                      for e in result.get("errors", [])}
+            for error in result.get("ingestion", {}).get("errors", []):
+                issues.add(("archive_ingestion", _safe_error(error.get("error"))))
+            research = self.store.get("research_worker", "latest") or {}
+            research_state = research.get("status")
+            if research_state == "blocked":
+                issues.update(("research", _safe_error(e.get("error"))) for e in research.get("errors", []))
+                if not research.get("errors"):
+                    issues.add(("research", _safe_error(research.get("error"))))
+            deferred = research_state == "deferred" or any(code == "ModelBudgetExceeded" for _, code in issues)
+            failures = sorted((stage, code) for stage, code in issues if code != "ModelBudgetExceeded")
+            state = "blocked" if failures else "deferred" if deferred else "healthy"
+            signature = stable_id(state, failures)
+            previous = self.store.get("ops_health", "latest")
+            if previous and previous.get("signature") == signature:
+                return
+            if not self.execute:
+                return
+            sequence = (previous or {}).get("sequence", 0) + 1
+            transition = {"signature": signature, "status": state, "sequence": sequence,
+                          "timestamp": now, "issues": [{"stage": a, "error": b} for a, b in failures]}
+            # Save before attempting delivery: transport uncertainty must not cause
+            # a new operational notice on every subsequent quote tick.
+            self.store.put("ops_health", "latest", transition)
+            if previous is None and state == "healthy":
+                return
+            key = stable_id("investment-operations", sequence, signature)
+            title = "运行异常" if state == "blocked" else "研究延后" if state == "deferred" else "运行已恢复"
+            lines = ["【犀牛投资·运维通知】" + title, "这是系统运行状态，非投资建议。", "时间：" + now]
+            if failures:
+                labels = {"research": "研究任务", "archive_ingestion": "封存证据研究", "official_quotes": "官方行情",
+                          "feishu_input": "飞书账本读取", "notification": "报告通知", "export": "飞书投影"}
+                lines.extend(labels.get(stage, "投资任务") + "：" + code for stage, code in failures)
+            elif deferred:
+                lines.append("研究预算等条件导致延后；未把延后计作研究成功或实际交易。")
+            else:
+                lines.append("此前异常已恢复；投资建议与实际成交仍以各自记录为准。")
+            self.store.put("ops_notice", key, {"id": key, "status": "pending", "health": state, "timestamp": now})
+            try:
+                receipt = self.feishu.notify(key, "\n".join(lines))
+                self.store.put("ops_notice", key, {"id": key, "status": "disabled" if receipt.get("status") == "disabled" else "acknowledged",
+                    "health": state, "timestamp": now, "receipt": receipt})
+            except Exception as exc:
+                self.store.put("ops_notice", key, {"id": key, "status": "unknown", "health": state,
+                    "timestamp": now, "error": _safe_error(type(exc).__name__)})
+                # Deliberately do not append this failure to worker errors or
+                # notify again: notification errors cannot recurse into alerts.
+        except Exception:
+            pass  # Operational reporting cannot take down the investment worker.
 
     def _export(self, result, table, fields):
         try:
@@ -440,8 +520,10 @@ class Runner:
             try:
                 self.run_once()
             except Exception as exc:
-                self.store.put("worker", "latest", {"timestamp": self.clock(), "execute": self.execute,
-                    "errors": [{"stage": "worker", "error": type(exc).__name__}]})
+                failed = {"timestamp": self.clock(), "execute": self.execute,
+                    "errors": [{"stage": "worker", "error": type(exc).__name__}]}
+                self.store.put("worker", "latest", failed)
+                self._observe_health(failed, failed["timestamp"])
             stop.wait(self.config.interval_seconds)
         if self._research_thread and self._research_thread.is_alive():
             self._research_thread.join(timeout=30)
