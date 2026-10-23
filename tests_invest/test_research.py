@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from rhino_invest.store import Store
-from rhino_invest.model import ModelGateway, UnknownModelOutcome
+from rhino_invest.model import ModelGateway, UnknownModelOutcome, ModelOutputInvalid, ModelBudgetExceeded
 from rhino_invest.research import ingest_archives, review_plan, register_external_evidence, bind_instrument_identity, _run, COMPILE
 from tests_invest.test_decisions import active_plan, market, portfolio
 from rhino_invest.decisions import evaluate
@@ -683,6 +683,211 @@ class ResearchTests(unittest.TestCase):
         payload = {'symbol': 'NVDA', 'source': snapshot, 'levels': [], 'fundamentals': new_fund}
         with self.assertRaises(UnknownModelOutcome):
             _run(model, 'compile_plan', payload, frames=[(100, self.root / VID / 'frames/frame-00100.jpg')], store=self.store)
+        self.assertEqual(len(calls), 1)
+
+    def regeneration_fixture(self, transport, *, daily_calls=8, clock=None):
+        config = {'enabled': True, 'model': 'offline', 'base_url': 'https://offline.invalid',
+            'max_calls_per_day': daily_calls, 'max_cost_usd_per_call': '0.5',
+            'max_cost_usd_per_day': str(daily_calls / 2)}
+        model = ModelGateway(self.store, config, transport, clock=clock)
+        payload = {'instruction': 'Original trusted compile schema.', 'symbol': 'NVDA',
+            'fundamentals': {'financial_report': {'period': '2025'}}, 'evidence_ids': ['original-evidence']}
+        frames = [(100, self.root / VID / 'frames/frame-00100.jpg')]
+        return model, payload, frames
+
+    def test_compile_known_invalid_regenerates_once_with_same_evidence_images_and_cached_success(self):
+        bodies = []
+        malformed = '{"plan":{"price":123 BROKEN_OUTPUT_SENTINEL}}'
+        def transport(body):
+            bodies.append(body)
+            content = malformed if len(bodies) == 1 else '{"plan":{"status":"needs_review"}}'
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': content}}], 'usage': {'total_tokens': 20}}
+        model, payload, frames = self.regeneration_fixture(transport)
+        before_config = dict(model.config)
+        first = _run(model, 'compile_plan', payload, frames=frames, now=NOW, store=self.store)
+        receipts = self.store.items('model_receipt')
+        for moment in [NOW, '2026-10-24T15:00:00+00:00']:
+            restarted = ModelGateway(self.store, before_config, transport)
+            self.assertEqual(_run(restarted, 'compile_plan', payload, frames=frames, now=moment, store=self.store), first)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0]['messages'][1], bodies[1]['messages'][1])
+        self.assertNotIn('BROKEN_OUTPUT_SENTINEL', json.dumps(bodies[1]))
+        self.assertIn('FORMAT_REGENERATION_ATTEMPT=compile-json-v1', bodies[1]['messages'][0]['content'])
+        self.assertEqual(model.config, before_config)
+        self.assertEqual(self.store.items('model_receipt'), receipts)
+        self.assertTrue(any(r['response']['choices'][0]['message']['content'] == malformed for _, r in receipts))
+        self.assertEqual(len(self.store.items('model_response')), 1)
+
+    def test_compile_regeneration_second_invalid_is_fenced_at_two_calls(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"plan":['}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        for moment in [NOW, NOW, '2026-10-24T15:00:00+00:00']:
+            with self.assertRaises(ModelOutputInvalid):
+                _run(ModelGateway(self.store, model.config, transport), 'compile_plan', payload,
+                    frames=frames, now=moment, store=self.store)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.store.items('model_receipt')), 2)
+        self.assertEqual(self.store.items('model_response'), [])
+
+    def test_compile_regeneration_unknown_blocks_across_ticks_restart_and_day(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            if len(calls) > 1:
+                raise TimeoutError('Ambiguous regeneration outcome')
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"plan":['}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        for moment in [NOW, NOW, '2026-10-24T15:00:00+00:00']:
+            with self.assertRaises(UnknownModelOutcome):
+                _run(ModelGateway(self.store, model.config, transport), 'compile_plan', payload,
+                    frames=frames, now=moment, store=self.store)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.store.items('model_call')), 2)
+        self.assertEqual(len(self.store.items('model_receipt')), 1)
+
+    def test_compile_regeneration_respects_actual_daily_budget_without_reserving_unsent_calls(self):
+        calls, clock = [], [NOW]
+        def transport(body):
+            calls.append(body)
+            content = '{"plan":[' if len(calls) == 1 else '{"plan":{}}'
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': content}}]}
+        model, payload, frames = self.regeneration_fixture(transport, daily_calls=1, clock=lambda: clock[0])
+        for _ in range(2):
+            with self.assertRaises(ModelBudgetExceeded):
+                _run(model, 'compile_plan', payload, frames=frames, now=NOW, store=self.store)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.store.items('model_call')), 1)
+        original = self.store.items('model_receipt')[0]
+        clock[0] = '2026-10-24T15:00:00+00:00'
+        self.assertEqual(_run(model, 'compile_plan', payload, frames=frames, now=NOW, store=self.store), {'plan': {}})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.store.get('model_receipt', original[0]), original[1])
+        self.assertEqual(sorted(c['timestamp'] for _, c in self.store.items('model_call')), [NOW, clock[0]])
+
+    def test_review_known_invalid_has_no_automatic_format_regeneration(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            return {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"bad":['}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        with self.assertRaises(ModelOutputInvalid):
+            _run(model, 'review_plan', payload, frames=frames, now=NOW, store=self.store)
+        self.assertEqual(len(calls), 1)
+
+    def test_compile_length_receipt_never_uses_malformed_stop_regeneration(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            return {'choices': [{'finish_reason': 'length', 'message': {'content': '{"plan":['}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        for _ in range(2):
+            with self.assertRaises(ModelOutputInvalid):
+                _run(model, 'compile_plan', payload, frames=frames, now=NOW, store=self.store)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.store.items('model_receipt')), 1)
+
+    def test_compile_invalid_exception_without_exact_receipt_proof_never_regenerates(self):
+        class UnprovenModel:
+            config = {}
+            def __init__(self):
+                self.calls = 0
+            def run(self, *args, **kwargs):
+                self.calls += 1
+                raise ModelOutputInvalid('No durable receipt proof available')
+        model = UnprovenModel()
+        with self.assertRaises(ModelOutputInvalid):
+            _run(model, 'compile_plan', {'symbol': 'NVDA'}, now=NOW, store=self.store)
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(self.store.items('model_receipt'), [])
+
+    def test_structured_review_issues_are_preserved_as_stable_text_and_never_accepted(self):
+        for issues in [[{'field': 'eps', 'detail': {'unit': 'unresolved', 'period': 'unknown'}}], None,
+                       {'field': 'eps'}, 'not a list']:
+            with Store(':memory:') as store:
+                class StructuredReviewModel(FixtureModel):
+                    def run(self, purpose, payload, **kwargs):
+                        result = super().run(purpose, payload, **kwargs)
+                        if purpose == 'review_plan':
+                            result['issues'] = issues
+                        return result
+                result = ingest_archives(store, self.db, model=StructuredReviewModel(),
+                    fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
+                self.assertEqual(result['errors'], [])
+                plan = result['plans'][0]
+                self.assertEqual(plan['status'], 'needs_review')
+                self.assertTrue(plan['review_issues'])
+                self.assertTrue(all(isinstance(issue, str) for issue in plan['review_issues']))
+                saved_review = store.get('research_plan_review', plan['review_evidence_id'])['review']
+                self.assertEqual(saved_review['issues'], issues)
+                if isinstance(issues, list):
+                    self.assertIn('{"detail":{"period":"unknown","unit":"unresolved"},"field":"eps"}', plan['review_issues'][0])
+
+    def test_two_sources_frozen_at_same_revision_receive_final_revisions_before_review(self):
+        older_id = 'AAAAAAAAAAA'
+        older = self.root / 'older-source'
+        shutil.copytree(self.root / VID, older / older_id)
+        (older / older_id / (VID + '.info.json')).rename(older / older_id / (older_id + '.info.json'))
+        write(older / older_id / (older_id + '.info.json'),
+            {'id': older_id, 'duration': 200, 'upload_date': '20261021'})
+        analysis = {'video_id': older_id, 'claims': [{'evidence_segment_ids': [35], 'frame_seconds': 100}]}
+        write(older / 'analysis-v1.json', {'videos': [analysis]})
+        write(older / 'manifest-v1.json', {'analysis_sha256': digest(older / 'analysis-v1.json'), 'artifacts': [
+            {'path': p.relative_to(older).as_posix(), 'sha256': digest(p)}
+            for p in older.rglob('*') if p.is_file() and p.name != 'manifest-v1.json']})
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('INSERT INTO analyses VALUES(?,?,?,?,?,?)', (older_id, '1', str(older), 'Older source',
+                json.dumps(analysis), digest(older / 'analysis-v1.json')))
+        class InterruptedModel(FixtureModel):
+            def run(self, purpose, payload, **kwargs):
+                if purpose == 'compile_plan':
+                    raise RuntimeError('Injected unpaid stage interruption after freezing the attempt')
+                return super().run(purpose, payload, **kwargs)
+        data = {'NVDA': {'financial_report': {'period': '2025'}}}
+        first = ingest_archives(self.store, self.db, model=InterruptedModel(), fundamentals=data, now=NOW)
+        self.assertEqual(len(first['errors']), 2)
+        attempts = self.store.items('plan_attempt')
+        self.assertEqual([attempt['revision'] for _, attempt in attempts], [1, 1])
+        class ResumedModel(FixtureModel):
+            def __init__(self):
+                super().__init__()
+                self.reviewed_revisions = []
+            def run(self, purpose, payload, **kwargs):
+                if purpose == 'review_plan':
+                    self.reviewed_revisions.append(payload['plan']['revision'])
+                return super().run(purpose, payload, **kwargs)
+        resumed = ResumedModel()
+        result = ingest_archives(self.store, self.db, model=resumed, fundamentals=data,
+            now='2026-10-24T15:00:00+00:00')
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(resumed.reviewed_revisions, [1, 2])
+        self.assertEqual([p['revision'] for p in result['plans']], [1, 2])
+        self.assertEqual([p['created_at'] for p in result['plans']], [NOW, NOW])
+        self.assertEqual(self.store.items('plan_attempt'), attempts)
+        self.assertEqual(len(self.store.items('plan_revision')), 2)
+        self.assertEqual(self.store.items('plan')[0][1]['revision'], 2)
+        again = ingest_archives(self.store, self.db, model=resumed, fundamentals=data, now=NOW)
+        self.assertEqual(again['errors'], [])
+        self.assertEqual(resumed.reviewed_revisions, [1, 2])
+
+    def test_revision_reassignment_does_not_unlock_unknown_independent_review(self):
+        ingest_archives(self.store, self.db, now=NOW)
+        snapshot = self.store.items('research_evidence')[0][1]
+        calls = []
+        def transport(body):
+            calls.append(body)
+            raise TimeoutError()
+        model, _, frames = self.regeneration_fixture(transport)
+        payload = {'instruction': 'Independent original review.', 'source': snapshot, 'levels': [],
+            'plan': {'id': 'same-plan', 'symbol': 'NVDA', 'revision': 1},
+            'fundamentals': {'financial_report': {'period': '2025'}}}
+        with self.assertRaises(UnknownModelOutcome):
+            _run(model, 'review_plan', payload, frames=frames, now=NOW, store=self.store)
+        payload['plan']['revision'] = 2
+        with self.assertRaises(UnknownModelOutcome):
+            _run(model, 'review_plan', payload, frames=frames, now='2026-10-24T15:00:00+00:00', store=self.store)
         self.assertEqual(len(calls), 1)
 
 

@@ -197,6 +197,13 @@ assessment.condition, which must EXACTLY equal an existing plan.invalidation_con
 string. Return {"accepted":false,"condition":null,"evidence_refs":[],"issues":[]}.
 Accept only with the same original persisted evidence_refs as the assessment; do not
 treat the first model's assertion as evidence. No trade or invented new condition.'''
+COMPILE_FORMAT_REGENERATION = '''
+FORMAT_REGENERATION_ATTEMPT=compile-json-v1
+A previous completed response had unusable output format. Generate the entire plan
+again from the SAME original evidence and original images. Return one compact, valid
+JSON object following the original schema, with correctly nested braces and commas.
+Do not reconstruct, quote, repair or rely on the previous output. Preserve uncertainty,
+source references and all required fields; do not invent numbers to complete the JSON.'''
 
 
 def _run(model, purpose, payload, frames=(), now=None, store=None):
@@ -229,7 +236,37 @@ def _run(model, purpose, payload, frames=(), now=None, store=None):
             context['event_review'] = {k: context['event_review'][k] for k in ('accepted', 'issues', 'checks')
                                        if k in context['event_review']}
         payload['review_context'] = context
-    return model.run(purpose, payload, frames=frames, now=now, instruction=instruction, call_scope=scope)
+    from .model import ModelOutputInvalid
+    try:
+        return model.run(purpose, payload, frames=frames, now=now, instruction=instruction, call_scope=scope)
+    except ModelOutputInvalid as exc:
+        if (purpose != 'compile_plan' or not _completed_stop_receipt(
+                store or getattr(model, 'store', None), exc)):
+            raise
+        # This exception guarantees a completed durable receipt. The fixed
+        # instruction changes only this request fingerprint; its own receipt or
+        # unknown fence permits no further attempt across ticks/restarts/days.
+        return model.run(purpose, payload, frames=frames, now=now,
+            instruction=(instruction or '') + COMPILE_FORMAT_REGENERATION, call_scope=scope)
+
+
+def _completed_stop_receipt(store, error):
+    """Require this exact request's durable receipt; never infer known outcome."""
+    key = getattr(error, 'call_id', None)
+    if store is None or not isinstance(key, str):
+        return False
+    call = store.get('model_call', key)
+    if not call or call.get('purpose') != 'compile_plan' or store.get('model_response', key):
+        return False
+    receipt = store.get('model_receipt', key)
+    choices = (receipt or {}).get('response', {}).get('choices')
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)
+            and choices[0].get('finish_reason') == 'stop'):
+        return False
+    try:
+        return not isinstance(json.loads(choices[0]['message']['content']), dict)
+    except (ValueError, TypeError, KeyError):
+        return True
 
 
 def _guard_plan_scope(store, purpose, payload, frames, scope):
@@ -352,8 +389,25 @@ def _verify_levels(snapshot, extracted, checked):
     return result
 
 
+def _review_issues(value):
+    """Keep every reviewer objection auditable, including structured objections."""
+    if not isinstance(value, list):
+        return ['Independent review issues must be a list; received ' + type(value).__name__]
+    issues = []
+    for issue in value:
+        if isinstance(issue, str):
+            issues.append(issue if issue.strip() else 'Independent review contains an empty issue')
+        else:
+            try:
+                rendered = json.dumps(issue, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+            except (TypeError, ValueError):
+                rendered = 'Unserializable ' + type(issue).__name__
+            issues.append('Structured independent review issue: ' + rendered)
+    return issues
+
+
 def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
-    issues = list(review.get('issues', []))
+    issues = _review_issues(review.get('issues'))
     if review.get('accepted') is not True:
         issues.append('Independent review not accepted')
     known = set(evidence_ids)
@@ -655,8 +709,17 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         else:
             proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
         plan = dict(proposed)
+        # Another source can commit while this attempt is waiting for usable
+        # output. Keep economic input/as_of frozen, but let the independent
+        # reviewer see the actual final revision before sealing any new plan.
+        current_revision = (store.get('plan', plan_id) or {}).get('revision', 0)
+        revision = max(attempt['revision'], current_revision + 1)
+        assignment_key = stable_id('plan-revision-assignment', operation_key, revision)
+        store.put('plan_revision_assignment', assignment_key, {'operation_id': operation_key, 'plan_id': plan_id,
+            'attempt_revision': attempt['revision'], 'prior_revision': current_revision, 'revision': revision,
+            'analysis_as_of': plan_moment, 'economic_input_hash': stable_id(payload)}, immutable=True)
         plan.update(symbol=symbol, id=plan_id,
-            revision=attempt['revision'], created_at=plan_moment, status='needs_review', source_published_at=published_at)
+            revision=revision, created_at=plan_moment, status='needs_review', source_published_at=published_at)
         plan['next_review_at'] = next_review
         plan['thesis_valid_from'] = plan_moment
         plan['horizon_until'] = _horizon_end(plan_moment, plan.get('horizon_months'))
@@ -867,7 +930,7 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
         revised = next((p for p in compiled if p['symbol'] == plan['symbol']), None)
     if revised is None:
         # Missing original evidence cannot be renewed by a superficial review assurance.
-        result = dict(result, accepted=False, issues=list(result.get('issues', [])) + ['Original sealed research snapshot unavailable'])
+        result = dict(result, accepted=False, issues=_review_issues(result.get('issues')) + ['Original sealed research snapshot unavailable'])
     record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'],
         'event_id': event_id, 'review': result, 'revised_plan': revised,
         'status': revised['status'] if revised else 'needs_review'}

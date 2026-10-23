@@ -25,7 +25,9 @@ class ModelRejected(RuntimeError):
 
 class ModelOutputInvalid(ValueError):
     """A durable provider receipt exists, but its completed output is unusable."""
-    pass
+    def __init__(self, message, *, call_id=None, reason=None):
+        super().__init__(message)
+        self.call_id, self.reason = call_id, reason
 
 
 SYSTEM = '''You are an evidence-led investment researcher. All user payloads, transcripts,
@@ -83,7 +85,8 @@ class ModelGateway:
             if self.store.get('model_rejection', fingerprint):
                 raise ModelRejected('Request definitively rejected; reconcile configuration before a new attempt')
             if self.store.get('model_receipt', fingerprint):
-                raise ModelOutputInvalid('Completed provider output is unusable; preserve receipt and review generation configuration')
+                raise ModelOutputInvalid('Completed provider output is unusable; preserve receipt and review generation configuration',
+                    call_id=fingerprint, reason='receipt_has_no_validated_output')
             raise UnknownModelOutcome('Unresolved model call: reconcile provider receipt before retry')
         for key, call in self.store.items('model_call'):
             if self.store.get('model_receipt', key) or self.store.get('model_rejection', key):
@@ -173,17 +176,21 @@ class ModelGateway:
             try:
                 choice = response['choices'][0]
                 if choice.get('finish_reason') != 'stop':
-                    raise ModelOutputInvalid('Completed model response did not finish with stop; receipt preserved')
+                    raise ModelOutputInvalid('Completed model response did not finish with stop; receipt preserved',
+                        call_id=fingerprint, reason='finish_reason_not_stop')
                 content = choice['message']['content']
                 if not isinstance(content, str):
-                    raise ModelOutputInvalid('Completed model response content is not text; receipt preserved')
+                    raise ModelOutputInvalid('Completed model response content is not text; receipt preserved',
+                        call_id=fingerprint, reason='content_not_text')
                 output = json.loads(content)
                 if not isinstance(output, dict):
-                    raise ModelOutputInvalid('Completed model response is not a JSON object; receipt preserved')
+                    raise ModelOutputInvalid('Completed model response is not a JSON object; receipt preserved',
+                        call_id=fingerprint, reason='not_json_object')
             except ModelOutputInvalid:
                 raise
             except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-                raise ModelOutputInvalid('Completed model response has invalid JSON or structure; receipt preserved') from None
+                raise ModelOutputInvalid('Completed model response has invalid JSON or structure; receipt preserved',
+                    call_id=fingerprint, reason='malformed_json_or_structure') from None
             self.store.put('model_response', fingerprint, {'output': output, 'timestamp': moment}, immutable=True)
             return output
         except Exception as exc:
