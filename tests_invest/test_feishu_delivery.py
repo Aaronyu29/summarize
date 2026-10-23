@@ -184,6 +184,7 @@ class WebhookTests(unittest.TestCase):
         result = client.notify('first', '投资预览')
         self.assertEqual(result['status'], 'dry_run')
         self.assertFalse(result['readback_verified'])
+        self.assertEqual(result['body']['content']['text'], '投资预览')
         self.assertEqual(http.calls, [])
         self.assertNotIn('private-fixture-token', json.dumps(result))
 
@@ -195,6 +196,7 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual(receipt['verification'], 'provider_ack_only')
         self.assertFalse(receipt['readback_verified'])
         self.assertFalse(http.calls[0][2]['allow_redirects'])
+        self.assertEqual(http.calls[0][2]['json']['content']['text'], '投资状态')
         restarted = Feishu(self.store, self.config, http=http, execute=True)
         self.assertEqual(restarted.notify('first', '修改正文也不能重复发送同一回执'), receipt)
         self.assertEqual(len(http.calls), 1)

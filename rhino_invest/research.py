@@ -137,13 +137,24 @@ VERIFY = '''Reverify every extracted individual level against original transcrip
 including units, currency, dates, adjustment, horizon and conditions. Return
 {"checks":[{"index":0,"verified":false,"issues":[]}]} with exactly one check per level.
 Missing or ambiguous evidence must be verified=false; never repair by guessing.'''
+COMPILE_TEMPLATE = {'plan': {'symbol': None, 'thesis': None, 'horizon_months': None,
+    'next_review_at': None, 'currency': None, 'price_unit': None, 'is_adr': None,
+    'entry': {'low': None, 'high': None, 'amount_usd': None},
+    'targets': [{'scenario': scenario, 'price': None, 'horizon_months': None, 'method': 'eps_multiple',
+        'assumptions': {'eps': None, 'multiple': None, 'currency': None, 'price_unit': None,
+            'forecast_period': None, 'rationale': None, 'evidence_refs': []}, 'evidence_refs': []}
+        for scenario in ('base', 'bear')],
+    'take_profit': [{'price': None, 'fraction': None}], 'stop': {'price': None, 'confirmation': 'daily_close'},
+    'invalidation_conditions': [], 'time_exit_policy': None, 'valuation_basis': {},
+    'conditions_parsed': False, 'evidence_refs': []}}
 COMPILE = '''Build an INDEPENDENT 12-36 month investment plan from the verified evidence and
 raw financial reports/valuation below. The creator's technical levels are context only.
-Return {"plan":{symbol,thesis,horizon_months,next_review_at,currency,price_unit,is_adr,
-entry:{low,high,amount_usd},targets:[{scenario,price,horizon_months,method,assumptions,
-evidence_refs}],take_profit:[{price,fraction}],stop:{price,confirmation:"daily_close"},
-invalidation_conditions:[],time_exit_policy,valuation_basis:{},conditions_parsed:true,
-evidence_refs:[]}}. Use evidence_refs ONLY from supplied evidence IDs. Target method must
+Return exactly one JSON object following this valid JSON template. Replace nulls only
+with supported values, and set conditions_parsed true only after all conditions are parsed.
+JSON_TEMPLATE_BEGIN
+''' + json.dumps(COMPILE_TEMPLATE, ensure_ascii=False) + '''
+JSON_TEMPLATE_END
+Use evidence_refs ONLY from supplied evidence IDs. Target method must
 be eps_multiple with assumptions {eps,multiple,currency,price_unit,forecast_period,
 rationale,evidence_refs}; target=eps*multiple, at least base/bear scenarios. Forecast EPS
 and multiple are explicitly scenario assumptions, never pretend they are disclosed.
@@ -426,12 +437,25 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 adr_conversion_verified=bool(identity['metadata'].get('is_adr')
                     and identity['metadata'].get('ordinary_shares_per_adr')))
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
-        operation_key = stable_id('plan-operation', operation_id or stable_id(snapshot['id'], fid, context), symbol)
+        # Workflow discovery changes with the watch list; paid plans depend only
+        # on their own immutable source, relevant facts, model and explicit event.
+        event_context = None if not context else {
+            'event_id': context.get('event_id'),
+            'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
+        operation_key = stable_id('plan-operation-v2-symbol', snapshot['id'], symbol, fid,
+                                  _model_cache_identity(model), event_context)
         committed = store.get('plan_operation', operation_key)
+        legacy_key = stable_id('plan-operation', operation_id, symbol) if operation_id else None
+        if not committed and legacy_key:
+            # Reuse a provably identical pre-upgrade workflow, never infer old
+            # model settings from the current plan or another workflow's output.
+            committed = store.get('plan_operation', legacy_key)
+            if committed:
+                store.put('plan_operation', operation_key, committed, immutable=True)
         if committed:
             plans.append(committed['plan'])
             continue
-        attempt = store.get('plan_attempt', operation_key)
+        attempt = store.get('plan_attempt', operation_key) or (store.get('plan_attempt', legacy_key) if legacy_key else None)
         if not attempt:
             attempt = {'timestamp': moment, 'revision': previous['revision'] + 1 if previous else 1}
             store.put('plan_attempt', operation_key, attempt, immutable=True)

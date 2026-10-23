@@ -13,7 +13,8 @@ from .decisions import evaluate
 from .paper import paper_account, simulate
 from .watch import evaluate_levels, KINDS as WATCH_KINDS
 from .feishu import Feishu
-from .reporting import make_report, report_row, plan_row, portfolio_rows, readable
+from .reporting import (make_report, report_row, plan_row, portfolio_rows, readable,
+                        reported_holdings, with_reported_holdings, notification_text, actionable_notice, beijing_time)
 
 
 SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
@@ -149,6 +150,7 @@ class Runner:
         symbols = sorted(set(self.config.symbols) | {p["symbol"] for p in plans} |
                          {p["symbol"] for p in initial.get("positions", [])} |
                          {p["symbol"] for p in paper_initial.get("positions", [])} |
+                         {p["symbol"] for p in reported_holdings(self.store, now=now)} |
                          {level["symbol"] for _, level in self.store.items("research_level")
                           if level.get("verified") is True and level.get("kind") in WATCH_KINDS
                           and isinstance(level.get("symbol"), str)})
@@ -229,6 +231,7 @@ class Runner:
                     "period": event["timestamp"] + " · " + event["symbol"], "account": "视频观察", "timestamp": event["timestamp"],
                     "body": event["body"], "portfolio": {}, "recommendation_ids": [],
                     "watch_event_id": event["id"], "evidence_refs": event["evidence_refs"]}
+                report["notification_body"] = notification_text(report, watch_event=event)
                 self.store.put("report", report["id"], report, immutable=True)
                 result["reports"].append(report)
         # Replay prior paper intents on this later observed quote before generating
@@ -268,7 +271,8 @@ class Runner:
                     result["paper"].append(simulate(self.store, pending, list(quotes.values()), now=now))
             except Exception as exc:
                 self._error(result, "paper_simulation", exc)
-        snapshots = {account: portfolio(self.store, account, quotes=quotes, now=now) for account in ("real", "paper")}
+        snapshots = {account: with_reported_holdings(self.store, portfolio(self.store, account, quotes=quotes, now=now))
+                     for account in ("real", "paper")}
         for account, snapshot in snapshots.items():
             control = self.store.get("account_control", account) or {}
             if control.get("confirmed") and control.get("drawdown_limit") is not None:
@@ -321,7 +325,7 @@ class Runner:
         # Reservations can change during evaluation; publish the resulting cash
         # availability rather than the pre-evaluation planning snapshot.
         for account in snapshots:
-            refreshed = portfolio(self.store, account, quotes=quotes, now=now)
+            refreshed = with_reported_holdings(self.store, portfolio(self.store, account, quotes=quotes, now=now))
             for key in ("ledger_input_current", "drawdown_limit", "drawdown_status"):
                 if key in snapshots[account]:
                     refreshed[key] = snapshots[account][key]
@@ -377,10 +381,39 @@ class Runner:
                 self._export(result, "投资计划", plan_row(plan, recommendation))
             for key, report in self.store.items("report"):
                 self._export(result, "复盘报告", report_row(report))
-        for key, report in self.store.items("report"):
+        report_items = self.store.items("report")
+        scheduled_kinds = {"每日复盘", "每周复盘", "季度复核"}
+        latest_scheduled = {}
+        for key, report in report_items:
+            if report.get("kind") in scheduled_kinds:
+                group = (report.get("kind"), report.get("account", "real"))
+                order = (parse_time(report["timestamp"]), key)
+                if group not in latest_scheduled or order > latest_scheduled[group][0]:
+                    latest_scheduled[group] = (order, key)
+        for key, report in report_items:
             if not self.store.get("notification", key):
                 try:
-                    receipt = self.feishu.notify(key, report["body"])
+                    group = (report.get("kind"), report.get("account", "real"))
+                    if report.get("kind") in scheduled_kinds and latest_scheduled[group][1] != key:
+                        if self.execute:
+                            self.store.put("notification", key, {"report_id": key, "status": "suppressed",
+                                "reason": "newer_scheduled_report_available", "timestamp": now}, immutable=True)
+                        continue
+                    advice = [self.store.get("recommendation", identity) for identity in report.get("recommendation_ids", [])]
+                    advice = [rec for rec in advice if rec]
+                    delivery_plans = self._plans()
+                    if report.get("kind") == "重大变化" and not any(actionable_notice(rec, delivery_plans, now=now) for rec in advice):
+                        # Draft validation and routine waiting states stay in the
+                        # audit DB and the daily summary, without one alert per stock.
+                        if self.execute:
+                            self.store.put("notification", key, {"report_id": key, "status": "suppressed",
+                                "reason": "no_current_actionable_advice", "timestamp": now}, immutable=True)
+                        continue
+                    watch = self.store.get("watch_event", report.get("watch_event_id", "")) if report.get("kind") == "价格观察" else None
+                    app_meta = self.store.get("feishu_meta", "app") or {}
+                    text = notification_text(report, current_plans=delivery_plans, recommendations=advice, watch_event=watch,
+                                             now=now, table_url=app_meta.get("app_url"))
+                    receipt = self.feishu.notify(key, text)
                     if self.execute and receipt.get("status") != "disabled":
                         self.store.put("notification", key, {"report_id": key, "receipt": receipt, "timestamp": now}, immutable=True)
                     elif not self.execute:
@@ -391,10 +424,10 @@ class Runner:
             "quote_count": len(result["quotes"]), "errors": result["errors"], "report_count": len(result["reports"]),
             "recommendation_count": len(result["recommendations"])})
         self._observe_health(result, now)
-        if self._background_mode and self.execute and self.model:
+        if self._background_mode and self.execute and self.model and not self._stop.is_set():
             if not self._research_thread or not self._research_thread.is_alive():
                 self._research_thread = threading.Thread(target=self._research_cycle,
-                    args=(symbols, fundamentals), name="investment-research", daemon=True)
+                    args=(symbols, fundamentals), name="investment-research", daemon=False)
                 self._research_thread.start()
             result["research"] = "background_worker"
         return result
@@ -458,12 +491,19 @@ class Runner:
             deferred = research_state == "deferred" or any(code == "ModelBudgetExceeded" for _, code in issues)
             failures = sorted((stage, code) for stage, code in issues if code != "ModelBudgetExceeded")
             state = "blocked" if failures else "deferred" if deferred else "healthy"
-            signature = stable_id(state, failures)
+            signature = stable_id(state, sorted({stage for stage, _ in failures}))
             previous = self.store.get("ops_health", "latest")
-            if previous and previous.get("signature") == signature:
-                return
             if not self.execute:
                 return
+            observation = self.store.get("ops_observation", "latest") or {}
+            consecutive = observation.get("consecutive", 0) + 1 if observation.get("signature") == signature else 1
+            self.store.put("ops_observation", "latest", {"signature": signature, "consecutive": consecutive,
+                "status": state, "timestamp": now})
+            if previous and previous.get("signature") == signature:
+                return
+            urgent = research_state == "blocked" or any(code in {"UnknownModelOutcome", "UnknownOutcome"} for _, code in failures)
+            if state == "blocked" and not urgent and consecutive < 2:
+                return  # One transient poll/transport error stays in the audit log.
             sequence = (previous or {}).get("sequence", 0) + 1
             transition = {"signature": signature, "status": state, "sequence": sequence,
                           "timestamp": now, "issues": [{"stage": a, "error": b} for a, b in failures]}
@@ -474,15 +514,19 @@ class Runner:
                 return
             key = stable_id("investment-operations", sequence, signature)
             title = "运行异常" if state == "blocked" else "研究延后" if state == "deferred" else "运行已恢复"
-            lines = ["【犀牛投资·运维通知】" + title, "这是系统运行状态，非投资建议。", "时间：" + now]
+            lines = ["【犀牛投资·运维通知】" + title + " · " + beijing_time(now)]
             if failures:
-                labels = {"research": "研究任务", "archive_ingestion": "封存证据研究", "official_quotes": "官方行情",
-                          "feishu_input": "飞书账本读取", "notification": "报告通知", "export": "飞书投影"}
-                lines.extend(labels.get(stage, "投资任务") + "：" + code for stage, code in failures)
+                effects = {"research": "研究待核查，新研究建议暂缓", "archive_ingestion": "研究待核查，新研究建议暂缓",
+                           "official_quotes": "行情暂不可用，相关操作建议暂缓", "feishu_input": "账本暂无法核对，新增操作建议暂缓",
+                           "notification": "部分报告通知延后", "export": "工作台更新暂时延后"}
+                impact = list(dict.fromkeys(effects.get(stage, "投资任务暂不可用") for stage, _ in failures))
+                lines.append("影响：" + "；".join(impact[:2]) + "。")
+                lines.append("处理：系统继续检查；结果不明的请求已禁止盲目重试，无需重复提交。非投资建议。")
             elif deferred:
-                lines.append("研究预算等条件导致延后；未把延后计作研究成功或实际交易。")
+                lines.append("影响：新研究暂时延后，现有账本保留。")
+                lines.append("处理：等待预算或条件恢复，无需重复提交。非投资建议。")
             else:
-                lines.append("此前异常已恢复；投资建议与实际成交仍以各自记录为准。")
+                lines.append("此前异常已恢复，系统继续跟踪；无需重复操作。非投资建议。")
             self.store.put("ops_notice", key, {"id": key, "status": "pending", "health": state, "timestamp": now})
             try:
                 receipt = self.feishu.notify(key, "\n".join(lines))
@@ -528,14 +572,27 @@ class Runner:
                 self._observe_health(failed, failed["timestamp"])
             stop.wait(self.config.interval_seconds)
         if self._research_thread and self._research_thread.is_alive():
-            self._research_thread.join(timeout=30)
+            self.store.put("worker_shutdown", "latest", {"timestamp": self.clock(),
+                "status": "draining", "research_inflight": True, "grace_seconds": 660})
+            self._research_thread.join(timeout=660)
+            if self._research_thread.is_alive():
+                # Persist uncertainty before the service supervisor's longer
+                # stop deadline. Do not abandon/interrupt the paid request here;
+                # its pre-call model fence remains authoritative across restart.
+                self.store.put("worker_shutdown", "latest", {"timestamp": self.clock(),
+                    "status": "inflight_outcome_unknown", "research_inflight": True,
+                    "grace_seconds": 660, "waiting_for_receipt": True})
+                self._research_thread.join()
+            self.store.put("worker_shutdown", "latest", {"timestamp": self.clock(),
+                "status": "completed", "research_inflight": False})
 
 
 def status(store):
     outbox = [v for _, v in store.items("feishu_outbox")]
     return {"worker": store.get("worker", "latest"),
             "research_worker": store.get("research_worker", "latest"),
-            "portfolio": portfolio(store, "real"), "paper_portfolio": portfolio(store, "paper"),
+            "shutdown": store.get("worker_shutdown", "latest"),
+            "portfolio": with_reported_holdings(store, portfolio(store, "real")), "paper_portfolio": portfolio(store, "paper"),
             "staged_count": len(store.items("ledger_staged")),
             "confirmed_count": len(store.events("ledger")), "plan_count": len(store.items("plan")),
             "pending_feishu": sum(v["status"] in ("pending", "unknown") for v in outbox),

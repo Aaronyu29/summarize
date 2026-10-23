@@ -170,12 +170,20 @@ class ModelGateway:
                 'cost_usd': response.get('cost_usd'), 'actual_cost_known': response.get('cost_usd') is not None,
                 'budget_basis': 'estimated_reservation_not_provider_enforced_cap',
                 'reserved_cost_usd': str(ceiling)}, immutable=True)
-            choice = response['choices'][0]
-            if choice.get('finish_reason') != 'stop':
-                raise ModelOutputInvalid('Completed model response did not finish with stop; receipt preserved')
-            output = json.loads(choice['message']['content'])
-            if not isinstance(output, dict):
-                raise ValueError('Expected JSON object')
+            try:
+                choice = response['choices'][0]
+                if choice.get('finish_reason') != 'stop':
+                    raise ModelOutputInvalid('Completed model response did not finish with stop; receipt preserved')
+                content = choice['message']['content']
+                if not isinstance(content, str):
+                    raise ModelOutputInvalid('Completed model response content is not text; receipt preserved')
+                output = json.loads(content)
+                if not isinstance(output, dict):
+                    raise ModelOutputInvalid('Completed model response is not a JSON object; receipt preserved')
+            except ModelOutputInvalid:
+                raise
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                raise ModelOutputInvalid('Completed model response has invalid JSON or structure; receipt preserved') from None
             self.store.put('model_response', fingerprint, {'output': output, 'timestamp': moment}, immutable=True)
             return output
         except Exception as exc:

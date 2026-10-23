@@ -257,6 +257,7 @@ class RunnerTests(unittest.TestCase):
         self.feishu.notify = failing_notice
         result = {'errors': [{'stage': 'official_quotes:private-id', 'error': 'ConnectionError'}]}
         self.runner._observe_health(result, self.now)
+        self.assertEqual(attempts, [])  # one transient request failure stays quiet
         self.runner._observe_health(result, self.now)
         restarted = Runner(self.store, self.config, market=self.market, feishu=self.feishu,
                            calendar=Calendar(), execute=True, clock=lambda: self.now)

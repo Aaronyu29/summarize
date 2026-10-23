@@ -9,7 +9,7 @@ import unittest
 
 from rhino_invest.store import Store
 from rhino_invest.model import ModelGateway, UnknownModelOutcome
-from rhino_invest.research import ingest_archives, review_plan, register_external_evidence, bind_instrument_identity, _run
+from rhino_invest.research import ingest_archives, review_plan, register_external_evidence, bind_instrument_identity, _run, COMPILE
 from tests_invest.test_decisions import active_plan, market, portfolio
 from rhino_invest.decisions import evaluate
 from rhino_invest.config import Config
@@ -61,6 +61,14 @@ class FixtureModel:
 
 
 class ResearchTests(unittest.TestCase):
+    def test_compile_prompt_embeds_valid_nested_json_template_without_example_prices(self):
+        template = COMPILE.split('JSON_TEMPLATE_BEGIN\n', 1)[1].split('\nJSON_TEMPLATE_END', 1)[0]
+        plan = json.loads(template)['plan']
+        self.assertEqual([t['scenario'] for t in plan['targets']], ['base', 'bear'])
+        self.assertTrue(all(t['price'] is None and t['assumptions']['eps'] is None for t in plan['targets']))
+        self.assertEqual(plan['stop'], {'price': None, 'confirmation': 'daily_close'})
+        self.assertFalse(plan['conditions_parsed'])
+
     def setUp(self):
         temp_root = Path(__file__).resolve().parents[1] / 'research-data/test-tmp'
         temp_root.mkdir(parents=True, exist_ok=True)
@@ -264,6 +272,50 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(second['errors'][0]['error'], 'UnknownModelOutcome')
         self.assertEqual(calls.count('compile_plan'), 1)
         self.assertEqual(len(self.store.items('model_call')), 3)
+        changed_model = ModelGateway(self.store, dict(model.config, configuration_revision=2), transport)
+        third = ingest_archives(self.store, self.db, model=changed_model, symbols=['NVDA', 'META'],
+            fundamentals=dict(data, META={'financial_report': {'period': '2027'}}), now='2026-10-24T15:00:00+00:00')
+        self.assertEqual(third['errors'][0]['error'], 'UnknownModelOutcome')
+        self.assertEqual(calls.count('compile_plan'), 1)
+
+    def test_plan_cache_ignores_unrelated_watch_symbols_facts_and_identities(self):
+        model = FixtureModel()
+        data = {'NVDA': {'financial_report': {'period': '2025'}}}
+        first = ingest_archives(self.store, self.db, model=model, symbols=['NVDA'], fundamentals=data, now=NOW)
+        for symbols, facts in [(['NVDA', 'META'], data),
+                               (['NVDA', 'META'], dict(data, META={'financial_report': {'period': '2026'}}))]:
+            result = ingest_archives(self.store, self.db, model=model, symbols=symbols, fundamentals=facts,
+                now='2026-10-24T15:00:00+00:00')
+            self.assertEqual(result['errors'], [])
+            self.assertEqual(result['plans'], first['plans'])
+        self.store.put('instrument_identity', 'META', {'id': 'unrelated-reviewed-identity'})
+        result = ingest_archives(self.store, self.db, model=model, symbols=['NVDA', 'META'], fundamentals=data, now=NOW)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(model.calls, ['extract_levels', 'verify_levels', 'compile_plan', 'review_plan'])
+        self.assertEqual(len(self.store.items('plan_revision')), 1)
+
+    def test_plan_cache_recompiles_relevant_facts_identity_model_and_explicit_events(self):
+        model = FixtureModel()
+        model.config = {'configuration_revision': 1}
+        data = {'NVDA': {'financial_report': {'period': '2025'}}}
+        ingest_archives(self.store, self.db, model=model, fundamentals=data, now=NOW)
+        data['NVDA']['financial_report']['period'] = '2026'
+        ingest_archives(self.store, self.db, model=model, fundamentals=data, now=NOW)
+        self.store.put('instrument_identity', 'NVDA', {'id': 'reviewed-identity',
+            'metadata': {'is_adr': False, 'currency': 'USD', 'price_unit': 'per_share'}})
+        ingest_archives(self.store, self.db, model=model, fundamentals=data, now=NOW)
+        model.config['configuration_revision'] = 2
+        result = ingest_archives(self.store, self.db, model=model, fundamentals=data, now=NOW)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(model.calls.count('compile_plan'), 4)
+        self.assertEqual(model.calls.count('extract_levels'), 2)
+        plan = result['plans'][0]
+        for event in ['new-risk-one', 'new-risk-two']:
+            result = review_plan(self.store, plan, model, event_id=event,
+                evidence={'risk': 'Same facts, separately authorized new event'}, now=NOW)
+            self.assertIsNotNone(result['revised_plan'])
+        self.assertEqual(model.calls.count('compile_plan'), 6)
+        self.assertEqual(model.calls.count('event_review'), 2)
 
     def test_raw_financial_change_and_latest_quarterly_cache_feed_revisions(self):
         model = FixtureModel()

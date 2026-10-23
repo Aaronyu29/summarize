@@ -50,6 +50,28 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ModelOutputInvalid):
             model.run('extract', {}, now=NOW)
 
+    def test_stop_receipt_with_malformed_nested_json_is_preserved_and_not_repaired(self):
+        # Reproduce the live failure class: a target object lacks its closing
+        # brace before the targets array closes, despite finish_reason=stop.
+        raw = '{"plan":{"targets":[{"assumptions":{"eps":null},"evidence_refs":[]],"stop":{"price":null}}}'
+        provider = {'choices': [{'finish_reason': 'stop', 'message': {'content': raw}}],
+                    'usage': {'prompt_tokens': 43945, 'completion_tokens': 1615}}
+        calls = []
+        def transport(body):
+            calls.append(body)
+            return provider
+        model = ModelGateway(self.store, CONFIG, transport)
+        with self.assertRaises(ModelOutputInvalid):
+            model.run('compile_plan', {'source': 'sealed-source'}, call_scope='source-symbol')
+        receipt = self.store.items('model_receipt')[0]
+        self.assertEqual(receipt[1]['response'], provider)
+        self.assertEqual(receipt[1]['response']['choices'][0]['message']['content'], raw)
+        self.assertEqual(self.store.items('model_response'), [])
+        with self.assertRaises(ModelOutputInvalid):
+            ModelGateway(self.store, CONFIG, transport).run('compile_plan', {'source': 'sealed-source'}, call_scope='source-symbol')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.store.get('model_receipt', receipt[0]), receipt[1])
+
     def test_actual_clock_resets_budget_while_analysis_clock_stays_frozen(self):
         current = [NOW]
         calls = []

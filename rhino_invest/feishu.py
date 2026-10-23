@@ -134,6 +134,8 @@ class Feishu:
         except FeishuError:
             self.store.put("feishu_outbox", op_id, dict(operation, status="rejected"))
             raise
+        # Persist the provider ID before readback, including across a restart.
+        self.store.put("feishu_outbox", op_id, dict(operation, result=result))
         # A 2xx is insufficient: verify the state through a separate read.
         try:
             verified = check() if check else result
@@ -456,7 +458,7 @@ class Feishu:
         self.store.put("feishu_setting_confirmation", state_key, dict(consumed, phase="applied", acknowledged_at=utc_now()))
 
     def notify(self, notification_id, text):
-        """Optional bot notice with a stable visible receipt and unknown-outcome fence."""
+        """Human-facing text; delivery IDs stay in the durable outbox."""
         if self.execute:
             for _, operation in self.store.items("feishu_outbox"):
                 if operation.get("identity") != "notice:" + notification_id:
@@ -465,28 +467,54 @@ class Feishu:
                     return operation.get("result", {})
                 if operation.get("route") == "webhook" and operation.get("status") in ("pending", "unknown"):
                     raise UnknownOutcome("Webhook outcome is unresolved and has no API readback; automatic resend is fenced")
+                if operation.get("status") in ("pending", "unknown"):
+                    found = self._notice_readback(operation)
+                    if found is not None:
+                        self.store.put("feishu_outbox", operation["id"], dict(operation, status="delivered", result=found, reconciled_at=utc_now()))
+                        return found
+                    raise UnknownOutcome("Message outcome is unresolved; no matching provider message ID was verified")
         if not self.config.feishu_chat_id:
             if self.config.feishu_webhook_url:
                 return self._notify_webhook(notification_id, text)
             return {"status": "disabled", "reason": "chat_or_explicit_webhook_not_configured"}
-        marker = "[投资回执:" + notification_id + "]"
-        content = text + "\n" + marker
         path = "/im/v1/messages?receive_id_type=chat_id"
         body = {"receive_id": self.config.feishu_chat_id, "msg_type": "text",
-                "content": json.dumps({"text": content}, ensure_ascii=False), "uuid": stable_id("notice", notification_id)[:32]}
+                "content": json.dumps({"text": text}, ensure_ascii=False), "uuid": stable_id("notice", notification_id)[:32]}
         def check():
-            messages = self._list("/im/v1/messages", params={"container_id_type": "chat", "container_id": self.config.feishu_chat_id})
-            for msg in messages:
-                if marker in msg.get("body", {}).get("content", ""):
-                    return {"message_id": msg["message_id"]}
-            return None
+            operation = self.store.get("feishu_outbox", stable_id("feishu", "notice:" + notification_id, "POST", body))
+            return self._notice_readback(operation or {})
         return self._operation("notice:" + notification_id, "POST", path, body, check=check)
+
+    def _notice_readback(self, operation):
+        message_id = (operation.get("result") or {}).get("message_id")
+        expected = operation.get("body", {}).get("content")
+        if message_id and expected:
+            data = self._request("GET", "/im/v1/messages/" + quote(message_id, safe=""))
+            for msg in data.get("items", []):
+                if msg.get("message_id") == message_id:
+                    try:
+                        matches = json.loads(msg.get("body", {}).get("content", "")) == json.loads(expected)
+                    except (ValueError, TypeError):
+                        matches = False
+                    if matches:
+                        return {"message_id": message_id}
+            return None
+        # Legacy messages can still be reconciled by their old visible marker.
+        # New messages without a provider ID remain fenced; identical text is
+        # never sufficient evidence that this particular send was delivered.
+        marker = "[投资回执:" + operation.get("identity", "").removeprefix("notice:") + "]"
+        if expected and marker in expected:
+            chat = operation.get("body", {}).get("receive_id")
+            messages = self._list("/im/v1/messages", params={"container_id_type": "chat", "container_id": chat})
+            matches = [msg for msg in messages if marker in msg.get("body", {}).get("content", "")]
+            if len(matches) == 1:
+                return {"message_id": matches[0]["message_id"]}
+        return None
 
     def _notify_webhook(self, notification_id, text):
         """Custom bots acknowledge acceptance; they cannot verify chat readback."""
         identity = "notice:" + notification_id
-        marker = "[投资回执:" + notification_id + "]"
-        body = {"msg_type": "text", "content": {"text": text + "\n" + marker}}
+        body = {"msg_type": "text", "content": {"text": text}}
         if not self.execute:
             return {"status": "dry_run", "operation": identity, "route": "webhook",
                     "verification": "provider_ack_only", "readback_verified": False, "body": body}

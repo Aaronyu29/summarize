@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import timedelta, timezone
 from .common import stable_id, utc_now, parse_time, decimal_value
 
 
@@ -40,6 +42,126 @@ def readable(value):
     return str(value)
 
 
+def beijing_time(value):
+    try:
+        return parse_time(value).astimezone(timezone(timedelta(hours=8))).strftime("%m月%d日 %H:%M") + "（北京时间）"
+    except (TypeError, ValueError):
+        return "时间待核对"
+
+
+def _number(value, *, money=False):
+    try:
+        number = decimal_value(value)
+        return ("$" if money else "") + f"{number:,.2f}"
+    except (TypeError, ValueError):
+        return "待补"
+
+
+def _symbol(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", value) else "该股票"
+
+
+def _notification_reason(reasons):
+    values = []
+    for reason in reasons or []:
+        text = REASONS.get(reason) if isinstance(reason, str) else None
+        if text and text not in values:
+            values.append(text)
+    return "；".join(values[:2]) or "资料或交易条件尚待核实"
+
+
+def actionable_notice(recommendation, current_plans, *, now=None):
+    """Only a still-current approved plan can expose actionable price levels."""
+    plan = next((p for p in current_plans if p.get("id") == recommendation.get("plan_id")), None)
+    if now is not None:
+        try:
+            if parse_time(recommendation.get("expires_at")) <= parse_time(now) or parse_time(plan.get("next_review_at")) <= parse_time(now):
+                return False
+        except (TypeError, ValueError, AttributeError):
+            return False
+    return bool(plan and plan.get("status") == "active" and plan.get("revision") == recommendation.get("revision")
+                and recommendation.get("status") == "actionable"
+                and recommendation.get("action") in {"buy", "add", "reduce", "exit"})
+
+
+def notification_text(report, *, current_plans=(), recommendations=(), watch_event=None, now=None, table_url=None):
+    """Allowlisted short Chinese delivery, including for legacy audit-only reports."""
+    stamp = beijing_time(report.get("timestamp"))
+    if report.get("kind") == "价格观察":
+        event = watch_event or {}
+        if not event:
+            return "【犀牛投资·价格观察】\n" + stamp + "\n视频观察区间发生变化，仅供关注，不构成买卖建议。"
+        zone = event.get("zone") or {}
+        title = "触达视频观察区间" if event.get("touch_observed") is True else "报价跨过视频观察区间，未确认实际触达"
+        return (f"【犀牛投资·价格观察】\n{stamp}\n{_symbol(event.get('symbol'))}：{title}。\n"
+                f"报价 {_number(event.get('price'), money=True)}；观察区间 {_number(zone.get('low'), money=True)}–{_number(zone.get('high'), money=True)}。\n"
+                f"行情时间：{beijing_time(event.get('quote_time'))}\n视频观点仅供关注，不构成买卖建议。")
+    account = report.get("account", "real")
+    label = "模拟账户" if account == "paper" else "真实账户"
+    kind = report.get("kind") if report.get("kind") in {"每日复盘", "每周复盘", "季度复核", "重大变化"} else "投资更新"
+    snapshot = report.get("portfolio") or {}
+    lines = [f"【{kind}·{label}】{stamp}", "现金：" + _number(snapshot.get("cash"), money=True)]
+    positions = snapshot.get("positions") or []
+    known_symbols = {p.get("symbol") for p in positions}
+    holdings = []
+    for position in positions[:4]:
+        symbol = _symbol(position.get("symbol"))
+        holdings.append(f"{symbol} {_number(position.get('quantity'))}股，市值{_number(position.get('market_value'), money=True)}")
+    for record in snapshot.get("reported_holdings", []):
+        if record.get("symbol") in known_symbols or len(holdings) >= 4:
+            continue
+        holdings.append(f"{_symbol(record.get('symbol'))} 用户报市值{_number(record.get('reported_market_value'), money=True)}，待核对（{beijing_time(record.get('reported_at'))}）")
+    lines.append("持仓：" + ("；".join(holdings) if holdings else "已核对为空仓" if snapshot.get("holdings_complete") else "尚未核对"))
+    advice = [r for r in recommendations if actionable_notice(r, current_plans, now=now or report.get("timestamp")) and r.get("account", account) == account]
+    if advice:
+        for rec in advice[:1]:
+            symbol = _symbol(rec.get("symbol"))
+            lines.append(f"动作：{symbol} {ACTIONS.get(rec.get('action'), '等待复核')}，数量{_number(rec.get('quantity'))}股" +
+                         (f"，本次预算{_number(rec.get('amount_usd'), money=True)}" if rec.get("action") in {"buy", "add"} else ""))
+            lines.append("原因：" + _notification_reason(rec.get("reasons")))
+            plan = next(p for p in current_plans if p.get("id") == rec.get("plan_id"))
+            entry, stop = plan.get("entry") or {}, plan.get("stop") or {}
+            horizon = plan.get("horizon_months")
+            horizon_text = str(horizon) + "个月" if isinstance(horizon, int) and not isinstance(horizon, bool) and 12 <= horizon <= 36 else "期限待复核"
+            targets = [t for t in plan.get("targets", []) if isinstance(t, dict)]
+            target_text = " / ".join(_number(t.get("price"), money=True) for t in targets[:3]) or "待复核"
+            lines.append(f"买入区间 {_number(entry.get('low'), money=True)}–{_number(entry.get('high'), money=True)}；目标情景 {target_text}。")
+            steps = []
+            for step in plan.get("take_profit", [])[:3]:
+                if not isinstance(step, dict):
+                    continue
+                try:
+                    percent = f"{decimal_value(step.get('fraction')) * 100:.2f}".rstrip("0").rstrip(".") + "%"
+                except (TypeError, ValueError):
+                    percent = "待核对"
+                steps.append(_number(step.get("price"), money=True) + "卖出" + percent)
+            lines.append("分批止盈：" + "；".join(steps or ["规则待复核"]))
+            mode = {"daily_close": "常规交易日收盘确认", "weekly_close": "本周最后交易日收盘确认", "intraday": "常规时段盘中确认"}.get(stop.get("confirmation"), "确认方式待核对")
+            lines.append(f"止损 {_number(stop.get('price'), money=True)}，{mode}。")
+            days = rec.get("holding_days")
+            days_text = str(days) + "天" if isinstance(days, int) and not isinstance(days, bool) and days >= 0 else "天数待补"
+            lines.append(f"计划持有{horizon_text}；现持{days_text}；建议有效至{beijing_time(rec.get('expires_at'))}。")
+    else:
+        pending = sum(p.get("status") != "active" for p in current_plans)
+        lines.append("结论：暂无新增操作建议。" + (f"{pending}项计划待审核，暂不展示草稿价位。" if pending else ""))
+    gaps = []
+    if snapshot.get("cash") is None:
+        gaps.append("实际现金")
+    if not snapshot.get("holdings_complete"):
+        gaps.append("持仓股数、成本及买入时间，并完成持仓核对")
+    elif not snapshot.get("cost_complete") or not snapshot.get("fees_complete"):
+        gaps.append("持仓成本及实际费用")
+    if advice:
+        extra = f"另有{len(advice) - 1}项操作，见工作台。" if len(advice) > 1 else ""
+        if gaps or extra:
+            lines.append(("待补：" + "；".join(gaps) + "。" if gaps else "") + extra)
+    else:
+        lines.append("待补：" + "；".join(gaps) + "。" if gaps else "资料：账户信息已核对。")
+    safe_url = table_url if isinstance(table_url, str) and re.fullmatch(r"https://[A-Za-z0-9.\-]+/(?:base|wiki)/[A-Za-z0-9]+", table_url) else None
+    lines.append("工作台：" + safe_url if safe_url else "详情：打开投资工作台。")
+    return "\n".join(lines)
+
+
 def _rows(value):
     return value if isinstance(value, list) else []
 
@@ -56,6 +178,45 @@ def _take_profit(value):
             fraction = "未知比例"
         rows.append(f"${step.get('price', '未知')}：卖出{fraction}")
     return "\n".join(rows) or "未提供；需复核"
+
+
+def record_reported_holding(store, symbol, reported_market_value, *, reported_at, account="real"):
+    """Preserve a user's incomplete holding statement; never create a ledger entry."""
+    if account != "real":
+        raise ValueError("reported holdings must belong to the real account")
+    if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", symbol) or symbol.endswith(".US"):
+        raise ValueError("symbol must be a bare uppercase US symbol")
+    value = decimal_value(reported_market_value, "reported_market_value")
+    if value < 0:
+        raise ValueError("reported_market_value cannot be negative")
+    stamp = parse_time(reported_at).isoformat()
+    identity = stable_id("reported_holding", account, symbol, stamp)
+    record = {"id": identity, "account": account, "symbol": symbol,
+              "reported_market_value": str(value), "reported_at": stamp,
+              "source": "user_statement", "currency": "USD", "status": "unreconciled",
+              "quantity": None, "cost_basis": None, "first_fill_at": None,
+              "market_price": None, "unrealized_pnl": None}
+    store.put("reported_holding", identity, record, immutable=True)
+    return record
+
+
+def reported_holdings(store, account="real", *, now=None):
+    """Latest statement per symbol, retaining every immutable historical version."""
+    stamp = parse_time(now or utc_now())
+    latest = {}
+    for _, record in store.items("reported_holding"):
+        if record.get("account") != account or parse_time(record["reported_at"]) > stamp:
+            continue
+        symbol = record["symbol"]
+        if symbol not in latest or parse_time(record["reported_at"]) > parse_time(latest[symbol]["reported_at"]):
+            latest[symbol] = record
+    return [latest[symbol] for symbol in sorted(latest)]
+
+
+def with_reported_holdings(store, snapshot):
+    """Attach display-only statements, separate from positions and all totals."""
+    return dict(snapshot, reported_holdings=reported_holdings(
+        store, snapshot.get("account", "real"), now=snapshot.get("as_of")))
 
 
 def portfolio_rows(snapshot):
@@ -82,6 +243,17 @@ def portfolio_rows(snapshot):
                      "持有天数": readable(days), "占总资产比例": readable(weight),
                      "数据状态": readable(position.get("valuation_status", snapshot.get("valuation_status"))),
                      "更新时间": snapshot.get("as_of", utc_now())})
+    recorded = {position.get("symbol") for position in snapshot.get("positions", [])}
+    for record in snapshot.get("reported_holdings", []):
+        if record.get("account") != snapshot.get("account", "real") or record["symbol"] in recorded:
+            continue
+        rows.append({"系统标识": f"{record['account']}:{record['symbol']}",
+                     "账户": record["account"], "股票": record["symbol"],
+                     "数量": readable(None), "成本": readable(None), "市价": readable(None),
+                     "市值": f"用户报告 {record['reported_market_value']} USD（待核对；非系统估值）",
+                     "未实现盈亏": readable(None), "持有天数": readable(None), "占总资产比例": readable(None),
+                     "数据状态": "用户报告持仓待核对；股数、成本及首次建仓时间未知；未计入账本及资产合计；用户报告时间：" + record["reported_at"],
+                     "更新时间": record["reported_at"]})
     return rows
 
 
@@ -91,8 +263,8 @@ def plan_row(plan, recommendation=None):
     entry = entry if isinstance(entry, dict) else {}
     stop = stop if isinstance(stop, dict) else {}
     risk = rec.get("risk_context") or {}
-    return {"系统标识": plan["id"], "股票": plan.get("symbol", ""),
-            "版本": readable(plan.get("revision")), "状态": plan.get("status", "needs_review"),
+    row = {"系统标识": plan["id"], "股票": plan.get("symbol", ""),
+            "版本": readable(plan.get("revision")), "状态": {"active": "已审核", "candidate": "待审核", "needs_review": "待审核", "invalidated": "已失效", "superseded": "已替代"}.get(plan.get("status"), "待审核"),
             "建议动作": ACTIONS.get(rec.get("action"), "等待审核"), "理由": human_reasons(rec.get("reasons", [])),
             "推荐标识": rec.get("id", ""), "入场批次": readable(rec.get("tranche_id", rec.get("tranche"))),
             "投资逻辑": readable(plan.get("thesis")), "期限月数": readable(plan.get("horizon_months")),
@@ -114,6 +286,15 @@ def plan_row(plan, recommendation=None):
             "风险状态": ("最大回撤硬限制未配置；需人工判断" if risk.get("drawdown_limit") is None else
                          f"已设置回撤上限{risk['drawdown_limit']}；评估状态：{risk.get('drawdown_status', '未知')}；缺少历史净值时不能确认通过"),
             "更新时间": utc_now()}
+    if plan.get("status") != "active":
+        for key in ("买入区间", "目标情景", "分批止盈", "止损价", "止损确认方式", "情景年化收益估算",
+                    "每股止损风险美元", "价格止损风险百分比", "本次投入止损风险美元", "当前持仓止损风险美元",
+                    "投资逻辑", "逻辑失效条件", "到期处理", "单次买入美元", "期限月数", "下次复核"):
+            row[key] = "待审核，暂不展示"
+        row["建议动作"] = "等待审核"
+        row["理由"] = "研究资料尚未通过独立审核，暂无新增操作建议"
+        row["证据引用"] = "来源记录已内部留存，待独立审核"
+    return row
 
 
 def make_report(kind, period, portfolio, plans=(), recommendations=(), *, now=None):
@@ -146,11 +327,13 @@ def make_report(kind, period, portfolio, plans=(), recommendations=(), *, now=No
             f"逻辑失效条件：{row['逻辑失效条件'] or '尚待复核'}；到期处理：{row['到期处理']}",
             f"下次复核：{row['下次复核']}；依据：{row['证据引用']}"])
     for row in portfolio_rows(portfolio):
-        lines.append(f"{row['股票']}：{row['数量']}股，市值${row['市值']}，占总资产{row['占总资产比例']}，持有{row['持有天数']}天，未实现盈亏${row['未实现盈亏']}")
+        lines.append(f"{row['股票']}：{row['数量']}股，市值：{row['市值']}，占总资产{row['占总资产比例']}，持有{row['持有天数']}天，未实现盈亏${row['未实现盈亏']}；数据状态：{row['数据状态']}；记录时间：{row['更新时间']}")
     body = "\n".join(lines)
-    return {"id": stable_id("report", kind, period, account), "kind": kind, "period": period,
+    report = {"id": stable_id("report", kind, period, account), "kind": kind, "period": period,
             "account": account, "timestamp": now, "body": body,
             "portfolio": portfolio, "recommendation_ids": [r.get("id") for r in recommendations]}
+    report["notification_body"] = notification_text(report, current_plans=plans, recommendations=recommendations)
+    return report
 
 
 def report_row(report):
@@ -158,8 +341,8 @@ def report_row(report):
     if report.get("kind") == "价格观察":
         return {"系统标识": report["id"], "报告类型": report["kind"], "报告周期": report["period"],
                 "账户": "视频观察", "现金美元": "不适用", "持仓市值美元": "不适用",
-                "总权益美元": "不适用", "回撤限制": "不适用", "正文": report["body"], "生成时间": report["timestamp"]}
+                "总权益美元": "不适用", "回撤限制": "不适用", "正文": report.get("notification_body") or notification_text(report), "生成时间": report["timestamp"]}
     return {"系统标识": report["id"], "报告类型": report["kind"], "报告周期": report["period"],
             "账户": report.get("account", "real"), "现金美元": readable(p.get("cash")),
             "持仓市值美元": readable(p.get("market_value")), "总权益美元": readable(p.get("total_equity")),
-            "回撤限制": "未配置" if p.get("drawdown_limit") is None else str(p["drawdown_limit"]) + "；不能评估", "正文": report["body"], "生成时间": report["timestamp"]}
+            "回撤限制": "未配置" if p.get("drawdown_limit") is None else str(p["drawdown_limit"]) + "；不能评估", "正文": report.get("notification_body") or notification_text(report), "生成时间": report["timestamp"]}

@@ -28,7 +28,7 @@ MemoryMax=768M
 MemorySwapMax=128M
 TasksMax=64
 Nice=10
-TimeoutStopSec=45
+TimeoutStopSec=700
 
 [Install]
 WantedBy=multi-user.target
