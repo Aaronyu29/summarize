@@ -1529,13 +1529,29 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 'phase': 'review', 'review': review, 'terminal': True, 'semantic_attempts': 1}, immutable=True)
             plans.append(store.get('plan', plan_id) or committed['plan'])
             continue
-        issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
-        if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
-            issues.append('No individually verified source levels')
-        execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
+        if critique:
+            store.put('research_critique_review', operation_key,
+                {'review': review, 'review_hash': stable_id(review)}, immutable=True)
+        try:
+            # These are deterministic schema/evidence checks on completed output.
+            # Model calls (and their budget/unknown fences) remain outside this guard.
+            issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
+            if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
+                issues.append('No individually verified source levels')
+            execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
+            research_gaps = _typed_research_gaps(issues, review, evidence_ids)
+        except (TypeError, ValueError, KeyError, AttributeError, InvalidOperation) as exc:
+            if not critique:
+                raise
+            store.put('research_critique_result', operation_key, {'status': 'schema_invalid',
+                'phase': 'assessment', 'error_type': type(exc).__name__,
+                'proposal_hash': stable_id(proposed), 'review_hash': stable_id(review),
+                'terminal': True, 'semantic_attempts': 1}, immutable=True)
+            plans.append(store.get('plan', plan_id) or committed['plan'])
+            continue
         plan['status'] = 'active' if not issues and not execution_gaps else 'needs_review'
         plan['review_issues'] = issues
-        plan['research_gaps'] = _typed_research_gaps(issues, review, evidence_ids)
+        plan['research_gaps'] = research_gaps
         plan['research_gaps'].extend({'code': 'ENTRY_CONDITION_PENDING', 'scope': 'execution', 'blocking': False,
             'detail': detail, 'required_evidence': ['Resolved entry conditions and price band'], 'evidence_refs': []}
             for detail in execution_gaps)

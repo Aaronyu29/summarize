@@ -250,6 +250,31 @@ class CritiqueTests(unittest.TestCase):
         self.assertEqual(len(calls), 5)
         self.assertIn('array of strings', self.store.items('research_critique_result')[0][1]['issues'][0])
 
+    def test_completed_invalid_stop_type_is_terminal_after_independent_review(self):
+        data, calls = self.facts(), []
+        fixture = CritiqueModel()
+        def fail(purpose, payload, body):
+            if purpose == 'compile_plan' and payload.get('critique'):
+                proposal = fixture.run(purpose, payload)
+                proposal['plan']['stop']['confirmation'] = ['daily_close']
+                return {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(proposal)}}]}
+        transport = self.provider(fixture, calls, failure=fail)
+        old = self.ingest(self.gateway(transport), data)['plans'][0]
+        for day in (23, 24, 25):
+            result = self.ingest(self.gateway(transport), data, f'2026-10-{day}T15:00:00+00:00')
+            self.assertEqual(result['errors'], [])
+            self.assertEqual(result['plans'][0], old)
+            self.assertEqual(self.store.get('plan', old['id']), old)
+        terminal = self.store.items('research_critique_result')[0][1]
+        self.assertEqual((terminal['status'], terminal['phase'], terminal['error_type']),
+            ('schema_invalid', 'assessment', 'TypeError'))
+        draft = self.store.items('research_critique_draft')[0][1]
+        review = self.store.items('research_critique_review')[0][1]
+        self.assertEqual(terminal['proposal_hash'], draft['proposal_hash'])
+        self.assertEqual(terminal['review_hash'], review['review_hash'])
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(self.store.items('model_receipt')), 6)
+
     def test_new_plan_committed_during_review_is_not_overwritten(self):
         data, calls, concurrent = self.facts(), [], []
         def replace(purpose, payload, body):
