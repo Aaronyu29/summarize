@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 from .common import parse_time
+from .budget import load_limits
 
 
 @dataclass
@@ -100,6 +101,7 @@ class Config:
         for key, name in (("model", "INVEST_MODEL_NAME"), ("base_url", "INVEST_MODEL_BASE_URL"),
                           ("api_key_env", "INVEST_MODEL_API_KEY_ENV"),
                           ("max_calls_per_day", "INVEST_MODEL_MAX_CALLS_PER_DAY"),
+                          ("budget_file", "INVEST_MODEL_BUDGET_FILE"),
                           ("max_tokens", "INVEST_MODEL_MAX_TOKENS"),
                           ("thinking", "INVEST_MODEL_THINKING"),
                           ("reasoning_effort", "INVEST_MODEL_REASONING_EFFORT"),
@@ -122,8 +124,9 @@ class Config:
                            self.model.get("model") and self.model.get("api_key_env") and
                            os.environ.get(self.model.get("api_key_env", "")))
         try:
-            model_ready = model_ready and all(float(self.model.get(k, 0)) > 0 for k in
-                ("max_calls_per_day", "max_cost_usd_per_day", "max_cost_usd_per_call"))
+            limits = load_limits(self.model)
+            model_ready = model_ready and limits['max_calls_per_day'] > 0 and float(limits['max_cost_usd_per_day']) > 0 \
+                and float(self.model.get('max_cost_usd_per_call', 0)) > 0
         except (TypeError, ValueError):
             model_ready = False
         return {

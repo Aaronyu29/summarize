@@ -15,6 +15,7 @@ from .market import MarketData
 from .common import utc_now, stable_id
 from .feishu import SCHEMA
 from .research import register_external_evidence, bind_instrument_identity
+from .budget import budget_status, read_budget_status, validate_limits, write_limits
 
 
 def parser():
@@ -22,10 +23,13 @@ def parser():
     p.add_argument("--private-config", help="Explicit private JSON configuration; never printed")
     p.add_argument("--database", help="Investment SQLite path, separate from video archive")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("diagnostics", "provision", "run-once", "serve", "status", "reconcile", "portfolio", "import-csv", "confirm", "correct", "import-evidence", "bind-instrument"):
+    for name in ("diagnostics", "provision", "run-once", "serve", "status", "budget", "reconcile", "portfolio", "import-csv", "confirm", "correct", "import-evidence", "bind-instrument"):
         command = sub.add_parser(name)
-        if name in ("provision", "run-once", "serve", "reconcile", "import-csv", "confirm", "correct", "import-evidence", "bind-instrument"):
+        if name in ("provision", "run-once", "serve", "budget", "reconcile", "import-csv", "confirm", "correct", "import-evidence", "bind-instrument"):
             command.add_argument("--execute", action="store_true", help="Perform authorized writes; default is preview")
+        if name == "budget":
+            command.add_argument("--calls", type=int, help="Daily call ceiling; does not reset usage")
+            command.add_argument("--cost-usd", help="Daily estimated reservation ceiling, not actual provider cost")
         if name == "diagnostics":
             command.add_argument("--live", action="store_true", help="Read official quotes, exchange calendar and Bitable schema")
         if name in ("portfolio", "import-csv"):
@@ -62,6 +66,19 @@ def main(argv=None):
         config = Config.load(args.private_config)
         if args.database:
             config.database = args.database
+        if args.command == 'budget':
+            result = read_budget_status(config.database, config.model)
+            if args.calls is not None or args.cost_usd is not None:
+                limits = validate_limits({'max_calls_per_day': args.calls, 'max_cost_usd_per_day': args.cost_usd})
+                if not config.model.get('budget_file'):
+                    raise ValueError('Configure INVEST_MODEL_BUDGET_FILE before changing live limits')
+                if args.execute:
+                    write_limits(config.model['budget_file'], limits,
+                        protected_paths=(config.database, config.archive_database, args.private_config))
+                    result = read_budget_status(config.database, config.model)
+                result.update(proposed_limits=limits, applied=args.execute, usage_reset=False, restart_required=False)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         with Store(config.database) as store:
             execute = getattr(args, "execute", False)
             feishu = Feishu(store, config, execute=execute)
@@ -88,6 +105,7 @@ def main(argv=None):
                 result = feishu.reconcile()
             elif args.command == "status":
                 result = status(store)
+                result['model_budget'] = budget_status(store, config.model)
             elif args.command == "portfolio":
                 result = portfolio(store, args.account)
             elif args.command == "import-csv":

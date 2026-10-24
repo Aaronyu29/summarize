@@ -9,6 +9,7 @@ from .ledger import portfolio
 from .market import MarketData, quote_gate
 from .research import ingest_archives, ingest_holdings, review_plan, _logical_fundamentals
 from .model import ModelGateway
+from .budget import budget_status
 from .decisions import evaluate, _has_provenance, valid_thesis_events
 from .paper import paper_account, simulate
 from .watch import evaluate_levels, KINDS as WATCH_KINDS
@@ -19,7 +20,7 @@ from .reporting import (make_report, report_row, plan_row, portfolio_rows, reada
 
 SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
                "TimeoutError", "ConnectionError", "UnknownModelOutcome", "ModelBudgetExceeded", "ModelOutputInvalid", "ModelRejected", "FeishuError",
-               "UnknownOutcome", "RuntimeError", "OperationalError", "JSONDecodeError", "ImportError", "ModuleNotFoundError"}
+               "UnknownOutcome", "RuntimeError", "OperationalError", "JSONDecodeError", "ImportError", "ModuleNotFoundError", "ModelBudgetConfigError"}
 
 
 def _safe_error(value):
@@ -625,6 +626,7 @@ class Runner:
                     self._error(result, "notification:" + key, exc)
         self.store.put("worker", "latest", {"timestamp": now, "execute": self.execute,
             "notifications_enabled": self.config.notifications_enabled,
+            "model_budget": budget_status(self.store, self.config.model, now=self.clock()),
             "quote_count": len(result["quotes"]), "errors": result["errors"], "report_count": len(result["reports"]),
             "recommendation_count": len(result["recommendations"])})
         self._observe_health(result, now)

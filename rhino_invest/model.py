@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from decimal import Decimal
 from .common import utc_now, parse_time, decimal_value, stable_id
+from .budget import load_limits, utc_day
 
 
 class UnknownModelOutcome(RuntimeError):
@@ -183,11 +184,9 @@ class ModelGateway:
             return cached['output']
         self._existing_call_gate(fingerprint, scope, purpose)
         ceiling = decimal_value(self.config.get('max_cost_usd_per_call'), 'max_cost_usd_per_call')
-        day_limit = decimal_value(self.config.get('max_cost_usd_per_day'), 'max_cost_usd_per_day')
-        calls_limit = int(self.config.get('max_calls_per_day', 0))
-        if ceiling <= 0 or day_limit <= 0 or calls_limit <= 0:
+        if ceiling <= 0:
             raise ValueError('Positive call and cost ceilings are required')
-        day = parse_time(moment).date()
+        day = utc_day(moment)
         content = [{'type': 'text', 'text': json.dumps({'purpose': purpose, 'evidence': payload}, ensure_ascii=False)}]
         for second, _, data in frame_data:
             content.extend([{'type': 'text', 'text': f'Original frame timestamp_seconds={second}'},
@@ -215,11 +214,17 @@ class ModelGateway:
             if cached:
                 return cached['output']
             self._existing_call_gate(fingerprint, scope, purpose)
+            # Read at the same serialized gate as durable reservations. Changes
+            # never reset usage, alter cache identity or interrupt an admitted call.
+            limits = load_limits(self.config)
+            calls_limit = limits['max_calls_per_day']
+            day_limit = decimal_value(limits['max_cost_usd_per_day'])
             calls = [v for _, v in self.store.items('model_call')
-                     if parse_time(v['timestamp']).date() == day]
+                     if utc_day(v['timestamp']) == day]
             used = sum((decimal_value(v.get('reserved_cost_usd', '0')) for v in calls), Decimal(0))
             if len(calls) >= calls_limit or used + ceiling > day_limit:
                 raise ModelBudgetExceeded('Daily model budget exhausted')
+            call['budget_limits'] = limits
             self.store.put('model_call', fingerprint, call, immutable=True)
         try:
             if self.transport:
