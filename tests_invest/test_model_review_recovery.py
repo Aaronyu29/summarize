@@ -152,6 +152,30 @@ class ReviewRecoveryTests(unittest.TestCase):
         with self.assertRaises(UnknownModelOutcome): self.run_review(self.model([]))
         self.assertEqual(len(self.calls), 2)
 
+    def test_recovery_preserves_original_evidence_and_independent_entry_condition_review(self):
+        payload = copy.deepcopy(PAYLOAD)
+        payload['plan']['entry'] = {'low': '90', 'high': '110',
+            'conditions': ['Enter only when the official execution price is between 90 and 110 USD.'],
+            'condition_mode': 'price_only',
+            'execution_conditions': [{'type': 'price_between', 'low': '90', 'high': '110'}]}
+        original = copy.deepcopy(payload)
+        independent = {'condition_mode': 'price_only', 'all_text_conditions_covered': True,
+            'conditions': payload['plan']['entry']['conditions'],
+            'execution_conditions': payload['plan']['entry']['execution_conditions']}
+        review = dict(REVIEW, accepted=True, issues=[], entry_condition_review=independent)
+        model = self.model([response(), response(json.dumps(review))])
+        result = model.run('review_plan', payload, instruction='Independently verify the original issuer evidence.',
+                           call_scope='original-entry-contract', now=NOW)
+        self.assertEqual(result['entry_condition_review'], independent)
+        self.assertEqual(payload, original)
+        for body in self.calls:
+            sent = json.loads(body['messages'][1]['content'][0]['text'])
+            self.assertEqual(sent['evidence'], original)
+        instruction = self.calls[1]['messages'][0]['content']
+        self.assertIn('independently return entry_condition_review', instruction)
+        self.assertIn('every original condition', instruction)
+        self.assertIn('price_and_fundamental with coverage false', instruction)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -143,7 +143,7 @@ COMPILE_TEMPLATE = {'plan': {'symbol': None, 'thesis': None, 'horizon_months': N
     'next_review_at': None, 'thesis_valid_from': None, 'horizon_until': None,
     'currency': None, 'price_unit': None, 'is_adr': None,
     'entry': {'low': None, 'high': None, 'amount_usd': None, 'basis': None,
-              'source_level_ids': [], 'conditions': []},
+              'source_level_ids': [], 'conditions': [], 'condition_mode': None, 'execution_conditions': []},
     'targets': [{'scenario': scenario, 'price': None, 'horizon_months': None, 'method': 'eps_multiple',
         'assumptions': {'eps': None, 'multiple': None, 'currency': None, 'price_unit': None,
             'forecast_period': None, 'rationale': None, 'evidence_refs': []}, 'evidence_refs': []}
@@ -183,6 +183,13 @@ Use exactly one verified creator zone when entry.basis="source_level" and list i
 source_level_ids. Never merge separate tranches into a broad entry band. Technical
 support alone is not a buy condition. Retain panic/add-on/no-position conditions;
 if conditions cannot be evaluated as price-only, leave conditions_parsed false.
+Declare entry.condition_mode='price_only' only if EVERY listed entry condition is
+covered by exactly one executable predicate: execution_conditions=[{type:'price_between',
+low:entry.low,high:entry.high}]. Preserve the exact full conditions text. Future filings,
+margin/EPS confirmation, fresh NAV or other fundamental requirements mean
+condition_mode='price_and_fundamental'; retain those conditions for conditional research.
+conditions_parsed=true alone NEVER authorizes execution. Do not erase non-price clauses
+to fit the predicate; independent review must attest complete text coverage.
 An independently derived entry must use basis="independent_valuation", explicit
 conditions and evidenced valuation rationale rather than relabel technical support.
 Respect instrument_contract: ETF fund statements are not operating-company EPS;
@@ -199,6 +206,10 @@ Use evidence_refs ONLY from supplied evidence IDs. Equity target method must
 be eps_multiple with assumptions {eps,multiple,currency,price_unit,forecast_period,
 rationale,evidence_refs}; target=eps*multiple, at least base/bear scenarios. Forecast EPS
 and multiple are explicitly scenario assumptions, never pretend they are disclosed.
+When deriving future EPS by compound growth, supply optional eps_bridge={anchor_eps,
+annual_growth,years} inside assumptions. Supply explicit numeric inputs and explain the
+anchor period, forecast period, units and evidence in rationale. The calculator uses
+only these structured author inputs; it never guesses a bridge from prose.
 For an ETF with verified aligned issuer NAV/portfolio PE/holdings, use etf_nav_scenario
 with assumptions {nav_per_share,current_pe,annual_earnings_growth,exit_pe,years,
 fees_treatment,rationale,currency,price_unit,evidence_refs}. years=horizon_months/12;
@@ -241,7 +252,13 @@ Read supplied original images, not just frame metadata. Verify EPS growth arithm
 forecast fiscal years versus holding horizon, exact entry-zone bounds/conditions and
 stop-edge attribution. Review the supplied policy dates and authoritative per-buy amount.
 If current_position_basis is supplied, return position_basis_accepted:true ONLY after
-independently reviewing the TP schedule against that exact current holdings structure.'''
+independently reviewing the TP schedule against that exact current holdings structure.
+Also return entry_condition_review={condition_mode:'price_only'|'price_and_fundamental',
+all_text_conditions_covered:false,conditions:[ALL exact original entry conditions],
+execution_conditions:[the exact executable predicates]}. Attest price_only and
+all_text_conditions_covered=true ONLY if the single exact price_between predicate
+covers every text condition. Future fundamental conditions remain conditional research;
+do not presume a boolean conditions_parsed proves that they are satisfied.'''
 EVENT_REVIEW = REVIEW + ''' For a risk event, also return assessment:{triggered:false,
 condition:null,evidence_refs:[],rationale:null}. Set triggered true ONLY when the new
 persisted raw evidence proves one EXACT existing plan.invalidation_conditions string.
@@ -387,7 +404,7 @@ def _model_plan(plan):
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
         'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
-        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin')
+        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin', 'entry_condition_review')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -485,6 +502,9 @@ def _review_issues(value):
 
 
 def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
+    plan.pop('entry_condition_review', None)
+    if isinstance(review.get('entry_condition_review'), dict):
+        plan['entry_condition_review'] = json.loads(json.dumps(review['entry_condition_review']))
     issues = _review_issues(review.get('issues'))
     if review.get('accepted') is not True:
         issues.append('Independent review not accepted')
@@ -538,6 +558,15 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                 raise ValueError('Unsupported target method')
             if abs(decimal_value(assumptions['eps']) * decimal_value(assumptions['multiple']) - decimal_value(target['price'])) > Decimal('.01'):
                 raise ValueError('Target arithmetic mismatch')
+            if assumptions.get('eps_bridge') is not None:
+                bridge = assumptions['eps_bridge']
+                with localcontext() as precision:
+                    precision.prec = 40
+                    anchor, growth, years = (decimal_value(bridge[key]) for key in ('anchor_eps', 'annual_growth', 'years'))
+                    if anchor <= 0 or growth <= -1 or not 0 < years <= 10:
+                        raise ValueError('EPS bridge inputs outside supported calculation domain')
+                    if abs(anchor * (1 + growth) ** years - decimal_value(assumptions['eps'])) > Decimal('.000001'):
+                        raise ValueError('EPS bridge does not reproduce the scenario EPS')
             if assumptions.get('currency') != plan.get('currency') or assumptions.get('price_unit') != plan.get('price_unit'):
                 raise ValueError('Target unit/currency mismatch')
             if not assumptions.get('forecast_period') or not assumptions.get('rationale'):
@@ -948,11 +977,25 @@ def _calculate_target_prices(proposal):
         try:
             with localcontext() as precision:
                 precision.prec = 40
+                intermediates, eps_bridge = {}, None
                 if target.get('method') == 'eps_multiple':
+                    bridge = assumptions.get('eps_bridge') if isinstance(assumptions, dict) else None
+                    if bridge is not None:
+                        anchor = decimal_value(bridge['anchor_eps'])
+                        growth, years = decimal_value(bridge['annual_growth']), decimal_value(bridge['years'])
+                        if anchor <= 0 or growth <= -1 or not 0 < years <= 10:
+                            continue
+                        factor = (Decimal(1) + growth) ** years
+                        derived = anchor * factor
+                        eps_bridge = {'inputs': dict(bridge), 'original_eps': assumptions.get('eps'),
+                            'growth_factor': str(factor), 'derived_eps_unrounded': str(derived),
+                            'formula': 'anchor_eps * (1 + annual_growth) ** years'}
+                        assumptions['eps'] = str(derived)
                     eps, multiple = decimal_value(assumptions['eps']), decimal_value(assumptions['multiple'])
                     if eps <= 0 or multiple <= 0:
                         continue
                     price = eps * multiple
+                    intermediates = {'eps': str(eps), 'multiple': str(multiple)}
                     formula = 'eps * multiple'
                 elif target.get('method') == 'etf_nav_scenario':
                     nav, pe = decimal_value(assumptions['nav_per_share']), decimal_value(assumptions['current_pe'])
@@ -961,7 +1004,14 @@ def _calculate_target_prices(proposal):
                     if (nav <= 0 or pe <= 0 or exit_pe <= 0 or growth <= -1 or not 1 <= years <= 3
                             or abs(years - decimal_value(target['horizon_months']) / 12) > Decimal('.000001')):
                         continue
-                    price = nav * (1 + growth) ** years * exit_pe / pe
+                    implied = nav / pe
+                    factor = (1 + growth) ** years
+                    grown = implied * factor
+                    price = grown * exit_pe
+                    intermediates = {'nav_per_share': str(nav), 'current_pe': str(pe),
+                        'implied_earnings_proxy_per_etf_share': str(implied), 'growth_factor': str(factor),
+                        'grown_earnings_proxy_per_etf_share': str(grown), 'exit_multiple': str(exit_pe),
+                        'exit_pe_ratio': str(exit_pe / pe)}
                     formula = '(nav_per_share / current_pe) * (1 + annual_earnings_growth) ** years * exit_pe'
                 else:
                     continue
@@ -976,6 +1026,8 @@ def _calculate_target_prices(proposal):
             target['price'] = corrected
             rows.append({'index': index, 'scenario': target.get('scenario'), 'method': target['method'],
                 'formula': formula, 'inputs': assumptions, 'original_price': original,
+                'intermediates': intermediates, 'eps_bridge': eps_bridge, 'unrounded_price': str(price),
+                'rounding': 'Decimal precision 40, half-even to USD 0.01',
                 'calculated_price': corrected, 'changed': changed})
         except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
             continue  # Missing/invalid inputs remain defects for independent review.
@@ -1121,6 +1173,84 @@ def _unresolved_thesis_defer(store, plan, snapshot, fundamentals, moment):
     return record
 
 
+CRITIQUE_INSTRUCTION = '''
+SEMANTIC_CRITIQUE_ATTEMPT=1
+Revise the supplied original economic proposal ONCE using the SAME original evidence,
+images and the specific blocking independent review issues. Review issues are opinions,
+not new source facts: verify their claims, including arithmetic, against original sources
+and the precise calculation book. Repair supported numeric/schema/internal-consistency
+defects and disclose all changed author assumptions. Never invent missing source facts,
+units or normalization adjustments, lower review standards, or presume acceptance.
+Populate structured fields and explicit bridges where supported. Keep unresolved true
+evidence gaps explicit. This is a fresh complete proposal, followed by independent review.'''
+
+
+def _critique_ready(store, plan, fundamental, moment):
+    binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
+    review = binding.get('review') or {}
+    if (plan.get('status') != 'needs_review' or binding.get('plan_hash') != plan_fingerprint(plan)
+            or review.get('accepted') is not False or review.get('deterministic_preflight')
+            or not isinstance(review.get('issues'), list) or not review['issues']):
+        return False
+    contract = fundamental.get('instrument_contract') or {}
+    if contract.get('quote_currency') != 'USD' or contract.get('quote_price_unit') not in {'per_share', 'per_adr'}:
+        return False
+    if contract.get('quote_price_unit') == 'per_adr' and fundamental.get('adr_conversion_verified') is not True:
+        return False
+    if contract.get('asset_type') == 'etf':
+        refs = set(plan_evidence_refs(plan)) | _nested_refs(fundamental)
+        return not _etf_input_gaps(fundamental, moment, refs, store)
+    return (contract.get('stock_eps_valuation_applicable') is True
+        and bool(fundamental.get('financial_report') or (fundamental.get('primary_financials') or {}).get('facts')))
+
+
+def _record_critique_output_failure(store, key, critique, phase, error):
+    if not critique:
+        return
+    from .model import ModelOutputInvalid
+    receipt_id = getattr(error, 'call_id', None)
+    if isinstance(error, ModelOutputInvalid) and receipt_id and store.get('model_receipt', receipt_id):
+        store.put('research_critique_result', key, {'status': 'output_invalid', 'phase': phase,
+            'receipt_id': receipt_id, 'terminal': True, 'semantic_attempts': 1}, immutable=True)
+
+
+def _critique_schema_errors(proposal):
+    """Reject malformed containers, leaving missing economic facts to review."""
+    if not isinstance(proposal, dict):
+        return ['plan must be an object']
+    errors = []
+    for field in ('entry', 'stop'):
+        if field in proposal and not isinstance(proposal[field], dict):
+            errors.append(field + ' must be an object')
+    for field in ('targets', 'take_profit'):
+        if field in proposal and (not isinstance(proposal[field], list)
+                or any(not isinstance(row, dict) for row in proposal[field])):
+            errors.append(field + ' must be an array of objects')
+    for target in proposal.get('targets', []) if isinstance(proposal.get('targets'), list) else []:
+        if isinstance(target, dict) and 'assumptions' in target and not isinstance(target['assumptions'], dict):
+            errors.append('target.assumptions must be an object')
+    ref_owners = [proposal]
+    for target in proposal.get('targets', []) if isinstance(proposal.get('targets'), list) else []:
+        if isinstance(target, dict):
+            ref_owners.append(target)
+            if isinstance(target.get('assumptions'), dict):
+                ref_owners.append(target['assumptions'])
+    for owner in ref_owners:
+        if 'evidence_refs' in owner and (not isinstance(owner['evidence_refs'], list)
+                or any(not isinstance(ref, str) for ref in owner['evidence_refs'])):
+            errors.append('evidence_refs must be an array of strings')
+    return errors
+
+
+def _critique_superseded(store, key, critique, current):
+    if not critique or not current or plan_fingerprint(current) == critique['source_plan_hash']:
+        return False
+    store.put('research_critique_result', key, {'status': 'superseded', 'terminal': True,
+        'semantic_attempts': 1, 'current_plan_id': current['id'],
+        'current_revision': current['revision']}, immutable=True)
+    return True
+
+
 def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, context=None, operation_id=None, deferred=None):
     moment = now or utc_now()
     holding_source = snapshot.get('source_type') == 'holding_fundamentals'
@@ -1150,9 +1280,15 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if holding_source:
             operation_key = stable_id(operation_key, 'holding-research-v1', model_ready)
         calculation_seed = None
+        critique = None
         source_operation_key = operation_key
         committed = store.get('plan_operation', operation_key)
         if committed:
+            if (previous and previous.get('revision', 0) > committed['plan'].get('revision', 0)
+                    and (previous.get('status') == 'active'
+                        or previous.get('research_assessment', {}).get('status') == 'approved_conditional')):
+                plans.append(previous)
+                continue  # A stale rejected operation must not replace an accepted newer thesis.
             _, preview = _calculate_target_prices(committed['plan'])
             if (committed['plan'].get('status') == 'needs_review'
                     and any(row['changed'] for row in preview['targets'])):
@@ -1160,14 +1296,35 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 operation_key = stable_id(source_operation_key, CALCULATION_CONTRACT)
                 completed_calculation = store.get('plan_operation', operation_key)
                 if completed_calculation:
-                    plans.append(completed_calculation['plan'])
+                    committed = completed_calculation
+                    calculation_seed = None
+            if calculation_seed is None and committed and model_ready and _critique_ready(store, committed['plan'], fundamental, moment):
+                operation_key = stable_id('plan-critique-v1', source_operation_key, _logical_fundamentals(fundamental))
+                terminal = store.get('research_critique_result', operation_key)
+                repaired = store.get('plan_operation', operation_key)
+                if repaired or terminal:
+                    plans.append(previous if terminal and terminal.get('status') == 'superseded' and previous
+                        else (repaired or {}).get('plan') or committed['plan'])
                     continue
-            else:
+                critique = store.get('research_critique_attempt', operation_key)
+                if not critique:
+                    parent_plan = committed['plan']
+                    binding = store.get('research_plan_review', parent_plan['review_evidence_id'])
+                    critique = {'id': operation_key, 'base_operation_id': source_operation_key,
+                        'source_plan_hash': plan_fingerprint(parent_plan), 'source_plan_revision': parent_plan['revision'],
+                        'source_review_id': parent_plan['review_evidence_id'], 'source_review_hash': stable_id(binding),
+                        'economic_proposal': {key: parent_plan[key] for key in COMPILE_TEMPLATE['plan'] if key in parent_plan},
+                        'blocking_review_issues': binding['review']['issues'], 'review_is_untrusted_opinion': True,
+                        'calculation_book': _calculate_target_prices(parent_plan)[1],
+                        'timestamp': moment, 'compile_instruction': COMPILE + CRITIQUE_INSTRUCTION,
+                        'review_instruction': REVIEW, 'max_semantic_attempts': 1, 'max_paid_requests_including_json_recovery': 4}
+                    store.put('research_critique_attempt', operation_key, critique, immutable=True)
+            elif calculation_seed is None:
                 plans.append(committed['plan'])
                 continue
         attempt = store.get('plan_attempt', operation_key)
         if not attempt:
-            attempt = {'timestamp': moment, 'revision': previous['revision'] + 1 if previous else 1}
+            attempt = {'timestamp': critique['timestamp'] if critique else moment, 'revision': previous['revision'] + 1 if previous else 1}
             store.put('plan_attempt', operation_key, attempt, immutable=True)
         plan_moment = attempt['timestamp']
         observed = store.get('fundamental_evidence', fid)
@@ -1228,6 +1385,10 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if previous and previous.get('status') == 'needs_review' and not context:
             repair_feedback = {'prior_revision': previous['revision'], 'untrusted_prior_review': previous.get('review_issues', []),
                 'typed_gaps': previous.get('research_gaps', []), 'instruction': 'Opinions only; independently verify against current original evidence.'}
+        if critique:
+            repair_feedback = {'source_review_id': critique['source_review_id'], 'prior_revision': critique['source_plan_revision'],
+                'untrusted_prior_review': critique['blocking_review_issues'],
+                'instruction': 'Critique is opinion, not evidence; verify it against the same original sources.'}
         stored_context = store.get('plan_context', operation_key)
         if stored_context:
             policy, current_basis, repair_feedback = stored_context['policy'], stored_context['current_position_basis'], stored_context['repair_feedback']
@@ -1242,6 +1403,11 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'fundamentals': fundamental, 'evidence_ids': evidence_ids, 'as_of': plan_moment,
             'review_context': context, 'policy': policy, 'current_position_basis': current_basis,
             'evidence_bundle': bundle, 'repair_feedback': repair_feedback}
+        if critique:
+            payload['instruction'] = critique['compile_instruction']
+            payload['critique'] = {key: critique[key] for key in ('id', 'economic_proposal',
+                'blocking_review_issues', 'review_is_untrusted_opinion', 'calculation_book',
+                'source_plan_hash', 'source_review_hash')}
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
         etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
         holding_gaps = []
@@ -1269,7 +1435,30 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             # Reuse economic inputs, never old reviewer state/verification.
             proposed = {key: calculation_seed[key] for key in COMPILE_TEMPLATE['plan'] if key in calculation_seed}
         else:
-            proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
+            cached_draft = store.get('research_critique_draft', operation_key) if critique else None
+            if cached_draft:
+                proposed = cached_draft['proposal']
+            else:
+                try:
+                    proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
+                except Exception as exc:
+                    _record_critique_output_failure(store, operation_key, critique, 'draft', exc)
+                    raise
+                if critique:
+                    store.put('research_critique_draft', operation_key, {'proposal': proposed,
+                        'proposal_hash': stable_id(proposed)}, immutable=True)
+        if critique:
+            schema_errors = _critique_schema_errors(proposed)
+            if schema_errors:
+                store.put('research_critique_result', operation_key, {'status': 'schema_invalid',
+                    'phase': 'draft', 'issues': schema_errors, 'proposal_hash': stable_id(proposed),
+                    'terminal': True, 'semantic_attempts': 1}, immutable=True)
+                plans.append(store.get('plan', plan_id) or committed['plan'])
+                continue
+            current = store.get('plan', plan_id)
+            if _critique_superseded(store, operation_key, critique, current):
+                plans.append(current)
+                continue
         plan, calculation = _calculate_target_prices(proposed)
         for field in ('review_issues', 'review_evidence_id', 'research_gaps', 'research_assessment', 'execution_requirements'):
             plan.pop(field, None)
@@ -1313,11 +1502,33 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'policy': policy, 'current_position_basis': current_basis,
             'evidence_ids': evidence_ids, 'evidence_bundle': bundle, 'repair_feedback': repair_feedback,
             'review_event_id': (context or {}).get('event_id')}
+        if critique:
+            review_payload['instruction'] = critique['review_instruction']
+            review_payload['critique_context'] = {'id': critique['id'], 'prior_issues_are_opinions': True,
+                'blocking_review_issues': critique['blocking_review_issues']}
+            checkpoint = store.get('research_critique_review_input', operation_key)
+            if checkpoint:
+                review_payload = checkpoint['payload']
+                plan = json.loads(json.dumps(review_payload['plan']))
+                revision = plan['revision']
+            else:
+                store.put('research_critique_review_input', operation_key,
+                    {'payload': review_payload, 'payload_hash': stable_id(review_payload)}, immutable=True)
         if preflight_gaps:
             review = {'accepted': False, 'checks': {}, 'issues': preflight_gaps,
                 'deterministic_preflight': True}
         else:
-            review = _run(model, 'review_plan', review_payload, frames=original_frames, now=plan_moment, store=store)
+            try:
+                review = _run(model, 'review_plan', review_payload, frames=original_frames, now=plan_moment, store=store)
+            except Exception as exc:
+                _record_critique_output_failure(store, operation_key, critique, 'review', exc)
+                raise
+        if critique and (not isinstance(review, dict) or
+                (review.get('checks') is not None and not isinstance(review['checks'], dict))):
+            store.put('research_critique_result', operation_key, {'status': 'schema_invalid',
+                'phase': 'review', 'review': review, 'terminal': True, 'semantic_attempts': 1}, immutable=True)
+            plans.append(store.get('plan', plan_id) or committed['plan'])
+            continue
         issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
         if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
             issues.append('No individually verified source levels')
@@ -1331,6 +1542,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan['research_assessment'] = {'status': 'needs_evidence' if issues else 'approved_conditional' if execution_gaps else 'approved',
             'evidence_bundle_hash': bundle['hash'], 'evidence_generation': fid,
             'repair_status': 'awaiting_new_evidence' if issues else 'reviewed_new_evidence' if repair_feedback else 'initial_review'}
+        if critique:
+            plan['research_assessment'].update(critique_id=critique['id'],
+                repair_status='critique_exhausted' if issues else 'critique_accepted')
         plan['execution_requirements'] = ['Fresh official execution quote', 'Reconciled account cash/holdings/fees',
             'Confirmed current holding basis when selling; separate from research approval']
         gap_key = stable_id('research-gap-assessment', plan['id'], revision, bundle['hash'])
@@ -1345,8 +1559,22 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan['fundamental_evidence_id'] = fid
         seal_plan_review(store, plan, review, evidence_ids)
         with store.transaction():
+            current = store.get('plan', plan_id)
+            if _critique_superseded(store, operation_key, critique, current):
+                plans.append(current)
+                continue
+            if (calculation_seed and current and previous
+                    and plan_fingerprint(current) != plan_fingerprint(previous)
+                    and (current.get('status') == 'active'
+                         or current.get('research_assessment', {}).get('status') == 'approved_conditional')):
+                plans.append(current)
+                continue
             _persist_plan(store, plan)
             store.put('plan_operation', operation_key, {'plan': plan}, immutable=True)
+            if critique:
+                store.put('research_critique_result', operation_key, {'status': plan['status'],
+                    'plan_id': plan_id, 'revision': revision, 'review_id': plan['review_evidence_id'],
+                    'semantic_attempts': 1, 'terminal': True}, immutable=True)
         plans.append(plan)
     return plans
 
@@ -1487,7 +1715,14 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                         if risk_defer:
                             result['deferred_unresolved_risk'].append(risk_defer)
                         else:
-                            result['plans'].append(cached_plan)
+                            candidate = cached_plan
+                            if model is not None and cached_plan.get('status') == 'needs_review':
+                                cached_levels = [level for _, level in store.items('research_level')
+                                    if snapshot['id'] in level.get('evidence_refs', [])
+                                    and level.get('symbol') == cached_plan['symbol']]
+                                revised = compile_plan(store, snapshot, cached_levels, model, fundamentals, moment)
+                                candidate = next((plan for plan in revised if plan['symbol'] == cached_plan['symbol']), candidate)
+                            result['plans'].append(candidate)
                     result['deferred_unresolved_risk'].extend(completed.get('deferred_unresolved_risk', []))
                 continue
             attempt = store.get('research_attempt', workflow_id)

@@ -8,7 +8,8 @@ from unittest.mock import patch
 from rhino_invest.common import parse_time
 from rhino_invest.decisions import evaluate, record_thesis_risk
 from rhino_invest.ledger import stage_entry, confirm_entry, portfolio
-from rhino_invest.research import seal_plan_review, _price_basis_deadline
+from rhino_invest.research import _price_basis_deadline
+from tests_invest.plan_fixtures import seal_fixture_review as seal_plan_review
 from rhino_invest.store import Store
 from tests_invest.test_acceptance_core import approved_plan, quote
 

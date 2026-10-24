@@ -4,7 +4,7 @@ import unittest
 from rhino_invest.decisions import (evaluate, record_thesis_risk, valid_thesis_events,
                                     take_profit_position_basis)
 from rhino_invest.ledger import stage_entry, confirm_entry, portfolio
-from rhino_invest.research import seal_plan_review
+from tests_invest.plan_fixtures import seal_fixture_review as seal_plan_review
 from rhino_invest.store import Store
 from tests_invest.test_decisions import active_plan, market, NOW
 

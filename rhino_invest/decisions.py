@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_FLOOR
 import calendar
-from .common import utc_now, parse_time, stable_id, decimal_value, validate_plan
+from .common import utc_now, parse_time, stable_id, decimal_value, validate_plan, entry_condition_errors
 from .market import quote_gate, latest_regular_session
 
 
@@ -215,6 +215,11 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
         errors.append('plan_not_active')
     if plan.get('conditions_parsed') is not True:
         errors.append('entry_conditions_unverified')
+    binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
+    independent_conditions = (binding.get('review') or {}).get('entry_condition_review')
+    if (entry_condition_errors(plan) or not isinstance(independent_conditions, dict)
+            or independent_conditions != plan.get('entry_condition_review')):
+        errors.append('entry_conditions_unverified')
     price_basis_expired = False
     if plan.get('price_basis_valid_until') is not None:
         try:
@@ -290,7 +295,12 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
     stop = plan.get('stop') or {}
     stop_price = _number(stop.get('price'))
     stop_triggered = False
-    price_basis_verified = (verified_plan and not schema_errors and plan.get('conditions_parsed') is True
+    # Entry predicates control buys/adds. They cannot silence an independently
+    # sealed price stop or a thesis-risk exit on an existing holding.
+    entry_only_errors = {'entry_conditions_unverified', 'entry conditions are unparsed'}
+    risk_schema_errors = [error for error in schema_errors if error not in entry_only_errors]
+    risk_errors = [error for error in errors if error not in entry_only_errors]
+    price_basis_verified = (verified_plan and not risk_schema_errors
         and not price_basis_expired
         and 'post_plan_split_requires_price_unit_review' not in errors
         and 'corporate_action_history_unverifiable' not in errors)
@@ -327,7 +337,7 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
         if held <= 0:
             action, status, quantity = 'watch', 'warning', None
             reasons.append('reported_holding_quantity_unknown_requires_risk_check')
-        elif errors or due or portfolio.get('ledger_input_current') is False:
+        elif risk_errors or due or portfolio.get('ledger_input_current') is False:
             action, status, quantity = 'hold', 'warning', None
             reasons.extend(errors)
             if portfolio.get('ledger_input_current') is False:
@@ -445,7 +455,8 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
             changed = dict(prior, status='filled', filled_at=moment)
         elif parse_time(prior['expires_at']) <= parse_time(moment):
             changed = dict(prior, status='expired')
-        elif ((errors or due) and not (invalidated and prior.get('tranche') == 'exit')) or prior.get('revision') != plan.get('revision'):
+        elif (((risk_errors if stop_triggered and prior.get('tranche') == 'exit' else errors) or due)
+              and not (invalidated and prior.get('tranche') == 'exit')) or prior.get('revision') != plan.get('revision'):
             changed = dict(prior, status='cancelled', reason='plan_review_or_supersession')
         elif status != 'actionable':
             changed = dict(prior, status='suspended', reason='latest_advice_not_actionable')

@@ -50,6 +50,8 @@ class FixtureModel:
             plan['entry'].update(basis='source_level', source_level_ids=[payload['levels'][0]['id']] if payload['levels'] else [],
                 conditions=[payload['levels'][0]['conditions']] if payload['levels'] else [])
             plan['entry']['amount_usd'] = payload['policy']['amount_usd']
+            plan['entry'].update(condition_mode='price_only', execution_conditions=[{
+                'type': 'price_between', 'low': plan['entry']['low'], 'high': plan['entry']['high']}])
             plan['evidence_refs'] = payload['evidence_ids']
             plan['is_adr'] = self.adr
             plan['price_unit'] = 'per_adr' if self.adr else 'per_share'
@@ -61,7 +63,13 @@ class FixtureModel:
                         'rationale': 'Independent scenario, not reported consensus', 'evidence_refs': payload['evidence_ids']},
                     'evidence_refs': payload['evidence_ids']})
             return {'plan': plan}
-        return {'accepted': True, 'issues': [], 'checks': {'provenance': True, 'currency': True, 'unit': True, 'adr': True}}
+        result = {'accepted': True, 'issues': [], 'checks': {'provenance': True, 'currency': True, 'unit': True, 'adr': True}}
+        if purpose == 'review_plan':
+            entry = payload['plan']['entry']
+            result['entry_condition_review'] = {'condition_mode': entry.get('condition_mode'),
+                'all_text_conditions_covered': entry.get('condition_mode') == 'price_only',
+                'conditions': entry.get('conditions'), 'execution_conditions': entry.get('execution_conditions')}
+        return result
 
 
 class ResearchTests(unittest.TestCase):

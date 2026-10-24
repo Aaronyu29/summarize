@@ -2,13 +2,13 @@ import copy
 import unittest
 from rhino_invest.store import Store
 from rhino_invest.decisions import evaluate
-from rhino_invest.research import seal_plan_review
+from tests_invest.plan_fixtures import seal_fixture_review as seal_plan_review, with_price_conditions
 
 NOW = '2026-10-23T15:00:00+00:00'
 
 
 def active_plan(symbol='SOXX'):
-    return {'id': symbol + '-v1', 'revision': 1, 'symbol': symbol, 'status': 'active',
+    return with_price_conditions({'id': symbol + '-v1', 'revision': 1, 'symbol': symbol, 'status': 'active',
         'created_at': '2026-10-22T15:00:00+00:00', 'evidence_refs': ['sealed-evidence'],
         'thesis': 'Independent forecast with explicit scenario assumptions', 'horizon_months': 24,
         'next_review_at': '2027-01-22T15:00:00+00:00', 'currency': 'USD', 'price_unit': 'per_share',
@@ -18,7 +18,7 @@ def active_plan(symbol='SOXX'):
         'take_profit': [{'price': '150', 'fraction': '0.5'}, {'price': '200', 'fraction': '0.5'}],
         'stop': {'price': '80', 'confirmation': 'daily_close'}, 'invalidation_conditions': ['cashflow_failed'],
         'time_exit_policy': 'Review at horizon; hold requires a new thesis', 'valuation_basis': {'type': 'scenario'},
-        'verification': {'provenance': True, 'currency': True, 'unit': True}, 'conditions_parsed': True}
+        'verification': {'provenance': True, 'currency': True, 'unit': True}, 'conditions_parsed': True})
 
 
 def market(symbol='SOXX', price='100'):

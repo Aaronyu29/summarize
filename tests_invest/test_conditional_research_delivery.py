@@ -29,7 +29,8 @@ class ConditionalResearchValidationTests(unittest.TestCase):
         classification = classify_plan_validation(plan)
         self.assertEqual(classification['research_errors'], [])
         self.assertEqual(set(classification['execution_gaps']), {
-            'entry.low must be positive', 'entry.high must be positive', 'entry conditions are unparsed'})
+            'entry.low must be positive', 'entry.high must be positive', 'entry conditions are unparsed',
+            'entry_conditions_unverified'})
         self.assertEqual(validate_research_plan(plan), [])
         self.assertEqual(validate_plan(plan), strict)
         self.assertEqual(plan, before)
@@ -52,13 +53,20 @@ class ConditionalResearchValidationTests(unittest.TestCase):
                     plan[field] = value
                 self.assertIn(expected, validate_research_plan(plan))
 
-    def test_source_zones_and_missing_conditions_cannot_use_independent_valuation_exception(self):
+    def test_source_zone_missing_bounds_and_missing_conditions_remain_research_defects(self):
         for basis, conditions in (('source_level', ['wait for confirmation']),
                                   ('independent_valuation', []), ('independent_valuation', [None])):
             plan = conditional_plan()
             plan['entry'].update(basis=basis, conditions=conditions)
-            self.assertIn('entry conditions are unparsed', validate_research_plan(plan))
-            self.assertEqual(classify_plan_validation(plan)['execution_gaps'], [])
+            errors = validate_research_plan(plan)
+            if basis == 'source_level':
+                # A source zone must retain its original numeric bounds even
+                # when a non-price entry condition is pending independently.
+                self.assertIn('entry.low must be positive', errors)
+                self.assertIn('entry.high must be positive', errors)
+            else:
+                self.assertIn('entry conditions are unparsed', errors)
+                self.assertEqual(classify_plan_validation(plan)['execution_gaps'], [])
 
     def test_conditional_research_approval_does_not_create_trade_or_reserve_cash(self):
         with Store(':memory:') as store:

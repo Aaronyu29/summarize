@@ -7,7 +7,7 @@ from rhino_invest.config import Config
 from rhino_invest.decisions import evaluate
 from rhino_invest.ledger import portfolio, stage_entry, confirm_entry
 from rhino_invest.runner import Runner
-from rhino_invest.research import seal_plan_review
+from tests_invest.plan_fixtures import seal_fixture_review as seal_plan_review, with_price_conditions
 from rhino_invest.feishu import Feishu, SCHEMA
 from rhino_invest.reporting import plan_row
 from rhino_invest.store import Store
@@ -17,7 +17,7 @@ DAY = "2026-10-23"
 
 
 def approved_plan(symbol="SOXX"):
-    return {"id": "independent:" + symbol, "revision": 1, "symbol": symbol,
+    return with_price_conditions({"id": "independent:" + symbol, "revision": 1, "symbol": symbol,
             "status": "active", "created_at": "2026-10-22T15:00:00+00:00",
             "evidence_refs": ["sealed:1"], "thesis": "Verified multi-year fixture thesis",
             "horizon_months": 24, "next_review_at": "2027-01-22T15:00:00+00:00",
@@ -29,7 +29,7 @@ def approved_plan(symbol="SOXX"):
             "stop": {"price": "80", "confirmation": "daily_close"},
             "invalidation_conditions": ["cashflow_failed"], "time_exit_policy": "re-review thesis at horizon",
             "valuation_basis": {"type": "scenario"}, "currency": "USD", "price_unit": "per_share",
-            "verification": {"provenance": True, "currency": True, "unit": True}, "conditions_parsed": True}
+            "verification": {"provenance": True, "currency": True, "unit": True}, "conditions_parsed": True})
 
 
 def quote(now, price="100", symbol="SOXX"):

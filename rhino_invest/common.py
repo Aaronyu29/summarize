@@ -46,6 +46,43 @@ def _unsupported(value):
     raise TypeError(f"unsupported JSON value: {type(value).__name__}")
 
 
+def entry_condition_errors(plan) -> list[str]:
+    """Only an independently covered, exact price interval can auto-enter.
+
+    Text is never interpreted as an executable predicate. The independent
+    review binds every original condition to the explicit supported rule;
+    future fundamental conditions require another reviewed plan revision.
+    """
+    if not isinstance(plan, dict):
+        return ["entry_conditions_unverified"]
+    entry = plan.get("entry")
+    entry = entry if isinstance(entry, dict) else {}
+    conditions = entry.get("conditions")
+    predicates = entry.get("execution_conditions")
+    review = plan.get("entry_condition_review")
+    if (entry.get("condition_mode") != "price_only"
+            or not isinstance(conditions, list) or not conditions
+            or any(not isinstance(text, str) or not text.strip() for text in conditions)
+            or not isinstance(predicates, list) or len(predicates) != 1
+            or not isinstance(predicates[0], dict)
+            or set(predicates[0]) != {"type", "low", "high"}
+            or predicates[0].get("type") != "price_between"
+            or not isinstance(review, dict)
+            or review.get("condition_mode") != "price_only"
+            or review.get("all_text_conditions_covered") is not True
+            or review.get("conditions") != conditions
+            or review.get("execution_conditions") != predicates):
+        return ["entry_conditions_unverified"]
+    try:
+        low, high = decimal_value(entry.get("low")), decimal_value(entry.get("high"))
+        if (low <= 0 or high < low or decimal_value(predicates[0].get("low")) != low
+                or decimal_value(predicates[0].get("high")) != high):
+            raise ValueError()
+    except (TypeError, ValueError):
+        return ["entry_conditions_unverified"]
+    return []
+
+
 def validate_plan(plan) -> list[str]:
     """Return actionable omissions; never turn an unparsed condition into a buy.
 
@@ -149,8 +186,9 @@ def validate_plan(plan) -> list[str]:
         errors.append("price_unit must be per_share/per_adr")
     if (plan.get("is_adr") or plan.get("price_unit") == "per_adr") and verification.get("adr") is not True:
         errors.append("verification.adr required for ADR")
-    if plan.get("conditions_parsed") is False:
+    if plan.get("conditions_parsed") is not True:
         errors.append("entry conditions are unparsed")
+    errors.extend(entry_condition_errors(plan))
     return errors
 
 
@@ -167,16 +205,18 @@ def classify_plan_validation(plan) -> dict[str, list[str]]:
     entry = plan.get("entry") if isinstance(plan, dict) else None
     entry = entry if isinstance(entry, dict) else {}
     conditions = entry.get("conditions")
-    conditional = (entry.get("basis") == "independent_valuation"
+    conditional = (entry.get("basis") in {"independent_valuation", "source_level"}
         and isinstance(conditions, list) and bool(conditions)
         and all(isinstance(value, str) and value.strip() for value in conditions))
     deferred = set()
     if conditional:
-        if plan.get("conditions_parsed") is False:
+        if plan.get("conditions_parsed") is not True:
             deferred.add("entry conditions are unparsed")
-        for field in ("low", "high"):
-            if entry.get(field) is None:
-                deferred.add(f"entry.{field} must be positive")
+        deferred.update(entry_condition_errors(plan))
+        if entry.get("basis") == "independent_valuation":
+            for field in ("low", "high"):
+                if entry.get(field) is None:
+                    deferred.add(f"entry.{field} must be positive")
     return {"research_errors": [error for error in errors if error not in deferred],
             "execution_gaps": [error for error in errors if error in deferred]}
 

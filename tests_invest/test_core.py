@@ -5,10 +5,11 @@ from decimal import Decimal
 
 from rhino_invest.common import decimal_value, parse_time, stable_id, validate_plan
 from rhino_invest.store import Store
+from tests_invest.plan_fixtures import with_price_conditions
 
 
 def plan():
-    return {"id": "p", "revision": 1, "symbol": "TSM", "status": "active",
+    return with_price_conditions({"id": "p", "revision": 1, "symbol": "TSM", "status": "active",
             "created_at": "2026-01-01T00:00:00+00:00", "next_review_at": "2026-04-01T00:00:00Z",
             "thesis": "Evidenced business case", "horizon_months": 24, "evidence_refs": ["evidence:1"],
             "entry": {"low": "100", "high": "110", "amount_usd": "2000"},
@@ -18,7 +19,7 @@ def plan():
             "stop": {"price": "80", "confirmation": "daily_close"}, "invalidation_conditions": ["A sustained margin collapse"],
             "time_exit_policy": "review at 24 months", "valuation_basis": {"type": "scenario"},
             "currency": "USD", "price_unit": "per_adr", "is_adr": True,
-            "verification": {"provenance": True, "currency": True, "unit": True, "adr": True}}
+            "verification": {"provenance": True, "currency": True, "unit": True, "adr": True}})
 
 
 class CommonTests(unittest.TestCase):

@@ -393,7 +393,8 @@ class EvidenceContractTests(unittest.TestCase):
             def run(self, purpose, payload, **kwargs):
                 result = super().run(purpose, payload, **kwargs)
                 if purpose == 'compile_plan':
-                    result['plan']['entry'].update(low=None, high=None, conditions=['Issuer confirms the modeled margin improvement'])
+                    result['plan']['entry'].update(low=None, high=None, conditions=['Issuer confirms the modeled margin improvement'],
+                        condition_mode='price_and_fundamental', execution_conditions=[])
                     result['plan']['conditions_parsed'] = False
                 return result
         plan = self.ingest(Conditional(), data)

@@ -48,7 +48,14 @@ Return ONLY one compact valid JSON object, without markdown or optional long pro
 "unit":false,"adr":false}}. Replace those values with your independent conclusions;
 issues must be concise strings. If current_position_basis was supplied, also return
 position_basis_accepted as a boolean after reviewing that exact structure. Preserve
-uncertainty; reject with issues if the original evidence does not justify acceptance.'''
+uncertainty; reject with issues if the original evidence does not justify acceptance.
+If the original plan has entry conditions, independently return entry_condition_review:
+{condition_mode:'price_only'|'price_and_fundamental',all_text_conditions_covered:false,
+conditions:[the exact original condition strings],execution_conditions:[the exact
+original predicates]}. Attest price_only and all_text_conditions_covered:true ONLY
+when every original condition is covered by the supported price interval. Future
+issuer releases, operating results or other unresolved fundamental conditions remain
+price_and_fundamental with coverage false; never turn them into a price-only rule.'''
 
 
 class ModelGateway:
