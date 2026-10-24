@@ -1,0 +1,63 @@
+name: Investment and finance checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "rhino_invest/**"
+      - "tests_invest/**"
+      - "scripts/finance_*.py"
+      - "scripts/test_finance*.py"
+      - "deploy/investment/**"
+      - "pyproject.toml"
+      - ".github/workflows/investment.yml"
+  push:
+    branches: [main, feat/rhino-investment-terminal]
+
+permissions:
+  contents: read
+
+jobs:
+  investment:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install investment dependencies
+        run: python -m pip install -r deploy/investment/requirements.txt
+      - name: Check investment behavior offline
+        run: python -m unittest discover -s tests_invest -p 'test_*.py' -v
+      - name: Preserve finance pipeline behavior
+        run: python -m unittest discover -s scripts -p 'test_finance*.py' -v
+      - name: Verify package entry point
+        run: python -m rhino_invest --help
+
+  release:
+    needs: investment
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build application and dependency wheels
+        run: python -m pip wheel --wheel-dir release/wheels -r deploy/investment/requirements.txt .
+      - name: Seal release and provenance
+        run: |
+          python deploy/investment/build_release.py --revision "$GITHUB_SHA"
+          tar -czf rhino-invest-linux-py312.tar.gz -C release .
+      - name: Publish reviewed deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhino-invest-linux-py312-${{ github.sha }}
+          path: rhino-invest-linux-py312.tar.gz
+          if-no-files-found: error
+          retention-days: 30

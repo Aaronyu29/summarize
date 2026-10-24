@@ -1,0 +1,6 @@
+# Deployment scripts must execute on Linux after a Windows checkout.
+deploy/investment/*.sh text eol=lf
+deploy/investment/*.service text eol=lf
+rhino_invest/*.py text eol=lf
+tests_invest/*.py text eol=lf
+deploy/investment/*.py text eol=lf

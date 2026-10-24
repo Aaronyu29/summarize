@@ -6,7 +6,7 @@ import pathlib
 import tempfile
 import unittest
 
-from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url
+from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url, highlighted_elements
 
 
 class Response:
@@ -61,6 +61,76 @@ class FakeSession:
 
 
 class FeishuTests(unittest.TestCase):
+    def test_native_highlight_keeps_conditional_and_unfinished_wording(self):
+        text = '观察：**若跌破698，风险升高；当前尚未触发**；**融资尚未完成**。'
+        elements = highlighted_elements(text)
+        self.assertEqual(''.join(e['text_run']['content'] for e in elements), text.replace('**', ''))
+        emphasized = [e['text_run'] for e in elements if e['text_run'].get('text_element_style')]
+        self.assertEqual(len(emphasized), 2)
+        self.assertTrue(all(r['text_element_style'] == {'bold': True, 'background_color': 3} for r in emphasized))
+
+    def test_import_losing_emphasis_stops_before_notification(self):
+        self.md.write_text('# Sample\n\n**Important condition**\n\n![Image caption](frame.jpg)\n', encoding='utf-8')
+        session = FakeSession()
+        with self.assertRaisesRegex(RuntimeError, 'lost required emphasis'):
+            self.publisher(session).run()
+        self.assertFalse(any('/hook/' in url for _, url in session.calls))
+
+    def test_highlight_is_patched_and_read_back(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**QQQ 698；尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': 'QQQ 698；尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        def call(method, path, *, json_body):
+            block['text']['elements'] = json_body['update_text_elements']['elements']
+        publisher.call = call
+        publisher.block = lambda doc, block_id: block
+        publisher.emphasize_and_verify('doc')
+        self.assertEqual(block['text']['elements'][0]['text_run']['text_element_style']['background_color'], 3)
+
+    def test_duplicate_phrase_must_be_emphasized_at_every_occurrence(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**尚未触发**\n\n**尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': highlighted_elements('**尚未触发**')}}
+        publisher.list_blocks = lambda doc: [block]
+        with self.assertRaisesRegex(RuntimeError, 'lost required emphasis'):
+            publisher.emphasize_and_verify('doc')
+
+    def test_server_splitting_styled_runs_is_accepted(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**QQQ 698；尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': 'QQQ 698；尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        def call(method, path, *, json_body):
+            block['text']['elements'] = highlighted_elements('**QQQ 698；****尚未触发**')
+        publisher.call = call
+        publisher.block = lambda doc, block_id: block
+        publisher.emphasize_and_verify('doc')
+        self.assertTrue(publisher.state['highlight_verified'])
+
+    def test_failed_style_readback_does_not_mark_verified(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': '尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        publisher.call = lambda *args, **kwargs: None
+        publisher.block = lambda doc, block_id: block
+        with self.assertRaisesRegex(RuntimeError, 'highlight readback failed'):
+            publisher.emphasize_and_verify('doc')
+        self.assertNotIn('highlight_verified', publisher.state)
+
+    def test_document_only_acceptance_does_not_send_notification(self):
+        session = FakeSession()
+        publisher = self.publisher(session)
+        result = publisher.run(notify=False)
+        self.assertEqual(result['status'], 'document_verified')
+        self.assertFalse(any('/hook/' in url for _, url in session.calls))
+        self.assertNotIn('webhook_sent', publisher.state)
+        self.assertEqual(publisher.run()['status'], 'delivered')
+
     def setUp(self):
         root = pathlib.Path(__file__).resolve().parent.parent / ".cache" / "finance-tests"
         root.mkdir(parents=True, exist_ok=True)

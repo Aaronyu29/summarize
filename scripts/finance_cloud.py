@@ -18,7 +18,7 @@ import subprocess
 import sys
 import urllib.request
 
-from finance_archive import publish, sha, validate
+from finance_archive import publish, sha, validate, validate_readability, REPORT_STYLE_VERSION
 from finance_collect import CHANNEL_ID, parse_feed
 from finance_feishu import Publisher
 from finance_jobs import Jobs
@@ -197,6 +197,19 @@ evidence_segment_ids 必须复制给定的S前缀字符串，不能填秒数或�
 复盘条件、反例等若为本报告归纳，须在正文中明确标为“本报告复盘补充”，不能归为博主原话。
 估值中位、估值区间与技术支撑不是同一概念；已经发生的价位变化不能写成尚未触发的条件。
 转写日期若与画面/发布信息冲突，应标为自动识别不确定，不能未经听辨断言博主口误。
+阅读与强调规则适用于全文，不仅是摘要：
+overview 建议120至180字，最多220字符，用一句直白结论加三条短要点（换行分隔）；不要堆满行情数字，
+不要写“本期围绕三条线”等套话。日期纠错放uncertainty，复盘条件放review_questions，不塞进摘要。
+每条text先说结论，再用2至4条短句换行分别说明依据和条件；同一说明只出现一次，不在核对说明重复正文。
+所有需要读者注意的内容，用Markdown **关键短语** 标记：关键判断、重要数字及单位、变化方向与前后值、
+支撑/压力区间、事件期限、风险、触发条件、反例和判断失效条件。text、uncertainty、review_questions均适用。
+强调必须包含主体及必要限定，例如 **OpenAI目标估值1.40万亿→1.25万亿美元，融资尚未完成**、
+**若QQQ跌破698，风险进一步升高；节目时点尚未触发**。不许只加粗数字而漏掉“若/未/预计”。
+上述示例仅演示强调格式，不是本期事实，不得照搬示例中的公司或数字。
+每条text至少一处强调，每处不超过90字符；所有重要点都要强调，不能只标第一项或一个数字充数。
+只强调关键短语，不把整段全部加粗，不装饰无关日期或证据编号。仅用**强调**与换行，不使用HTML或表格。
+headline保持简短纯文本。uncertainty突出会改变判断的缺口，例如 **在建规模未标数，无法确认**。
+review_questions换行列出“验证什么”和“出现什么则下调原判断”，本报告归纳仍须标注来源。
 JSON结构：{"overview":"本期速读", "claims":[{"headline":"重点标题", "kind":"creator_view或on_screen或analyst_inference",
 "text":"完整中文重点", "timestamp_seconds":123, "evidence_segment_ids":["S000041","S000042"], "frame_seconds":145,
 "uncertainty":"识别限制/核对说明"}], "review_questions":"可验证的复盘问题"}。所有字符串为中文，数值用JSON数字。'''
@@ -205,6 +218,9 @@ VERIFY = '''你是第二遍证据核验员。仅依据完整转写与截图检�
 核验每条claim的数字、年份、价格区间、条件/已执行区分、证据时刻、遗漏的重要主题。
 也核对标题：不得将开场说成开盘、将收盘或全日数据说成开盘数据；本报告的归纳不得写成博主原话。
 任何实质错误、含糊但写成确定的数字、证据不支持、遗漏关键风险均拒绝。
+同时检查全文可读性：overview必须简短直白，不能混入日期纠错和长篇复盘；每条正文及复盘的关键结论、
+数字变化、关键价位、风险与失效条件必须用**短语**强调。强调必须带主体、单位及“若/未完成/尚未触发”等
+必要限定，不能通过加粗把推测变成事实。核对说明中的重要证据缺口也须突出，避免整段加粗和重复说明。
 输出JSON：{"accepted":true或false,"issues":["问题"],"checked_claim_indices":[0,1,...]}。
 仅当逐条检查且无实质错误时accepted=true。不要改写报告或凭常识补数据。'''
 
@@ -282,7 +298,9 @@ def analyze(capture_dir, info, env):
     def build(candidate, evidence_repair=False, semantic_repair=False):
         canonical = canonicalize_evidence(candidate, transcript['segments'])
         video = {**canonical, 'video_id': vid, 'published_shanghai': published}
+        validate_readability(video)
         value = {'schema_version': 1, 'revision': 1, 'edition': f'单期自动研究 · {published}（北京时间发布）',
+                 'report_style_version': REPORT_STYLE_VERSION,
                  'summary': video['overview'], 'videos': [video],
                  'cross_video_observations': '本报告仅分析本期视频。后续应核验博主提出的条件是否发生，不能直接据此计算预测胜率或交易收益。',
                  'review_provenance': {'mode': 'deepseek_full_transcript_and_frames_with_second_pass',
@@ -305,7 +323,7 @@ def analyze(capture_dir, info, env):
             if attempt:
                 raise
             result = model_json(directory, 'analysis-repair-001', INSTRUCTION +
-                '\n修订候选总结的证据引用与时间对齐。保留有依据的内容，删掉无依据内容，不添加片外信息。'
+                '\n按validation_error修订证据引用、时间对齐或全文样式。保留有依据的内容，删掉无依据内容，不添加片外信息。'
                 '给每个重点复制真实S前缀segment_id，严禁把秒数填入证据编号。输出完整同结构JSON。',
                 {**payload, 'candidate_needing_repair': result, 'validation_error': str(error)}, [], env)
             repaired = True
@@ -321,7 +339,8 @@ def analyze(capture_dir, info, env):
             prefix = 'reviewed-' if semantic_attempt else 'repaired-' if repaired else ''
             review_name = f'verification-{prefix}{batch_index:03}'
             review = model_json(directory, review_name, VERIFY +
-                '\n只检查本批candidate.claims，checked_claim_indices 必须使用 global_claim_indices 给定的原报告索引。',
+                '\n检查本批candidate.claims以及overview和review_questions的可读性与强调；'
+                'checked_claim_indices 必须使用 global_claim_indices 给定的原报告索引。',
                 {**payload, 'candidate': {**video, 'claims': review_claims}, 'global_claim_indices': indices},
                 [(s,p) for s,p in frames if s in selected], env)
             accepted = (review.get('accepted') is True and not review.get('issues') and
@@ -388,7 +407,10 @@ def process(jobs, vid, root, env):
         jobs.save(vid, analysis_complete=True, report=str(report))
     else:
         report = pathlib.Path(checkpoint['report'])
-    title = delivery_title(info, read(capture_dir / 'analysis-v1.json'))
+    delivery_analysis = read(capture_dir / 'analysis-v1.json')
+    # A delivery retry must not bypass the new style gate via an older analysis checkpoint.
+    validate_readability(next(v for v in delivery_analysis['videos'] if v['video_id'] == vid))
+    title = delivery_title(info, delivery_analysis)
     update_costs(capture_dir)
     jobs.save(vid, stage='上传飞书、图片核验与发送简报')
     receipt = Publisher(report, title, 'feishu', env=env).run()

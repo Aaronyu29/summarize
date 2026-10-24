@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -16,11 +17,37 @@ import pathlib
 import re
 import time
 import urllib.parse
+from collections import Counter
 
 BASES = {"feishu": "https://open.feishu.cn/open-apis", "lark": "https://open.larksuite.com/open-apis"}
 IMAGE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
 ENV_KEYS = {"FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_FOLDER_TOKEN", "LARK_WEBHOOK_URL", "LARK_WEBHOOK_SECRET"}
 ENV_ALIASES = {"APPID": "FEISHU_APP_ID", "APPSecret": "FEISHU_APP_SECRET", "LARK_WEBHOOK": "LARK_WEBHOOK_URL"}
+
+
+def highlighted_elements(text):
+    """Convert editorial emphasis to native Feishu bold with a pale yellow background."""
+    elements = []
+    for index, fragment in enumerate(re.split(r'\*\*([^*\n]+)\*\*', text)):
+        if fragment:
+            run = {'content': fragment}
+            if index % 2:
+                run['text_element_style'] = {'bold': True, 'background_color': 3}
+            elements.append({'text_run': run})
+    return elements
+
+
+def text_payload(block):
+    return next((value for value in block.values()
+                 if isinstance(value, dict) and isinstance(value.get('elements'), list)), {})
+
+
+def bold_content(block, *, highlighted=False):
+    """Keep adjacent styled runs together, but never bridge an unstyled gap."""
+    return ''.join(run.get('content', '') if run.get('text_element_style', {}).get('bold')
+                   and (not highlighted or run.get('text_element_style', {}).get('background_color') == 3) else '\0'
+                   for element in text_payload(block).get('elements', [])
+                   for run in [element.get('text_run', {})])
 
 
 def load_environment(path):
@@ -202,7 +229,44 @@ class Publisher:
     def block(self, doc, block):
         return self.call("GET", f"/docx/v1/documents/{doc}/blocks/{block}")["data"]["block"]
 
-    def run(self):
+    def emphasize_and_verify(self, doc):
+        normalize = lambda value: re.sub(r'\s+', '', value)
+        expected = Counter(normalize(value) for value in re.findall(r'\*\*([^*\n]+)\*\*', self.content))
+        if not expected:
+            return
+        blocks = self.list_blocks(doc)
+        actual = [normalize(bold_content(block)) for block in blocks]
+        if any(sum(value.count(phrase) for value in actual) < count for phrase, count in expected.items()):
+            raise RuntimeError('Document lost required emphasis during import; webhook not sent')
+        for block in blocks:
+            # Headings already have a visual hierarchy. Highlight inline emphasis in body/list/quote blocks.
+            if block.get('block_type') not in {2, 12, 13, 15}:
+                continue
+            elements = copy.deepcopy(text_payload(block).get('elements', []))
+            changed = False
+            for element in elements:
+                run = element.get('text_run', {})
+                style = run.get('text_element_style', {})
+                if style.get('bold') and style.get('background_color') != 3:
+                    style['background_color'] = 3
+                    changed = True
+            if changed:
+                self.call('PATCH', f"/docx/v1/documents/{doc}/blocks/{block['block_id']}",
+                          json_body={'update_text_elements': {'elements': elements}})
+                confirmed = self.block(doc, block['block_id'])
+                # Feishu may split a run when applying styles. Compare content and coverage, not segmentation.
+                expected_content = normalize(bold_content({'text': {'elements': elements}}))
+                confirmed_content = normalize(bold_content(confirmed, highlighted=True))
+                if expected_content != confirmed_content:
+                    raise RuntimeError('Document highlight readback failed; webhook not sent')
+        final = [normalize(bold_content(block, highlighted=True)) for block in self.list_blocks(doc)]
+        if any(sum(value.count(phrase) for value in final) < count for phrase, count in expected.items()):
+            raise RuntimeError('Document highlight readback failed; webhook not sent')
+        self.state['highlight_verified'] = True
+        self.state['highlight_span_count'] = sum(expected.values())
+        self.save()
+
+    def run(self, *, notify=True):
         lock = self.state_path.with_suffix(".lock")
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
@@ -281,8 +345,12 @@ class Publisher:
             if ("FINANCE_IMAGE_" in raw or not raw.strip() or
                     any(re.sub(r"\s", "", heading) not in normalized_raw for heading in headings)):
                 raise RuntimeError("Document content verification failed; webhook not sent")
+            self.emphasize_and_verify(doc)
             self.state["document_verified"] = True
             self.save()
+            if not notify:
+                return {"status": "document_verified", "url": self.state["url"],
+                        "image_count": len(self.images), "highlight_span_count": self.state.get('highlight_span_count', 0)}
             payload = {"msg_type": "text", "content": {"text": f"{self.title}\n{self.state['url']}"}}
             if self.env.get("LARK_WEBHOOK_SECRET"):
                 payload["timestamp"] = str(int(time.time()))

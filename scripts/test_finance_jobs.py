@@ -1,8 +1,11 @@
 import pathlib
 import tempfile
 import unittest
+import json
+from unittest.mock import patch
 from finance_jobs import Jobs
 from finance_cloud import unseen_entries, batches, canonicalize_evidence, publication_time, delivery_title
+from finance_cloud import process
 
 
 class JobsTests(unittest.TestCase):
@@ -64,6 +67,23 @@ class JobsTests(unittest.TestCase):
         self.assertEqual(other.pending(), [vid])
         self.assertTrue(other.get(vid)['checkpoint']['analysis_complete'])
         self.assertEqual(other.get(vid)['checkpoint']['report'], '/data/brief.md')
+
+    def test_legacy_delivery_checkpoint_cannot_skip_readability_gate(self):
+        vid = self.entry['video_id']
+        self.jobs.add(self.entry)
+        capture = pathlib.Path(self.temp.name) / 'capture'
+        directory = capture / vid
+        directory.mkdir(parents=True)
+        (directory / 'transcript.asr.json').write_text('{}')
+        (directory / 'frames.json').write_text('[]')
+        (capture / 'analysis-v1.json').write_text(json.dumps({'videos': [
+            {'video_id': vid, 'overview': 'legacy wall of text', 'review_questions': 'question',
+             'claims': [{'text': 'plain'}]}]}), encoding='utf-8')
+        self.jobs.save(vid, status='retry', analysis_complete=True, report=str(capture / 'brief-v1.md'))
+        with patch('finance_cloud.capture', return_value=(capture, {'id': vid})), patch('finance_cloud.Publisher') as publisher:
+            with self.assertRaisesRegex(ValueError, 'Overview'):
+                process(self.jobs, vid, pathlib.Path(self.temp.name), {})
+            publisher.assert_not_called()
 
     def test_unknown_remote_results_and_historic_baseline_never_auto_run(self):
         for index, status in enumerate(['needs_review', 'baseline', 'complete']):
