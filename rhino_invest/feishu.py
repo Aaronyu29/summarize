@@ -33,6 +33,9 @@ SCHEMA["账户与资金"].extend(["持仓核对设置", "持仓核对状态"])
 SCHEMA["投资计划"].append("设置错误说明")
 for _settings_table in ("账户与资金", "投资计划"):
     SCHEMA[_settings_table].append("设置回执")
+SCHEMA["账户与资金"].extend(["券商", "券商账户", "现金来源", "净值来源", "截图记录时间", "截图行情时间",
+    "券商未实现盈亏美元", "券商已实现盈亏美元", "维持保证金美元", "剩余流动性美元", "购买力美元", "股息美元", "对账差额美元"])
+SCHEMA["券商快照"] = ["系统标识", "券商", "账户", "项目", "数值", "币种", "说明", "记录时间", "截图行情时间"]
 
 TYPE_NAMES = {"期初现金": "opening_cash", "期初持仓": "opening_position", "买入": "buy", "卖出": "sell", "入金": "deposit", "出金": "withdrawal", "股息": "dividend", "拆股": "split", "更正": "correction", "作废": "correction"}
 

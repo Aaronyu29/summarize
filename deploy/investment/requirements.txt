@@ -3,3 +3,4 @@ akshare[quotes] @ git+https://github.com/Aaronyu29/akshare.git@cc7e451d7ba372596
 longbridge==5.2.2
 requests>=2.32,<3
 exchange-calendars>=4.5,<5
+pypdf==6.21.2

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import re
+from urllib.parse import urlsplit, parse_qs
+from zoneinfo import ZoneInfo
 
 from .common import decimal_value, parse_time, stable_id, utc_now
 from .ledger import _effective
@@ -116,6 +119,76 @@ def _revision(value):
     return (1, int(text)) if text.isdigit() else (0, text)
 
 
+def _primary_splits(store, moment):
+    """Read issuer-proven effective splits, independent of account bookkeeping.
+
+    A cached boolean/status or an unbound date cannot invalidate price units.
+    The original official excerpt must name this symbol and the effective date.
+    """
+    result = {}
+    date_pattern = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s*\d{4}"
+    for symbol, cached in store.items("fundamental_cache"):
+        data = cached.get("data") or {}
+        if not isinstance(data, dict) or not isinstance(data.get("primary_evidence"), list):
+            continue
+        declared = {item["id"] for item in data["primary_evidence"] if isinstance(item, dict) and isinstance(item.get("id"), str)}
+        etf = data.get("etf_valuation") or {}
+        if not isinstance(etf, dict) or not isinstance(etf.get("corporate_actions"), list):
+            continue
+        for action in etf["corporate_actions"]:
+            if not isinstance(action, dict) or action.get("type") != "split":
+                continue
+            refs, excerpt = action.get("evidence_refs"), action.get("source_excerpt")
+            if (not isinstance(refs, list) or not refs or not all(isinstance(ref, str) for ref in refs)
+                    or not set(refs).issubset(declared) or not isinstance(excerpt, str)):
+                continue
+            if not re.search(r"\b" + re.escape(symbol) + r"\b", excerpt) or not re.search(r"\bsplit\b", excerpt, re.I):
+                continue
+            effective = action.get("effective_at") or action.get("effective_date")
+            try:
+                day = datetime.fromisoformat(str(effective).replace("Z", "+00:00")).date()
+                stamp = datetime(day.year, day.month, day.day, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
+                match = re.search(r"(?:split-adjusted basis on|effective(?: date)?(?: is|:| on)?)\s*(" + date_pattern + r")", excerpt, re.I)
+                if not match:
+                    continue
+                raw_date = re.sub(r"\s+", " ", match.group(1))
+                parsed = None
+                for fmt in ("%B %d, %Y", "%b %d, %Y"):
+                    try:
+                        parsed = datetime.strptime(raw_date, fmt).date()
+                        break
+                    except ValueError:
+                        pass
+                if parsed != day or stamp > moment:
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+            valid = True
+            for ref in refs:
+                evidence = store.get("external_evidence", ref) or {}
+                content = evidence.get("content")
+                try:
+                    url = urlsplit(evidence.get("source_url", ""))
+                    # The currently supported issuer corporate-action feed is
+                    # SOXX's actual fund page, not arbitrary content on its host.
+                    allowed = (symbol == "SOXX" and url.scheme == "https" and not url.username and not url.password
+                        and url.port in (None, 443) and (
+                            (url.hostname == "www.ishares.com" and url.path.startswith("/us/products/239705/")) or
+                            (url.hostname == "www.blackrock.com" and url.path.startswith("/varnish-api/blk-one01-product-data/")
+                             and parse_qs(url.query).get("portfolioId") == ["239705"])))
+                    if evidence.get("observed_at") and parse_time(evidence["observed_at"]) > moment:
+                        allowed = False
+                except (ValueError, TypeError):
+                    allowed = False
+                if (not allowed or not isinstance(content, str) or excerpt not in content
+                        or hashlib.sha256(content.encode("utf-8")).hexdigest() != evidence.get("sha256")):
+                    valid = False
+                    break
+            if valid and (symbol not in result or stamp > result[symbol]["effective_at"]):
+                result[symbol] = {"effective_at": stamp, "evidence_refs": refs}
+    return result
+
+
 def evaluate_levels(store, snapshots, now=None):
     """Emit durable watch events on a zone entry or an observed cross-zone gap.
 
@@ -140,6 +213,10 @@ def evaluate_levels(store, snapshots, now=None):
             if event["type"] == "split" and parse_time(event["timestamp"]) <= moment:
                 stamp = parse_time(event["timestamp"])
                 splits[event["symbol"]] = max(splits.get(event["symbol"], stamp), stamp)
+        issuer_splits = _primary_splits(store, moment)
+        for symbol, action in issuer_splits.items():
+            stamp = action["effective_at"]
+            splits[symbol] = max(splits.get(symbol, stamp), stamp)
         seals = {(s.get("snapshot_id"), s.get("analysis_sha256"), s.get("manifest_sha256"))
                  for _, s in store.items("research_archive_seal")}
         extracted = {stable_id(level) for _, result in store.items("research_extraction")
@@ -162,6 +239,13 @@ def evaluate_levels(store, snapshots, now=None):
         events = []
         for key, level, published, source in candidates:
             symbol = level["symbol"]
+            if symbol in issuer_splits and issuer_splits[symbol]["effective_at"] > published:
+                action = issuer_splits[symbol]
+                audit_id = stable_id("watch-primary-split-block", key, action["effective_at"].isoformat(), action["evidence_refs"])
+                if store.get("watch_block", audit_id) is None:
+                    store.put("watch_block", audit_id, {"id": audit_id, "symbol": symbol, "level_id": key,
+                        "reason": "verified_primary_split_requires_new_price_basis", "timestamp": observed_at,
+                        "effective_at": action["effective_at"].isoformat(), "evidence_refs": action["evidence_refs"]}, immutable=True)
             if (published != newest[symbol] or _revision(source.get("revision")) != revisions[(symbol, published, source["video_id"])]
                     or not _eligible_level(level, source) or symbol not in quotes
                     or (symbol in splits and splits[symbol] > published)):

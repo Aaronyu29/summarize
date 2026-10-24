@@ -215,6 +215,14 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
         errors.append('plan_not_active')
     if plan.get('conditions_parsed') is not True:
         errors.append('entry_conditions_unverified')
+    price_basis_expired = False
+    if plan.get('price_basis_valid_until') is not None:
+        try:
+            price_basis_expired = parse_time(moment) >= parse_time(plan['price_basis_valid_until'])
+        except (TypeError, ValueError):
+            price_basis_expired = True
+        if price_basis_expired:
+            errors.append('announced_corporate_action_requires_price_unit_review')
     try:
         from .ledger import _effective
         as_of = parse_time(moment)
@@ -283,6 +291,7 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
     stop_price = _number(stop.get('price'))
     stop_triggered = False
     price_basis_verified = (verified_plan and not schema_errors and plan.get('conditions_parsed') is True
+        and not price_basis_expired
         and 'post_plan_split_requires_price_unit_review' not in errors
         and 'corporate_action_history_unverifiable' not in errors)
     if (held > 0 or reported_held) and stop_price is not None and price_basis_verified:
@@ -305,11 +314,12 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
                 pass
     if invalidated:
         reasons.append('verified_thesis_invalidation')
-        if held > 0 and portfolio.get('ledger_input_current') is not False:
+        if held > 0 and portfolio.get('ledger_input_current') is not False and not price_basis_expired:
             action, status, quantity = 'exit', 'actionable', held
         elif held > 0 or reported_held:
             action, status, quantity = 'hold' if held > 0 else 'watch', 'warning', None
-            reasons.append('ledger_input_not_current' if held > 0 else 'reported_holding_quantity_unknown_requires_risk_check')
+            reasons.append('announced_corporate_action_requires_price_unit_review' if price_basis_expired else
+                'ledger_input_not_current' if held > 0 else 'reported_holding_quantity_unknown_requires_risk_check')
         else:
             action, status, quantity = 'watch', 'invalidated', None
     elif stop_triggered:
@@ -504,7 +514,7 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
             'drawdown_status': drawdown_status, 'current_drawdown': str(drawdown) if drawdown is not None else None,
             'risk_check_passed': False, 'cash_source': 'actual_confirmed_ledger', 'planning_only': True},
         'market_gate': gate}
-    if price and price > 0 and stop_price is not None:
+    if price and price > 0 and stop_price is not None and not price_basis_expired:
         unit_risk = max(Decimal(0), price - stop_price)
         recommendation['risk_context'].update(price_risk_per_share_usd=str(unit_risk),
             price_risk_percent=str(unit_risk / price * 100),

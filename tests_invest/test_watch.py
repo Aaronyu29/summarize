@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import unittest
 
 from rhino_invest.common import stable_id
@@ -153,6 +154,64 @@ class VideoWatchTests(unittest.TestCase):
         events = evaluate_levels(self.store, [self.quote()], NOW)
         self.assertEqual(len(events), 1)
         self.assertTrue(events[0]["touch_observed"])
+
+    def issuer_split(self, *, effective='2026-11-05', url='https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf', sha_valid=True, declared=True):
+        text = ('On August 21, 2026, iShares filed to issue a forward stock split for SOXX. '
+                'Shares of SOXX will begin trading on a split-adjusted basis on November 5, 2026.')
+        ref = stable_id('issuer-split', url)
+        self.store.put('external_evidence', ref, {'id': ref, 'source_url': url, 'content': text,
+            'sha256': hashlib.sha256(text.encode()).hexdigest() if sha_valid else '0' * 64,
+            'observed_at': NOW}, immutable=True)
+        self.store.put('fundamental_cache', 'SOXX', {'data': {
+            'primary_evidence': [{'id': ref}] if declared else [],
+            'etf_valuation': {'issuer_verified': True, 'corporate_actions': [{'type': 'split',
+                'effective_at': effective, 'status': 'effective', 'new_shares_per_old': '3',
+                'source_excerpt': text, 'evidence_refs': [ref]}]}}})
+
+    def test_verified_issuer_split_blocks_old_zone_at_new_york_effective_midnight_without_ledger_write(self):
+        self.level()
+        self.issuer_split()
+        before = '2026-11-05T04:59:59Z'
+        self.assertEqual(len(evaluate_levels(self.store, [self.quote(timestamp=before)], before)), 1)
+        effective = '2026-11-05T05:00:00Z'
+        self.assertEqual(evaluate_levels(self.store, [self.quote(timestamp=effective)], effective), [])
+        self.assertEqual(len(self.store.items('watch_block')), 1)
+        self.assertEqual(self.store.events('ledger'), [])
+        original = self.store.items('research_level')[0][1]
+        self.assertEqual((original['low'], original['high']), ('360', '365'))
+
+    def test_announced_split_does_not_hide_current_observations_before_effective_day(self):
+        self.level()
+        self.issuer_split()
+        self.assertEqual(len(evaluate_levels(self.store, [self.quote()], NOW)), 1)
+        self.assertEqual(self.store.items('watch_block'), [])
+
+    def test_primary_split_flags_tampered_dates_bad_sha_unapproved_url_and_missing_refs_cannot_suppress(self):
+        for fields in ({'effective': '2026-11-04'}, {'sha_valid': False}, {'declared': False},
+                       {'url': 'https://www.ishares.com/us/products/999999/other-fund'},
+                       {'url': 'https://www.ishares.com.attacker.example/us/products/239705/'}):
+            with self.subTest(fields=fields), Store(':memory:') as isolated:
+                previous = self.store
+                self.store = isolated
+                try:
+                    self.level()
+                    self.issuer_split(**fields)
+                    now = '2026-11-05T15:00:00Z'
+                    self.assertEqual(len(evaluate_levels(self.store, [self.quote(timestamp=now)], now)), 1)
+                    self.assertEqual(self.store.items('watch_block'), [])
+                finally:
+                    self.store = previous
+
+    def test_new_post_split_video_uses_its_own_prices_instead_of_dividing_old_prices(self):
+        self.level()
+        self.issuer_split()
+        fresh = self.level(date='20261106', video='SOXXvideo02', low='360', high='365')
+        now = '2026-11-06T15:00:00Z'
+        events = evaluate_levels(self.store, [self.quote(timestamp=now)], now)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['level_id'], fresh['id'])
+        self.assertEqual(events[0]['zone'], {'low': '360', 'high': '365'})
+        self.assertEqual(self.store.events('ledger'), [])
 
 
 if __name__ == "__main__":

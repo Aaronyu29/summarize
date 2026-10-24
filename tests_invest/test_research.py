@@ -525,7 +525,7 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(result['errors'], [])
         plan = result['plans'][0]
         self.assertEqual(plan['status'], 'needs_review')
-        self.assertEqual(plan['research_gaps'][0]['code'], 'ETF_VALUATION_EVIDENCE_UNAVAILABLE')
+        self.assertEqual(plan['research_gaps'][0]['code'], 'ETF_ISSUER_EVIDENCE_UNVERIFIED')
         self.assertEqual(plan['targets'], [])
         self.assertEqual(plan['entry']['amount_usd'], '1000')
         self.assertNotIn('horizon_until', plan)

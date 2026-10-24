@@ -23,6 +23,7 @@ REASONS = {
     "portfolio_drawdown_breached": "组合已达到设置的回撤上限", "budget_below_one_share_plus_fee": "预算不足以购买一整股并支付费用",
     "reported_holding_quantity_unknown_requires_risk_check": "你提供的持仓股数尚未核对，请检查实际持仓风险",
     "position_structure_changed_requires_take_profit_review": "持仓结构已变化，分批止盈规则需重新核对",
+    "announced_corporate_action_requires_price_unit_review": "已到拆股等公司行动生效日，价格口径与持仓股数需重新核对",
 }
 
 
@@ -130,6 +131,8 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
     kind = report.get("kind") if report.get("kind") in {"每日复盘", "每周复盘", "季度复核", "重大变化"} else "投资更新"
     snapshot = report.get("portfolio") or {}
     lines = [f"【{kind}·{label}】{stamp}", "现金：" + _number(snapshot.get("cash"), money=True)]
+    if snapshot.get("broker_snapshot_id"):
+        lines[-1] += "（IBKR截图）"
     positions = snapshot.get("positions") or []
     known_symbols = {p.get("symbol") for p in positions}
     holdings = []
@@ -263,11 +266,26 @@ def reported_holdings(store, account="real", *, now=None):
         symbol = record["symbol"]
         if symbol not in latest or parse_time(record["reported_at"]) > parse_time(latest[symbol]["reported_at"]):
             latest[symbol] = record
+    from .broker_snapshot import latest_broker_snapshot
+    broker = latest_broker_snapshot(store, account, now=now)
+    if broker:
+        for symbol in broker.get("supersedes_symbols", []):
+            if symbol in latest and parse_time(latest[symbol]["reported_at"]) <= parse_time(broker["recorded_at"]):
+                del latest[symbol]
+        for holding in broker.get("holdings", []):
+            symbol = holding["symbol"]
+            if symbol in latest and parse_time(latest[symbol]["reported_at"]) > parse_time(broker["recorded_at"]):
+                continue
+            latest[symbol] = dict(holding, account=account, source="broker_screenshot",
+                reported_market_value=holding["market_value"], reported_at=broker["recorded_at"],
+                market_price=holding.get("last_price"), broker=broker["broker"], broker_as_of=broker.get("as_of"))
     return [latest[symbol] for symbol in sorted(latest)]
 
 
 def with_reported_holdings(store, snapshot):
-    """Attach display-only statements, separate from positions and all totals."""
+    """Preserve reported brokerage balances separately from ledger-derived totals."""
+    from .broker_snapshot import with_broker_snapshot
+    snapshot = with_broker_snapshot(store, snapshot)
     recorded = {position.get("symbol") for position in snapshot.get("positions", [])}
     return dict(snapshot, reported_holdings=[record for record in reported_holdings(
         store, snapshot.get("account", "real"), now=snapshot.get("as_of")) if record["symbol"] not in recorded])
@@ -303,12 +321,33 @@ def portfolio_rows(snapshot):
             continue
         rows.append({"系统标识": f"{record['account']}:{record['symbol']}",
                      "账户": record["account"], "股票": record["symbol"],
-                     "数量": readable(None), "成本": readable(None), "市价": readable(None),
+                     "数量": readable(record.get("quantity")), "成本": readable(record.get("cost_basis")), "市价": readable(record.get("market_price")),
                      "市值": f"用户报告 {record['reported_market_value']} USD（待核对；非系统估值）",
                      "未实现盈亏": readable(None), "持有天数": readable(None), "占总资产比例": readable(None),
-                     "数据状态": "用户报告持仓待核对；股数、成本及首次建仓时间未知；未计入账本及资产合计；用户报告时间：" + record["reported_at"],
+                     "数据状态": ("IBKR截图已录入；股数、成本、买入日期未显示；截图行情时间未显示；记录时间：" if record.get("source") == "broker_screenshot" else
+                         "用户报告持仓待核对；股数、成本及首次建仓时间未知；未计入账本及资产合计；用户报告时间：") + record["reported_at"],
                      "更新时间": record["reported_at"]})
     return rows
+
+
+def broker_account_fields(snapshot):
+    if not snapshot.get("broker_snapshot_id"):
+        return {}
+    fields = {"券商": "IBKR", "券商账户": readable(snapshot.get("broker_account_identifier")),
+        "现金来源": "IBKR截图；余额已记录，尚未与逐笔成交核对", "净值来源": "IBKR截图账户净值，非系统逐笔估值",
+        "截图记录时间": snapshot["broker_snapshot_recorded_at"], "截图行情时间": snapshot.get("broker_snapshot_as_of") or "截图未显示",
+        "现金完整": "截图余额已记录；逐笔账目尚未核对", "持仓核对状态": "已记录IBKR持仓；股数、成本和买入日期未显示",
+        "成本完整": "截图未显示", "费用完整": "截图未显示",
+        "持仓市值美元": readable(snapshot.get("broker_reported_holdings_market_value_sum")) + "（持仓截图合计）",
+        "可用现金美元": "执行前核对券商可用现金；购买力不计入现金"}
+    for label, key in {"券商未实现盈亏美元": "unrealized_pnl", "券商已实现盈亏美元": "realized_pnl",
+                       "维持保证金美元": "maintenance_margin", "剩余流动性美元": "excess_liquidity",
+                       "购买力美元": "buying_power", "股息美元": "dividends",
+                       "对账差额美元": "unexplained_non_cash_value"}.items():
+        fields[label] = readable(snapshot.get("broker_reported_" + key))
+    if snapshot.get("cash_status") == "new_ledger_cash_event_requires_broker_refresh":
+        fields.update(现金来源="截图后已录入新的现金变动，历史余额见券商快照", 现金完整="需要更新券商余额")
+    return fields
 
 
 def plan_row(plan, recommendation=None):
@@ -346,7 +385,13 @@ def plan_row(plan, recommendation=None):
                     "投资逻辑", "逻辑失效条件", "到期处理", "单次买入美元", "期限月数", "下次复核"):
             row[key] = "待审核，暂不展示"
         row["建议动作"] = "等待审核"
-        row["理由"] = "研究资料尚未通过独立审核，暂无新增操作建议"
+        labels = {"EPS_UNIT_UNVERIFIED": "每股盈利口径尚待核实", "INSTRUMENT_UNIT_UNVERIFIED": "证券报价单位尚待核实",
+                  "ETF_BASELINE_VALUE_MISSING": "基金净值或估值基准待补齐", "ETF_BASELINE_DATES_UNALIGNED": "基金净值与估值日期未对齐",
+                  "ETF_HOLDINGS_COVERAGE_MISSING": "基金成分持仓覆盖不足", "ETF_FEES_UNRESOLVED": "基金费用口径待核实",
+                  "ETF_ISSUER_EVIDENCE_UNVERIFIED": "基金官方资料待核实", "RESEARCH_REVIEW_REJECTED": "独立复核仍有实质疑点"}
+        gaps = list(dict.fromkeys(labels[g["code"]] for g in plan.get("research_gaps", [])
+            if isinstance(g, dict) and g.get("blocking") and g.get("code") in labels and g.get("scope") != "execution"))
+        row["理由"] = "；".join(gaps[:3]) if gaps else "研究资料尚未通过独立审核，暂无新增操作建议"
         row["证据引用"] = "来源记录已内部留存，待独立审核"
     return row
 

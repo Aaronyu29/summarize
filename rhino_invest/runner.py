@@ -7,14 +7,14 @@ import threading
 from .common import utc_now, parse_time, stable_id, decimal_value
 from .ledger import portfolio
 from .market import MarketData, quote_gate
-from .research import ingest_archives, review_plan
+from .research import ingest_archives, review_plan, _logical_fundamentals
 from .model import ModelGateway
 from .decisions import evaluate, _has_provenance, valid_thesis_events
 from .paper import paper_account, simulate
 from .watch import evaluate_levels, KINDS as WATCH_KINDS
 from .feishu import Feishu
 from .reporting import (make_report, report_row, plan_row, portfolio_rows, readable,
-                        reported_holdings, with_reported_holdings, notification_text, actionable_notice, beijing_time)
+                        reported_holdings, with_reported_holdings, notification_text, actionable_notice, beijing_time, broker_account_fields)
 
 
 SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
@@ -70,9 +70,16 @@ class TradingCalendar:
 
 class Runner:
     def __init__(self, store, config, *, market=None, feishu=None, calendar=None,
-                 model=None, execute=False, clock=utc_now):
+                 model=None, primary_enricher=None, execute=False, clock=utc_now):
         self.store, self.config, self.execute, self.clock = store, config, bool(execute), clock
         self.market = market or MarketData()
+        # An injected market is a complete test/custom adapter and must not
+        # silently add network traffic. The production adapter also gathers
+        # issuer evidence; callers can explicitly inject the same capability.
+        if primary_enricher is None and market is None:
+            from .primary_evidence import enrich_primary_fundamentals
+            primary_enricher = enrich_primary_fundamentals
+        self.primary_enricher = primary_enricher
         self.feishu = feishu or Feishu(store, config, execute=execute)
         self.calendar = calendar or TradingCalendar()
         self.model = model
@@ -285,17 +292,45 @@ class Runner:
         period = cal["completed_session"] if cal else parse_time(now).date().isoformat()
         for symbol in symbols:
             cached = self.store.get("fundamental_cache", symbol)
-            if cached and cached.get("period") == period:
+            enrichment_revision = "issuer-evidence-v1" if self.primary_enricher and self.execute else None
+            refresh_due = False
+            if cached and (cached.get("data") or {}).get("primary_refresh_after"):
+                try:
+                    refresh_due = parse_time(now) >= parse_time(cached["data"]["primary_refresh_after"])
+                except (TypeError, ValueError):
+                    refresh_due = True
+            if (cached and cached.get("period") == period
+                    and cached.get("enrichment_revision") == enrichment_revision and not refresh_due):
                 fundamentals[symbol] = cached["data"]
                 continue
             try:
                 data = self.market.fundamentals(symbol, now=now)
+                if self.primary_enricher and self.execute:
+                    data = self.primary_enricher(self.store, symbol, data, now=now)
+                    previous_data = cached.get("data", {}) if cached else {}
+                    lost_facts = (bool((previous_data.get("primary_financials") or {}).get("facts"))
+                        and not (data.get("primary_financials") or {}).get("facts"))
+                    lost_etf = ((previous_data.get("etf_valuation") or {}).get("issuer_verified") is True
+                        and (data.get("etf_valuation") or {}).get("issuer_verified") is not True)
+                    if (lost_facts or lost_etf) and any(g.get("blocking") for g in data.get("primary_gaps", [])):
+                        # A failed HTTP fetch is not a changed issuer fact. Keep
+                        # last known dated evidence, never give it a new as-of.
+                        failure = {"status": "retained_last_known_evidence", "attempted_at": now,
+                                   "gaps": data.get("primary_gaps", [])}
+                        for key, value in previous_data.items():
+                            if ((key.startswith("primary_") and key not in {"primary_refresh_after", "primary_collection"})
+                                    or key in {"etf_valuation", "reviewed_identity", "adr_conversion_verified"}):
+                                data[key] = value
+                        data["primary_collection"] = failure
+                    from .market import normalize_fundamentals
+                    data = normalize_fundamentals(data, store=self.store)
                 fundamentals[symbol] = data
                 previous = cached["data"] if cached else None
-                changed = previous is not None and _stable(previous) != _stable(data)
-                self.store.put("fundamental_cache", symbol, {"period": period, "data": data, "changed": changed})
+                changed = previous is not None and _logical_fundamentals(previous) != _logical_fundamentals(data)
+                self.store.put("fundamental_cache", symbol, {"period": period, "data": data, "changed": changed,
+                    "enrichment_revision": enrichment_revision})
                 if changed:
-                    self._queue_review(stable_id("fundamental_change", symbol, _stable(data)), {
+                    self._queue_review(stable_id("fundamental_change", symbol, _logical_fundamentals(data)), {
                         "symbol": symbol, "kind": "fundamental_change", "timestamp": now,
                         "evidence": data})
             except Exception as exc:
@@ -508,6 +543,7 @@ class Runner:
                           "可用现金美元": readable(snapshot.get("available_cash_after_reservations")),
                           "回撤限制": ("未配置" if snapshot.get("drawdown_limit") is None else
                                       "已设置" + str(snapshot["drawdown_limit"]) + "；历史净值峰值不足，不能评估"), "更新时间": now}
+                fields.update(broker_account_fields(snapshot))
                 self._export(result, "账户与资金", fields)
                 for row in portfolio_rows(snapshot):
                     self._export(result, "持仓总览", row)

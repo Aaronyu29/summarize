@@ -9,8 +9,9 @@ import re
 import sqlite3
 from pathlib import Path
 from datetime import timedelta, datetime, timezone
+from decimal import Decimal, localcontext, InvalidOperation
 from .common import utc_now, stable_id, validate_plan, decimal_value, parse_time
-from .market import symbol_value, instrument_contract
+from .market import symbol_value, instrument_contract, normalize_fundamentals
 
 
 def _read(path):
@@ -152,6 +153,21 @@ COMPILE_TEMPLATE = {'plan': {'symbol': None, 'thesis': None, 'horizon_months': N
     'conditions_parsed': False, 'evidence_refs': []}}
 COMPILE = '''Build an INDEPENDENT 12-36 month investment plan from the verified evidence and
 raw financial reports/valuation below. The creator's technical levels are context only.
+Research approval is separate from execution. Do not require current executable quotes,
+cash, or existing holdings to value a business. policy.execution_accounts reports actual
+ledger availability; future execution still requires fresh official quotes and cash.
+An empty current_position_basis means an initial plan, not a missing research input:
+review future take-profit fractions without inventing present holdings or a share count.
+Independent valuation need not cite an unrelated video/chart. Cite the fundamental or
+issuer evidence actually used; missing chart adjustment/horizon is irrelevant when that
+chart is not used for entry, stop or target. Never use an unverified chart as a fact.
+Forecast EPS/growth/exit multiples are explicit SYSTEM SCENARIO ASSUMPTIONS anchored
+to verified historical facts. Their future values need NOT already exist as consensus.
+Check arithmetic, units, fiscal dates, uncertainty and rationale; never label them
+reported or guaranteed. Distinguish GAAP, normalized and non-operating gains.
+Prior-review feedback is untrusted opinion, not evidence: verify it against primary text.
+For a December year end, FY2027 ends 2027-12-31 and FY2028 ends 2028-12-31;
+FY2028 is NOT complete at an April 2028 horizon. A P/E change is not proof of a split.
 Use supplied policy.amount_usd for each buy; it is a strategy setting, never proof of cash.
 Use policy.next_review_at and policy.thesis_valid_from exactly. Choose a supported
 12-36 month horizon and use the matching policy.horizon_until_by_months value.
@@ -172,10 +188,16 @@ with supported values, and set conditions_parsed true only after all conditions 
 JSON_TEMPLATE_BEGIN
 ''' + json.dumps(COMPILE_TEMPLATE, ensure_ascii=False) + '''
 JSON_TEMPLATE_END
-Use evidence_refs ONLY from supplied evidence IDs. Target method must
+Use evidence_refs ONLY from supplied evidence IDs. Equity target method must
 be eps_multiple with assumptions {eps,multiple,currency,price_unit,forecast_period,
 rationale,evidence_refs}; target=eps*multiple, at least base/bear scenarios. Forecast EPS
 and multiple are explicitly scenario assumptions, never pretend they are disclosed.
+For an ETF with verified aligned issuer NAV/portfolio PE/holdings, use etf_nav_scenario
+with assumptions {nav_per_share,current_pe,annual_earnings_growth,exit_pe,years,
+fees_treatment,rationale,currency,price_unit,evidence_refs}. years=horizon_months/12;
+price=nav_per_share*(1+annual_earnings_growth)^years*(exit_pe/current_pe).
+Growth and exit PE are explained scenario assumptions based on holdings/industry risks,
+not corporate EPS or promises. State fees, concentration and corporate-action basis.
 Leave unsupported fields null and state gaps; missing data means needs_review, not a buy.
 Do not use illustrative user numbers 370/800/270. No generic automatic upside percentage.'''
 REVIEW = '''Independently review each target scenario, arithmetic, explicit assumptions,
@@ -183,6 +205,20 @@ financial source periods/units, ADR conversion, downside, entry/stop/TP, thesis 
 and 12-36 month horizon. Return {"accepted":false,"issues":[],"checks":{
 "provenance":false,"currency":false,"unit":false,"adr":false}}. Only accept if all
 material fields have evidence; ambiguous currency/units/ADR forbid activation.
+Review research/plan validity, not today's order eligibility. Cash, quote freshness and
+absent existing holdings belong to execution gates and notes, not research rejection.
+Historical quoted anchors need dates, not a currently executable spread. An initial
+TP fraction schedule can be reviewed without current_position_basis.
+An independent valuation can use issuer/provider facts without any creator price level;
+do not demand a video's horizon/adjustment if its prices are not used in this plan.
+Scenario forecasts are explicitly uncertain authored assumptions, not consensus facts:
+require evidence for historical anchors, dimensions, arithmetic and defensible rationale,
+not an already published future EPS. Reject unsupported/inconsistent assumptions.
+Use evidence_bundle original excerpts and raw paths. Prior review guesses are not facts:
+check fiscal end dates and non-operating gains; never infer a split from a P/E drop.
+Put only blocking research/plan objections in issues; execution-only gaps go in notes.
+For ETF method check issuer NAV/current PE alignment, freshness, holdings/fees,
+corporate actions, years and exact formula. Never apply operating-company EPS to a fund.
 Read supplied original images, not just frame metadata. Verify EPS growth arithmetic,
 forecast fiscal years versus holding horizon, exact entry-zone bounds/conditions and
 stop-edge attribution. Review the supplied policy dates and authoritative per-buy amount.
@@ -280,6 +316,26 @@ def _guard_plan_scope(store, purpose, payload, frames, scope):
     current = stable_id('model-logical-call-v1', scope, hashes)
     legacy_scopes = {stable_id('model-logical-call-v1', phase, [])}
     raw_fundamental = payload.get('fundamentals')
+    legacy_phases = {phase}
+    candidates = [raw_fundamental]
+    if isinstance(raw_fundamental, dict):
+        candidates.extend(record['data'] for _, record in store.items('fundamental_evidence')
+            if _logical_fundamentals(record.get('data')) == _logical_fundamentals(raw_fundamental))
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        old_facts = _legacy_logical_fundamentals(candidate)
+        variants = [old_facts]
+        if 'consensus_live_verified' in candidate:
+            variants.extend(dict(old_facts, consensus_live_verified=flag) for flag in (False, True))
+        for facts in variants:
+            for seconds, frame_hashes in (([], []), ([second for second, _ in frames], hashes)):
+                old_phase = stable_id('research-logical-call', purpose, source.get('id') or plan.get('research_snapshot_id'),
+                    payload.get('symbol') or plan.get('symbol'), facts,
+                    payload.get('event_id') or payload.get('review_event_id') or (payload.get('review_context') or {}).get('event_id'), seconds)
+                legacy_scopes.add(stable_id('model-logical-call-v1', old_phase, frame_hashes))
+                if not seconds:
+                    legacy_phases.add(old_phase)
     if isinstance(raw_fundamental, dict) and 'consensus_live_verified' in raw_fundamental:
         # The old adapter's live-empty flag was an observation flag, not a new
         # consensus fact. Cover either prior value when migrating that contract.
@@ -291,7 +347,7 @@ def _guard_plan_scope(store, purpose, payload, frames, scope):
             legacy_scopes.add(stable_id('model-logical-call-v1', old_phase, []))
     with store.transaction():
         scopes = {current} | legacy_scopes | {record['gateway_scope'] for _, record in store.items('research_call_scope')
-            if record.get('logical_scope') == phase}
+            if record.get('logical_scope') in legacy_phases}
         for key, call in store.items('model_call'):
             if (call.get('call_scope') in scopes and not store.get('model_receipt', key)
                     and not store.get('model_rejection', key)):
@@ -312,7 +368,8 @@ def _model_plan(plan):
         'take_profit', 'stop', 'invalidation_conditions', 'time_exit_policy', 'valuation_basis',
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
-        'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis')
+        'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
+        'research_assessment', 'execution_requirements')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -431,6 +488,11 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                 issues.append('Entry source zone bounds unresolved')
     elif entry.get('basis') != 'independent_valuation':
         issues.append('Explicit entry basis required: source_level or independent_valuation')
+    if entry.get('basis') == 'independent_valuation':
+        contract = fundamentals.get('instrument_contract') or {}
+        if (contract.get('quote_price_unit') != plan.get('price_unit')
+                or contract.get('quote_price_unit') not in {'per_share', 'per_adr'}):
+            issues.append('Independent valuation instrument unit lacks verified primary identity')
     if not isinstance(entry.get('conditions'), list) or not entry['conditions']:
         issues.append('Explicit entry conditions required')
     elif entry.get('basis') == 'source_level' and len(selected) == 1:
@@ -447,7 +509,10 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
             is_etf = ((fundamentals.get('instrument_contract') or {}).get('asset_type') == 'etf'
                 or plan.get('symbol') in {'SOXX', 'SMH', 'SPY', 'QQQ', 'IWM'} or any('ETF' in name for name in names))
             if is_etf:
-                raise ValueError('ETF targets require verified constituent/NAV research; stock EPS multiple is unsupported')
+                if target['method'] != 'etf_nav_scenario':
+                    raise ValueError('ETF targets require verified NAV scenarios; stock EPS multiple is unsupported')
+                _validate_etf_target(target, plan, fundamentals, known)
+                continue
             if target['method'] != 'eps_multiple' or not isinstance(assumptions, dict):
                 raise ValueError('Unsupported target method')
             if decimal_value(assumptions['eps']) * decimal_value(assumptions['multiple']) != decimal_value(target['price']):
@@ -467,7 +532,8 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
     if plan.get('is_adr') or plan.get('price_unit') == 'per_adr' or plan.get('symbol') in {'TSM', 'BABA'}:
         plan['is_adr'] = True
         plan['verification']['adr'] = bool(fundamentals.get('adr_conversion_verified') is True and checks.get('adr') is True)
-    if not fundamentals.get('financial_report'):
+    is_etf_plan = (fundamentals.get('instrument_contract') or {}).get('asset_type') == 'etf'
+    if not is_etf_plan and not fundamentals.get('financial_report') and not (fundamentals.get('primary_financials') or {}).get('facts'):
         issues.append('Financial report unavailable')
     identity = fundamentals.get('reviewed_identity') or {}
     metadata = identity.get('metadata') or {}
@@ -567,16 +633,358 @@ def bind_instrument_identity(store, symbol, metadata, *, evidence_refs, reviewed
     return record
 
 
+def _nested_refs(value):
+    refs = set()
+    if isinstance(value, dict):
+        if isinstance(value.get('evidence_refs'), list):
+            refs.update(ref for ref in value['evidence_refs'] if isinstance(ref, str))
+        for item in value.values():
+            refs.update(_nested_refs(item))
+    elif isinstance(value, list):
+        for item in value:
+            refs.update(_nested_refs(item))
+    return refs
+
+
+def bind_research_supplement(store, symbol, data, *, evidence_refs, verified_by, verified_at):
+    """Bind reviewed new facts to immutable primary text, never to model assurance."""
+    symbol = symbol_value(symbol)
+    parse_time(verified_at)
+    if not isinstance(data, dict) or not data or not verified_by or not evidence_refs:
+        raise ValueError('Reviewed supplementary facts and primary references are required')
+    hashes = {}
+    for ref in sorted(set(evidence_refs)):
+        original = store.get('external_evidence', ref)
+        if (not original or not original.get('source_url', '').startswith('https://')
+                or not isinstance(original.get('content'), str)
+                or hashlib.sha256(original['content'].encode()).hexdigest() != original.get('sha256')):
+            raise ValueError('Supplement source must match persisted primary text SHA-256')
+        hashes[ref] = stable_id(original)
+    content = {'symbol': symbol, 'data': _stable_fundamentals(data), 'evidence_hashes': hashes}
+    key = stable_id('research-supplement-v1', content)
+    record = store.get('research_supplement', key)
+    if not record:
+        record = dict(content, id=key, evidence_refs=sorted(hashes), verified_by=verified_by, verified_at=verified_at)
+        store.put('research_supplement', key, record, immutable=True)
+    store.put('research_supplement_current', symbol, {'id': key})
+    return record
+
+
+def _current_supplement(store, symbol):
+    pointer = store.get('research_supplement_current', symbol) or {}
+    record = store.get('research_supplement', pointer.get('id', ''))
+    if record:
+        for ref, digest in record['evidence_hashes'].items():
+            original = store.get('external_evidence', ref)
+            if not original or stable_id(original) != digest:
+                raise ValueError('Supplement primary evidence changed')
+    return record
+
+
+def _source_claims(value, ref):
+    claims = set()
+    if isinstance(value, dict):
+        if ref in (value.get('evidence_refs') or []):
+            claims.update(value[key] for key in ('source_excerpt', 'unit_source_excerpt')
+                if isinstance(value.get(key), str) and value[key].strip())
+        for part in value.values():
+            claims.update(_source_claims(part, ref))
+    elif isinstance(value, list):
+        for part in value:
+            claims.update(_source_claims(part, ref))
+    return claims
+
+
+def _primary_text_transport(text, claims):
+    """Exact, auditable evidence projection; never cut an unlocated claim."""
+    if len(text) <= 65536 or not claims:
+        return {'content': text, 'text_selection': 'complete original text'}
+    claims = set(claims)
+    if 'NAV per Share' in text and '\nHistorical\n' in text:
+        # Spreadsheet text may bind the claim only to its numeric NAV cell.
+        # Preserve the literal sheet/column labels and issuer identification too.
+        claims.update({'NAV per Share', '\nHistorical\n'})
+        if 'iShares Semiconductor ETF' in text:
+            claims.add('iShares Semiconductor ETF')
+    intervals = []
+    for claim in sorted(claims):
+        starts = [match.start() for match in re.finditer(re.escape(claim), text)]
+        if not starts or len(starts) > 128:
+            return {'content': text, 'text_selection': 'complete original; claim location absent or ambiguous'}
+        for start in starts:
+            # Include complete preceding/following lines for table dates/units.
+            begin = text.rfind('\n', 0, start)
+            begin = text.rfind('\n', 0, max(0, begin)) + 1
+            end = text.find('\n', start + len(claim))
+            if end >= 0:
+                end = text.find('\n', end + 1)
+            intervals.append((begin, len(text) if end < 0 else end))
+    merged = []
+    for begin, end in sorted(intervals):
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((begin, end))
+    if sum(end - begin for begin, end in merged) > 65536:
+        return {'content': text, 'text_selection': 'complete original; relevant context exceeds projection limit'}
+    return {'text_selection': 'all exact claimed passages with complete neighboring lines; other historical rows remain sealed locally',
+        'original_text_char_count': len(text), 'offset_unit': 'zero-based Python Unicode code points; end exclusive',
+        'excerpts': [{'start_char': begin, 'end_char': end, 'content': text[begin:end],
+            'sha256': hashlib.sha256(text[begin:end].encode()).hexdigest()} for begin, end in merged]}
+
+
+def _evidence_bundle(store, refs, fundamental_id):
+    artifacts = []
+    fundamental = (store.get('fundamental_evidence', fundamental_id) or {}).get('data', {})
+    for ref in refs:
+        for kind in ('external_evidence', 'fundamental_evidence', 'research_level', 'research_evidence'):
+            record = store.get(kind, ref)
+            if record is None:
+                continue
+            item = {'id': ref, 'kind': kind, 'record_hash': stable_id(record)}
+            if kind == 'external_evidence':
+                text = record.get('content')
+                if (not isinstance(text, str) or hashlib.sha256(text.encode()).hexdigest() != record.get('sha256')):
+                    raise ValueError('Primary evidence text SHA-256 mismatch')
+                item.update({key: record.get(key) for key in ('sha256', 'source_url', 'as_of', 'published_at')})
+                item.update(_primary_text_transport(text, _source_claims(fundamental, ref)))
+            elif kind == 'fundamental_evidence':
+                item.update(payload_path='/fundamentals', original_data_hash=stable_id(record['data']),
+                    note='Native reports/normalizations appear once at this payload path; retain original JSON pointers.')
+            elif kind == 'research_evidence':
+                item.update(payload_path='/source', analysis_sha256=record.get('analysis_sha256'),
+                    manifest_sha256=record.get('manifest_sha256'))
+            else:
+                item['payload_path'] = '/levels'
+            artifacts.append(item)
+            break
+    bundle = {'contract': 'research-evidence-v4', 'fundamental_evidence_id': fundamental_id,
+        'evidence_ids': list(refs), 'artifacts': artifacts,
+        'missing_evidence_refs': sorted(set(refs) - {item['id'] for item in artifacts})}
+    bundle['hash'] = stable_id(bundle)
+    return bundle
+
+
+def _typed_research_gaps(issues, review, refs):
+    raw = review.get('issues') if isinstance(review.get('issues'), list) else []
+    structured = {json.dumps(item, sort_keys=True, ensure_ascii=False, separators=(',', ':')): item
+                  for item in raw if isinstance(item, dict)}
+    gaps = []
+    for text in issues:
+        original = next((value for key, value in structured.items() if key in text), {})
+        lower = text.lower()
+        category = next((code for terms, code in [
+            (('eps', 'unit'), 'EPS_UNIT_UNVERIFIED'),
+            (('verification.adr',), 'ADR_IDENTITY_UNVERIFIED'),
+            (('verification.unit',), 'INSTRUMENT_UNIT_UNVERIFIED'),
+            (('financial report',), 'FINANCIAL_FACTS_MISSING'),
+            (('source level',), 'CHART_ENTRY_EVIDENCE_UNVERIFIED'),
+            (('scenario', 'arithmetic'), 'VALUATION_ARITHMETIC_INVALID'),
+            (('independent review not accepted',), 'INDEPENDENT_REVIEW_NOT_ACCEPTED'),
+        ] if all(term in lower for term in terms)), None)
+        code = original.get('code') or category or ('PLAN_VALIDATION_' + stable_id(text)[:12])
+        gaps.append({'code': code, 'scope': original.get('scope', 'research_plan'), 'blocking': True,
+            'detail': text, 'required_evidence': original.get('required_evidence', []),
+            'evidence_refs': original.get('evidence_refs') or list(refs)})
+    return gaps
+
+
+def _date(value):
+    return datetime.fromisoformat(str(value).replace('Z', '+00:00')).date()
+
+
+def _declared_effective_day(action):
+    english = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s*\d{4}'
+    match = re.search(r'(?:split-adjusted basis on|(?:becomes )?effective(?: date)?(?: is|:| on)?)\s*('
+        + english + r'|\d{4}-\d{2}-\d{2})', str(action.get('source_excerpt', '')), re.I)
+    if not match:
+        return None
+    raw = re.sub(r'\s+', ' ', match.group(1))
+    for fmt in ('%Y-%m-%d', '%B %d, %Y', '%b %d, %Y'):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
+    etf = fundamentals.get('etf_valuation') or {}
+    gaps = []
+    def gap(code, detail):
+        gaps.append({'code': code, 'scope': 'etf_valuation', 'blocking': True, 'detail': detail,
+            'required_evidence': ['issuer NAV, portfolio PE, holdings, fees and corporate-action basis'], 'evidence_refs': []})
+    if etf.get('issuer_verified') is not True:
+        gap('ETF_ISSUER_EVIDENCE_UNVERIFIED', 'Issuer evidence package has not been verified')
+    for name in ('nav', 'pe', 'holdings'):
+        item = etf.get(name) or {}
+        if not item.get('evidence_refs') or not set(item['evidence_refs']).issubset(known_refs):
+            gap('ETF_' + name.upper() + '_SOURCE_MISSING', name + ' lacks persisted primary evidence references')
+        elif store is not None:
+            from urllib.parse import urlparse
+            for ref in item['evidence_refs']:
+                original = store.get('external_evidence', ref) or {}
+                host = urlparse(original.get('source_url', '')).hostname or ''
+                if (not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com'))
+                        or not isinstance(original.get('content'), str)
+                        or hashlib.sha256(original['content'].encode()).hexdigest() != original.get('sha256')):
+                    gap('ETF_' + name.upper() + '_ISSUER_SOURCE_UNVERIFIED', name + ' raw issuer evidence cannot be validated')
+        try:
+            age = (parse_time(moment).date() - _date(item.get('as_of'))).days
+            if not 0 <= age <= 7:
+                raise ValueError()
+        except (ValueError, TypeError):
+            gap('ETF_' + name.upper() + '_DATE_INVALID', name + ' must have an explicit current issuer date within seven days')
+    nav, pe, holdings = etf.get('nav') or {}, etf.get('pe') or {}, etf.get('holdings') or {}
+    try:
+        if decimal_value(nav.get('value')) <= 0 or decimal_value(pe.get('value')) <= 0:
+            raise ValueError()
+    except ValueError:
+        gap('ETF_BASELINE_VALUE_MISSING', 'Positive issuer NAV and comparable portfolio PE are required')
+    if nav.get('currency') != 'USD' or nav.get('price_unit') != 'per_share':
+        gap('ETF_NAV_UNIT_UNRESOLVED', 'NAV must explicitly be USD per ETF share')
+    if nav.get('as_of') != pe.get('as_of') or nav.get('as_of') != holdings.get('as_of'):
+        gap('ETF_BASELINE_DATES_UNALIGNED', 'Use same-date issuer NAV, portfolio PE and holdings; do not silently shift dates')
+    if not holdings.get('rows') or holdings.get('coverage') is None or holdings.get('concentration') is None:
+        gap('ETF_HOLDINGS_COVERAGE_MISSING', 'Holdings, coverage and concentration must be visible')
+    fee = etf.get('expense_ratio') or etf.get('fee') or etf.get('fees') or {}
+    try:
+        if (not isinstance(fee, dict) or decimal_value(fee.get('value')) < 0
+                or fee.get('unit') not in {'percent_per_year', 'fraction_per_year'}
+                or not fee.get('evidence_refs') or not set(fee['evidence_refs']).issubset(known_refs)):
+            raise ValueError()
+        if store is not None:
+            for ref in fee['evidence_refs']:
+                original = store.get('external_evidence', ref) or {}
+                from urllib.parse import urlparse
+                host = urlparse(original.get('source_url', '')).hostname or ''
+                if (not isinstance(original.get('content'), str)
+                        or hashlib.sha256(original['content'].encode()).hexdigest() != original.get('sha256')
+                        or not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com'))):
+                    raise ValueError()
+    except (ValueError, TypeError):
+        gap('ETF_FEES_UNRESOLVED', 'Issuer expense ratio and fee treatment are required')
+    for action in etf.get('corporate_actions') or []:
+        if action.get('type') != 'split':
+            continue
+        try:
+            declared = _declared_effective_day(action)
+            if declared != _date(action.get('effective_at') or action.get('effective_date')):
+                raise ValueError()
+            if store is not None:
+                from .market import _primary_verified
+                if not _primary_verified(store, action):
+                    raise ValueError()
+        except (ValueError, TypeError):
+            gap('ETF_CORPORATE_ACTION_DATE_UNVERIFIED', 'Declared split effective date must match its persisted issuer text')
+    return gaps
+
+
+def _validate_etf_target(target, plan, fundamentals, known):
+    assumptions = target.get('assumptions') or {}
+    etf = fundamentals.get('etf_valuation') or {}
+    nav, pe = etf.get('nav') or {}, etf.get('pe') or {}
+    if (decimal_value(assumptions.get('nav_per_share')) != decimal_value(nav.get('value'))
+            or decimal_value(assumptions.get('current_pe')) != decimal_value(pe.get('value'))):
+        raise ValueError('ETF scenario baseline differs from verified issuer NAV/PE')
+    years = decimal_value(assumptions.get('years'))
+    if abs(years - decimal_value(target.get('horizon_months')) / 12) > Decimal('0.000001'):
+        raise ValueError('ETF years must equal horizon_months / 12')
+    growth, exit_pe = decimal_value(assumptions.get('annual_earnings_growth')), decimal_value(assumptions.get('exit_pe'))
+    if years <= 0 or growth <= -1 or exit_pe <= 0:
+        raise ValueError('ETF scenario growth and exit PE must have valid domains')
+    try:
+        with localcontext() as context:
+            context.prec = 40
+            price = decimal_value(nav['value']) * (Decimal(1) + growth) ** years * exit_pe / decimal_value(pe['value'])
+            if abs(price - decimal_value(target.get('price'))) > Decimal('0.01'):
+                raise ValueError('ETF NAV scenario arithmetic mismatch exceeds 0.01 USD')
+    except InvalidOperation:
+        raise ValueError('ETF NAV scenario arithmetic invalid') from None
+    if (assumptions.get('currency') != 'USD' or assumptions.get('price_unit') != 'per_share'
+            or plan.get('price_unit') != 'per_share'):
+        raise ValueError('ETF NAV scenario unit/currency mismatch')
+    if not assumptions.get('fees_treatment') or not assumptions.get('rationale'):
+        raise ValueError('ETF fees and holdings/industry scenario rationale required')
+    for refs in (target.get('evidence_refs'), assumptions.get('evidence_refs')):
+        if not refs or not set(refs).issubset(known):
+            raise ValueError('Unknown ETF scenario evidence references')
+
+
+def _price_basis_deadline(fundamentals, moment, refs, store=None):
+    from zoneinfo import ZoneInfo
+    etf = fundamentals.get('etf_valuation') or {}
+    try:
+        nav_day = _date((etf.get('nav') or {}).get('as_of')) if etf.get('nav') else parse_time(moment).date()
+    except (ValueError, TypeError):
+        return None  # Invalid issuer dates are recorded by the typed ETF input gate.
+    deadlines = []
+    for action in etf.get('corporate_actions') or []:
+        evidence = action.get('evidence_refs') or []
+        if not evidence or not set(evidence).issubset(refs):
+            continue
+        if store is not None:
+            from .market import _primary_verified
+            if not _primary_verified(store, action):
+                continue
+        effective = action.get('effective_at') or action.get('effective_date')
+        try:
+            day = _date(effective)
+        except (ValueError, TypeError):
+            continue
+        if _declared_effective_day(action) != day:
+            continue
+        if day > nav_day:
+            deadlines.append(datetime(day.year, day.month, day.day, tzinfo=ZoneInfo('America/New_York')).astimezone(timezone.utc))
+    return min(deadlines).isoformat() if deadlines else None
+
+
+def _research_fundamental(store, symbol, raw):
+    fundamental = dict(raw or {}, symbol=symbol)
+    supplement = _current_supplement(store, symbol)
+    if supplement:
+        fundamental['research_supplement'] = {'id': supplement['id'], 'data': supplement['data'],
+            'evidence_refs': supplement['evidence_refs']}
+    fundamental = normalize_fundamentals(fundamental, store=store)
+    fundamental['instrument_contract'] = instrument_contract(fundamental, store=store)
+    identity = store.get('instrument_identity', symbol)
+    if identity:
+        fundamental.update(reviewed_identity=identity,
+            adr_conversion_verified=bool(identity['metadata'].get('is_adr') and identity['metadata'].get('ordinary_shares_per_adr')))
+        fundamental['instrument_contract'] = dict(fundamental['instrument_contract'],
+            quote_currency=identity['metadata'].get('currency'), quote_price_unit=identity['metadata'].get('price_unit'),
+            adr_direction={'ordinary_shares_per_adr': identity['metadata'].get('ordinary_shares_per_adr'),
+                'meaning': 'one ADR represents this many ordinary shares'},
+            reviewed_identity_evidence_refs=identity.get('evidence_refs', []))
+    return fundamental, identity
+
+
 def _logical_fundamentals(fundamental):
     # A derived contract projection is not a new financial fact and must never
     # bypass an unresolved paid-call scope from the pre-contract payload.
     if isinstance(fundamental, dict):
         fundamental = {key: value for key, value in fundamental.items()
-            if key not in {'instrument_contract', 'consensus_response_received', 'consensus_live_verified'}}
-        if isinstance(fundamental.get('consensus_normalized'), dict):
-            fundamental['consensus_normalized'] = {key: value for key, value in fundamental['consensus_normalized'].items()
-                if key != 'coverage'}
+            if key not in {'instrument_contract', 'consensus_response_received', 'consensus_live_verified',
+                           'normalized_financials', 'consensus_normalized', 'reference_quote', 'market_quote',
+                           'financial_report_request', 'primary_collection'}}
     return _stable_fundamentals(fundamental)
+
+
+def _legacy_logical_fundamentals(value):
+    """Reconstruct the previous scope from archived inputs, never delete fences."""
+    def old_stable(item):
+        if isinstance(item, dict):
+            return {key: old_stable(part) for key, part in item.items()
+                if key != 'fetched_at' and not (key == 'as_of' and 'financial_report' in item)}
+        if isinstance(item, list):
+            return [old_stable(part) for part in item]
+        return item
+    if isinstance(value, dict):
+        value = {key: part for key, part in value.items()
+            if key not in {'instrument_contract', 'consensus_response_received', 'consensus_live_verified'}}
+        if isinstance(value.get('consensus_normalized'), dict):
+            value['consensus_normalized'] = {key: part for key, part in value['consensus_normalized'].items() if key != 'coverage'}
+    return old_stable(value)
 
 
 def _horizon_end(moment, months):
@@ -640,27 +1048,14 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         published_at = _published_at(snapshot['metadata'])
         if previous and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
             continue
-        fundamental = dict((fundamentals or {}).get(symbol) or {})
-        # The derived contract annotates the native report; it never replaces it.
-        fundamental.setdefault('instrument_contract', instrument_contract(dict(fundamental, symbol=symbol)))
-        identity = store.get('instrument_identity', symbol)
-        if identity:
-            fundamental = dict(fundamental, reviewed_identity=identity,
-                adr_conversion_verified=bool(identity['metadata'].get('is_adr')
-                    and identity['metadata'].get('ordinary_shares_per_adr')))
-            fundamental['instrument_contract'] = dict(fundamental['instrument_contract'],
-                quote_currency=identity['metadata'].get('currency'),
-                quote_price_unit=identity['metadata'].get('price_unit'),
-                adr_direction={'ordinary_shares_per_adr': identity['metadata'].get('ordinary_shares_per_adr'),
-                    'meaning': 'one ADR represents this many ordinary shares'},
-                reviewed_identity_evidence_refs=identity.get('evidence_refs', []))
+        fundamental, identity = _research_fundamental(store, symbol, (fundamentals or {}).get(symbol))
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
         # Workflow discovery changes with the watch list; paid plans depend only
         # on their own immutable source, relevant facts, model and explicit event.
-        event_context = None if not context else {
+        event_context = None if not context or not context.get('event_id') else {
             'event_id': context.get('event_id'),
             'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
-        operation_key = stable_id('plan-operation-v3-evidence-contract', snapshot['id'], symbol, fid,
+        operation_key = stable_id('plan-operation-v4-evidence-repair', snapshot['id'], symbol, fid,
                                   _model_cache_identity(model), event_context)
         committed = store.get('plan_operation', operation_key)
         if committed:
@@ -680,32 +1075,76 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         evidence_ids = [snapshot['id'], fid] + [l['id'] for l in levels if l.get('symbol') == symbol and l.get('verified')]
         if identity:
             evidence_ids.extend(ref for ref in identity.get('evidence_refs', []) if store.get('external_evidence', ref))
+        evidence_ids.extend(ref for ref in _nested_refs(fundamental) if store.get('external_evidence', ref))
+        evidence_ids.extend(item['id'] for item in fundamental.get('primary_evidence', [])
+            if isinstance(item, dict) and store.get('external_evidence', item.get('id', '')))
         evidence_ids = list(dict.fromkeys(evidence_ids))
+        bundle = _evidence_bundle(store, evidence_ids, fid)
         symbol_levels = [l for l in levels if l.get('symbol') == symbol and l.get('verified') is True]
-        original_frames = _plan_frames(snapshot, symbol_levels)
+        chart_limit_note = None
+        try:
+            original_frames = _plan_frames(snapshot, symbol_levels)
+        except ValueError as error:
+            if 'more than eight' not in str(error):
+                raise
+            chart_limit_note = 'All original chart frames remain archived; this independent valuation does not use the chart price levels. Explicit batch review is required before using them.'
+            original_frames, symbol_levels = [], []
         next_review = (parse_time(plan_moment) + timedelta(days=90)).isoformat()
+        basis_deadline = _price_basis_deadline(fundamental, plan_moment, set(evidence_ids), store)
+        if basis_deadline and parse_time(basis_deadline) < parse_time(next_review):
+            next_review = basis_deadline
         policy = {'amount_usd': '1000', 'amount_basis': 'user-authorized default per buy; no cumulative cap',
             'cash_verified': False, 'next_review_at': next_review, 'thesis_valid_from': plan_moment,
             'horizon_until_by_months': {str(months): _horizon_end(plan_moment, months) for months in range(12, 37)},
             'instrument_contract': fundamental['instrument_contract']}
+        if chart_limit_note:
+            policy['unused_chart_context'] = chart_limit_note
         if identity:
             policy['reviewed_identity'] = identity
             policy['adr_direction'] = 'one ADR represents ordinary_shares_per_adr ordinary shares; never invert this binding'
         current_basis = {}
+        execution_accounts = {}
         from .decisions import take_profit_position_basis
         from .ledger import portfolio
+        from .reporting import with_reported_holdings
         for account in ('real', 'paper'):
-            basis = take_profit_position_basis(store, portfolio(store, account, now=plan_moment), symbol, now=plan_moment)
+            account_state = with_reported_holdings(store, portfolio(store, account, now=plan_moment))
+            execution_accounts[account] = {key: account_state.get(key) for key in
+                ('account', 'currency', 'cash', 'cash_complete', 'cash_source', 'cash_status',
+                 'holdings_complete', 'cost_complete', 'fees_complete', 'total_equity', 'total_equity_source',
+                 'reported_holdings', 'broker_reported_cash', 'broker_reported_net_liquidation',
+                 'broker_snapshot_as_of', 'broker_snapshot_recorded_at', 'broker_reconciled')}
+            basis = take_profit_position_basis(store, account_state, symbol, now=plan_moment)
             if basis:
                 current_basis[account] = basis
+        policy.update(cash_verified=execution_accounts['real'].get('cash_complete') is True,
+            execution_accounts=execution_accounts, research_does_not_require_execution_cash=True,
+            empty_position_basis_means_initial_plan=True, price_basis_valid_until=basis_deadline)
+        repair_feedback = None
+        if previous and previous.get('status') == 'needs_review' and not context:
+            repair_feedback = {'prior_revision': previous['revision'], 'untrusted_prior_review': previous.get('review_issues', []),
+                'typed_gaps': previous.get('research_gaps', []), 'instruction': 'Opinions only; independently verify against current original evidence.'}
+        stored_context = store.get('plan_context', operation_key)
+        if stored_context:
+            policy, current_basis, repair_feedback = stored_context['policy'], stored_context['current_position_basis'], stored_context['repair_feedback']
+        else:
+            store.put('plan_context', operation_key, {'policy': policy, 'current_position_basis': current_basis,
+                'repair_feedback': repair_feedback}, immutable=True)
+        if repair_feedback:
+            store.put('research_repair', operation_key, {'source_id': snapshot['id'], 'symbol': symbol,
+                'evidence_bundle_hash': bundle['hash'], 'prior_revision': repair_feedback['prior_revision'],
+                'status': 'one_attempt_per_verified_evidence_package'}, immutable=True)
         payload = {'instruction': COMPILE, 'symbol': symbol, 'levels': symbol_levels, 'source': snapshot,
             'fundamentals': fundamental, 'evidence_ids': evidence_ids, 'as_of': plan_moment,
-            'review_context': context, 'policy': policy, 'current_position_basis': current_basis}
+            'review_context': context, 'policy': policy, 'current_position_basis': current_basis,
+            'evidence_bundle': bundle, 'repair_feedback': repair_feedback}
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
-        if is_etf:
+        etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
+        if etf_gaps:
             proposed = json.loads(json.dumps(COMPILE_TEMPLATE))['plan']
             proposed.update(currency=fundamental['instrument_contract'].get('quote_currency'),
-                price_unit='per_share', is_adr=False, evidence_refs=[snapshot['id'], fid], targets=[], take_profit=[])
+                price_unit=fundamental['instrument_contract'].get('quote_price_unit'),
+                is_adr=False, evidence_refs=[snapshot['id'], fid], targets=[], take_profit=[])
         else:
             proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
         plan = dict(proposed)
@@ -720,6 +1159,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'analysis_as_of': plan_moment, 'economic_input_hash': stable_id(payload)}, immutable=True)
         plan.update(symbol=symbol, id=plan_id,
             revision=revision, created_at=plan_moment, status='needs_review', source_published_at=published_at)
+        plan['research_snapshot_id'], plan['fundamental_evidence_id'] = snapshot['id'], fid
+        if basis_deadline:
+            plan['price_basis_valid_until'] = basis_deadline
         plan['next_review_at'] = next_review
         plan['thesis_valid_from'] = plan_moment
         plan['horizon_until'] = _horizon_end(plan_moment, plan.get('horizon_months'))
@@ -734,20 +1176,26 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         review_payload = {'instruction': REVIEW, 'plan': plan,
             'source': snapshot, 'levels': symbol_levels, 'fundamentals': fundamental,
             'policy': policy, 'current_position_basis': current_basis,
+            'evidence_ids': evidence_ids, 'evidence_bundle': bundle, 'repair_feedback': repair_feedback,
             'review_event_id': (context or {}).get('event_id')}
-        if is_etf:
-            gap = {'code': 'ETF_VALUATION_EVIDENCE_UNAVAILABLE',
-                'detail': fundamental['instrument_contract']['valuation_gap'],
-                'required': ['NAV', 'holdings', 'constituent/index earnings methodology'], 'evidence_refs': [fid]}
-            plan['research_gaps'] = [gap]
-            review = {'accepted': False, 'checks': {}, 'issues': [gap['code']]}
+        if etf_gaps:
+            review = {'accepted': False, 'checks': {}, 'issues': etf_gaps}
         else:
             review = _run(model, 'review_plan', review_payload, frames=original_frames, now=plan_moment, store=store)
         issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
-        if not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
+        if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
             issues.append('No individually verified source levels')
         plan['status'] = 'active' if not issues else 'needs_review'
         plan['review_issues'] = issues
+        plan['research_gaps'] = _typed_research_gaps(issues, review, evidence_ids)
+        plan['research_assessment'] = {'status': 'approved' if not issues else 'needs_evidence',
+            'evidence_bundle_hash': bundle['hash'], 'evidence_generation': fid,
+            'repair_status': 'awaiting_new_evidence' if issues else 'reviewed_new_evidence' if repair_feedback else 'initial_review'}
+        plan['execution_requirements'] = ['Fresh official execution quote', 'Reconciled account cash/holdings/fees',
+            'Confirmed current holding basis when selling; separate from research approval']
+        gap_key = stable_id('research-gap-assessment', plan['id'], revision, bundle['hash'])
+        store.put('research_gap', gap_key, {'plan_id': plan['id'], 'revision': revision,
+            'evidence_generation': fid, 'gaps': plan['research_gaps'], 'assessment': plan['research_assessment']}, immutable=True)
         if issues:
             plan.pop('thesis_valid_from', None)
             plan.pop('horizon_until', None)
@@ -766,7 +1214,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
 def _stable_fundamentals(value):
     if isinstance(value, dict):
         return {key: _stable_fundamentals(item) for key, item in value.items()
-                if key != 'fetched_at' and not (key == 'as_of' and 'financial_report' in value)}
+                if key not in {'fetched_at', 'observed_at', 'collected_at', 'reference_quote', 'market_quote',
+                               'primary_refresh_after', 'financial_report_request', 'primary_collection'}
+                and not (key == 'as_of' and 'financial_report' in value)}
     if isinstance(value, list):
         return [_stable_fundamentals(item) for item in value]
     return value
@@ -808,8 +1258,9 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                     'evidence_id': snapshot['id']})
                 continue
             identities = {key: value['id'] for key, value in store.items('instrument_identity')}
-            workflow_id = stable_id(snapshot['id'], 'workflow-v4-evidence-contract', sorted(symbols or []),
-                _stable_fundamentals(fundamentals or {}), identities, _model_cache_identity(model))
+            supplements = {key: value['id'] for key, value in store.items('research_supplement_current')}
+            workflow_id = stable_id(snapshot['id'], 'workflow-v5-evidence-repair', sorted(symbols or []),
+                _stable_fundamentals(fundamentals or {}), identities, supplements, _model_cache_identity(model))
             completed = store.get('research_workflow', workflow_id)
             if model is None or completed:
                 if completed:
@@ -884,6 +1335,29 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
         attempt = {'timestamp': moment, 'fundamentals': data, 'evidence': evidence}
         store.put('review_attempt', key, attempt, immutable=True)
     moment, evidence, data = attempt['timestamp'], attempt['evidence'], attempt['fundamentals']
+    # Ingestion has already independently reviewed these exact new facts. A
+    # failed initial plan without any holding is awaiting NEW evidence, not a
+    # reason to buy another event-review/compile pair for the same package.
+    financial_event = (isinstance(evidence, dict)
+        and ('financial_report' in evidence or 'fundamentals' in evidence))
+    if plan.get('status') == 'needs_review' and financial_event:
+        from .ledger import portfolio
+        from .reporting import reported_holdings
+        held = any(item.get('symbol') == plan['symbol'] for item in reported_holdings(store, now=moment))
+        for account in ('real', 'paper'):
+            state = portfolio(store, account, now=moment)
+            positions = (state.get('positions') or []) + (state.get('reported_holdings') or [])
+            held = held or any(item.get('symbol') == plan['symbol'] for item in positions)
+        current, _ = _research_fundamental(store, plan['symbol'], data.get(plan['symbol']))
+        same_facts = stable_id('fundamentals', _stable_fundamentals(current)) == plan.get('fundamental_evidence_id')
+        binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
+        if not held and same_facts and binding.get('plan_hash') == plan_fingerprint(plan):
+            record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
+                'review': {'accepted': False, 'issues': plan.get('review_issues', [])},
+                'revised_plan': None, 'status': 'needs_review', 'deduplicated': True,
+                'reason': 'ALREADY_INDEPENDENTLY_REVIEWED_SAME_EVIDENCE'}
+            store.put('plan_review', key, record, immutable=True)
+            return record
     raw = {'event_id': event_id, 'symbol': plan['symbol'], 'timestamp': moment, 'raw_evidence': evidence}
     raw_id = stable_id('review-event-evidence', raw)
     store.put('review_event_evidence', raw_id, dict(raw, id=raw_id), immutable=True)
