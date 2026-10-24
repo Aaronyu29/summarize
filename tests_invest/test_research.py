@@ -767,15 +767,18 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(self.store.get('model_receipt', original[0]), original[1])
         self.assertEqual(sorted(c['timestamp'] for _, c in self.store.items('model_call')), [NOW, clock[0]])
 
-    def test_review_known_invalid_has_no_automatic_format_regeneration(self):
-        calls = []
-        def transport(body):
-            calls.append(body)
-            return {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"bad":['}}]}
-        model, payload, frames = self.regeneration_fixture(transport)
-        with self.assertRaises(ModelOutputInvalid):
-            _run(model, 'review_plan', payload, frames=frames, now=NOW, store=self.store)
-        self.assertEqual(len(calls), 1)
+    def test_review_known_invalid_has_one_bounded_regeneration_event_review_has_none(self):
+        for purpose, expected in [('review_plan', 2), ('event_review', 1)]:
+            with self.subTest(purpose=purpose):
+                calls = []
+                def transport(body):
+                    calls.append(body)
+                    return {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"bad":['}}]}
+                model, payload, frames = self.regeneration_fixture(transport)
+                for _ in range(2):
+                    with self.assertRaises(ModelOutputInvalid):
+                        _run(model, purpose, payload, frames=frames, now=NOW, store=self.store)
+                self.assertEqual(len(calls), expected)
 
     def test_compile_length_receipt_never_uses_malformed_stop_regeneration(self):
         calls = []

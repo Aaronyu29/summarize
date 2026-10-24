@@ -3,12 +3,30 @@ import hashlib
 import unittest
 
 from rhino_invest.primary_evidence import (enrich_primary_fundamentals, TSM_PAGE,
-    GOOGLE_PDF, SOXX_PAGE, SOXX_HOLDINGS, _fetch, _evidence, EvidenceError)
+    GOOGLE_PDF, SOXX_PAGE, SOXX_HOLDINGS, SOXX_SPLIT_PDF, _fetch, _evidence, EvidenceError)
 from rhino_invest.store import Store
 
 
 NOW = '2026-10-24T01:00:00Z'
 DOWNLOAD = 'https://www.blackrock.com/varnish-api/blk-one01-product-data/product-data/api/v1/get-fund-document?component=fundDownload&portfolioId=239705'
+SPLIT_SUPPLEMENT = '''iShares Trust
+Supplement dated October 23, 2026
+for the iShares Semiconductor ETF (SOXX)
+As previously announced, the Board approved a three-for-one forward stock split.
+The record date for the split will be November 3, 2026, the distribution date will be
+November 4, 2026, and the forward split will be recognized at the commencement of trading on The
+Nasdaq Stock Market LLC on November 5, 2026 (the ex-dividend date).
+PLEASE RETAIN THIS SUPPLEMENT
+iShares Trust
+Supplement dated August 21, 2026
+for the iShares Semiconductor ETF (SOXX)
+Fund Name Ticker Forward Split Ratio
+iShares Semiconductor ETF SOXX 3:1
+The record date for the forward stock split will be November 3, 2026, and the stock split will be
+effectuated after the close of trading on November 4, 2026. Shares of the Fund will begin trading on a
+split-adjusted basis on November 5, 2026.
+PLEASE RETAIN THIS SUPPLEMENT
+'''
 
 
 def pdf(text):
@@ -135,6 +153,7 @@ USD,USD CASH,Cash,0.00
 <ss:Row><ss:Cell><ss:Data>Oct 20, 2026</ss:Data></ss:Cell><ss:Cell><ss:Data>500.282491</ss:Data></ss:Cell></ss:Row>
 </ss:Table></ss:Worksheet></ss:Workbook>'''
     return {SOXX_PAGE: Response(page, kind='text/html'), SOXX_HOLDINGS: Response(holdings, kind='text/csv'),
+            SOXX_SPLIT_PDF: Response(pdf(SPLIT_SUPPLEMENT), kind='application/pdf'),
             DOWNLOAD: Response(xml, kind='application/vnd.ms-excel')}
 
 
@@ -219,7 +238,7 @@ class PrimaryEvidenceTests(unittest.TestCase):
         self.assertEqual(etf['holdings']['rows'][0]['weight'], '0.60')
         self.assertEqual(etf['corporate_actions'][0]['status'], 'announced_not_effective')
         self.assertEqual(etf['corporate_actions'][0]['effective_at'], '2026-11-05')
-        self.assertIsNone(etf['corporate_actions'][0]['new_shares_per_old'])
+        self.assertEqual(etf['corporate_actions'][0]['new_shares_per_old'], '3')
         self.assertFalse(etf['corporate_actions'][0]['automatic_price_adjustment'])
         self.assertFalse(data['primary_financials']['instrument']['stock_eps_valuation_applicable'])
         self.assertEqual(data['primary_refresh_after'], '2026-10-25T01:00:00+00:00')
@@ -302,9 +321,9 @@ class PrimaryEvidenceTests(unittest.TestCase):
 
     def test_unknown_symbol_does_not_fetch_or_rewrite_native_values(self):
         original = {'financial_report': {'EPS': None}}
-        data, transport = self.enrich('CRCL', {}, fundamentals=original)
+        data, transport = self.enrich('ZZZZ', {}, fundamentals=original)
         self.assertEqual(transport.calls, [])
-        self.assertEqual(data, dict(original, symbol='CRCL'))
+        self.assertEqual(data, dict(original, symbol='ZZZZ'))
 
 
 if __name__ == '__main__':

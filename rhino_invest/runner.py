@@ -7,7 +7,7 @@ import threading
 from .common import utc_now, parse_time, stable_id, decimal_value
 from .ledger import portfolio
 from .market import MarketData, quote_gate
-from .research import ingest_archives, review_plan, _logical_fundamentals
+from .research import ingest_archives, ingest_holdings, review_plan, _logical_fundamentals
 from .model import ModelGateway
 from .decisions import evaluate, _has_provenance, valid_thesis_events
 from .paper import paper_account, simulate
@@ -292,7 +292,8 @@ class Runner:
         period = cal["completed_session"] if cal else parse_time(now).date().isoformat()
         for symbol in symbols:
             cached = self.store.get("fundamental_cache", symbol)
-            enrichment_revision = "issuer-evidence-v1" if self.primary_enricher and self.execute else None
+            enrichment_revision = (("issuer-evidence-v2" if symbol in {"CRCL", "SOXX"} else "issuer-evidence-v1")
+                if self.primary_enricher and self.execute else None)
             refresh_due = False
             if cached and (cached.get("data") or {}).get("primary_refresh_after"):
                 try:
@@ -335,6 +336,9 @@ class Runner:
                         "evidence": data})
             except Exception as exc:
                 self._error(result, "fundamentals:" + symbol, exc)
+        result['holding_research'] = ingest_holdings(self.store,
+            model=self.model if self.execute and not self._background_mode else None,
+            fundamentals=fundamentals, now=now, seed_only=self._background_mode)
         if self.config.archive_database:
             try:
                 result["ingestion"] = ingest_archives(self.store, self.config.archive_database,
@@ -550,7 +554,15 @@ class Runner:
             for plan in plans:
                 cursor = self.store.get("evaluation_cursor", plan["id"]) or {}
                 recommendation = self.store.get("recommendation", cursor.get("recommendation_id", ""))
-                self._export(result, "投资计划", plan_row(plan, recommendation))
+                fields = plan_row(plan, recommendation)
+                if plan.get('research_origin') == 'holding_fundamentals' and plan.get('research_preflight'):
+                    fields['理由'] = '；'.join(item['detail'] for item in plan['research_preflight'][:3])
+                    pending = self.store.get('holding_research_state', plan['symbol']) or {}
+                    wait = {'ModelBudgetExceeded': '研究审核额度暂不足，等待额度恢复',
+                        'UnknownModelOutcome': '上次模型审核结果尚未核实，暂停重复请求'}.get(pending.get('error'))
+                    if wait:
+                        fields['理由'] = wait + '；' + fields['理由']
+                self._export(result, "投资计划", fields)
             for key, report in self.store.items("report"):
                 self._export(result, "复盘报告", report_row(report))
         report_items = self.store.items("report")
@@ -638,6 +650,17 @@ class Runner:
                                  "deferred_unresolved_risk_count": 0},
                    "reviewed_count": 0}
         try:
+            if not self._stop.is_set():
+                holdings = ingest_holdings(self.store, model=model, fundamentals=fundamentals, now=self.clock())
+                summary['holding_research'] = {'symbols': holdings['symbols'], 'plan_count': len(holdings['plans']),
+                    'needs_evidence_count': sum(plan.get('status') != 'active' for plan in holdings['plans']),
+                    'deferred_unresolved_risk_count': len(holdings.get('deferred_unresolved_risk', []))}
+                if holdings.get('deferred_unresolved_risk'):
+                    summary['deferred'].append({'stage': 'holding_verified_thesis_risk',
+                        'reason': 'UNRESOLVED_VERIFIED_THESIS_RISK'})
+                for error in holdings['errors']:
+                    item = {'stage': 'holding_research', 'error': _safe_error(error.get('error'))}
+                    summary['deferred' if item['error'] == 'ModelBudgetExceeded' else 'errors'].append(item)
             if self.config.archive_database and not self._stop.is_set():
                 ingestion = ingest_archives(self.store, self.config.archive_database, model=model,
                     symbols=symbols or None, fundamentals=fundamentals, now=self.clock(), research_since=self.config.research_since)
@@ -687,7 +710,9 @@ class Runner:
                 if not research.get("errors"):
                     issues.add(("research", _safe_error(research.get("error"))))
             unresolved_risk = bool((research.get("ingestion") or {}).get("deferred_unresolved_risk_count") or
-                                   result.get("ingestion", {}).get("deferred_unresolved_risk"))
+                                   (research.get("holding_research") or {}).get("deferred_unresolved_risk_count") or
+                                   result.get("ingestion", {}).get("deferred_unresolved_risk") or
+                                   result.get("holding_research", {}).get("deferred_unresolved_risk"))
             deferred = research_state == "deferred" or unresolved_risk or any(code == "ModelBudgetExceeded" for _, code in issues)
             failures = sorted((stage, code) for stage, code in issues if code != "ModelBudgetExceeded")
             state = "blocked" if failures else "deferred" if deferred else "healthy"

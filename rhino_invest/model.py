@@ -38,6 +38,18 @@ valuation scenarios. A creator entry/position is never the user's holding or a l
 target. Do not invent consensus, ADR conversions, forecasts, source checks or risk limits.
 Every numeric inference needs source references and explicit assumptions. Report gaps.'''
 
+REVIEW_JSON_RECOVERY = '''
+REVIEW_JSON_RECOVERY_ATTEMPT=1
+A completed review response had invalid JSON syntax. Independently review the SAME
+original plan and original evidence again from scratch. Do not reconstruct or rely
+on the previous response, change the plan, invent financial facts, or presume approval.
+Return ONLY one compact valid JSON object, without markdown or optional long prose:
+{"accepted":false,"issues":[],"checks":{"provenance":false,"currency":false,
+"unit":false,"adr":false}}. Replace those values with your independent conclusions;
+issues must be concise strings. If current_position_basis was supplied, also return
+position_basis_accepted as a boolean after reviewing that exact structure. Preserve
+uncertainty; reject with issues if the original evidence does not justify acceptance.'''
+
 
 class ModelGateway:
     def __init__(self, store, config, transport=None, *, clock=None):
@@ -88,6 +100,9 @@ class ModelGateway:
                 raise ModelOutputInvalid('Completed provider output is unusable; preserve receipt and review generation configuration',
                     call_id=fingerprint, reason='receipt_has_no_validated_output')
             raise UnknownModelOutcome('Unresolved model call: reconcile provider receipt before retry')
+        self._unknown_scope_gate(scope, purpose)
+
+    def _unknown_scope_gate(self, scope, purpose):
         for key, call in self.store.items('model_call'):
             if self.store.get('model_receipt', key) or self.store.get('model_rejection', key):
                 continue
@@ -95,6 +110,44 @@ class ModelGateway:
                 raise UnknownModelOutcome('Unresolved logical model call; changing request/configuration cannot bypass receipt reconciliation')
 
     def run(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None):
+        # Only a completed, syntactically broken review qualifies. A child attempt
+        # calls _run_once directly, so it can never recursively buy another retry.
+        frames = tuple(frames)
+        try:
+            return self._run_once(purpose, payload, frames, now, instruction, call_scope)
+        except ModelOutputInvalid as error:
+            if purpose != 'review_plan':
+                raise
+            parent_id = error.call_id
+            call = self.store.get('model_call', parent_id) if parent_id else None
+            receipt = self.store.get('model_receipt', parent_id) if parent_id else None
+            if not (call and receipt and call.get('purpose') == 'review_plan'
+                    and call.get('call_scope') and not call.get('recovery_parent_id')
+                    and not self.store.get('model_rejection', parent_id)):
+                raise
+            try:
+                choice = receipt['response']['choices'][0]
+                content = choice['message']['content']
+                if choice.get('finish_reason') != 'stop' or not isinstance(content, str):
+                    raise error
+                json.loads(content)
+            except json.JSONDecodeError:
+                pass  # A receipt alone is insufficient: require broken JSON text.
+            except (KeyError, IndexError, TypeError, AttributeError):
+                raise error from None
+            else:
+                raise error  # Valid arrays/scalars and schema defects are not format retries.
+            child_id = stable_id('review-json-recovery-v1', parent_id)
+            recovery = {'id': child_id, 'parent_call_id': parent_id,
+                'parent_receipt_hash': stable_id(receipt), 'call_scope': call['call_scope'],
+                'attempt': 1, 'purpose': purpose, 'reason': 'completed_review_json_syntax_invalid'}
+            self.store.put('model_recovery', child_id, recovery, immutable=True)
+            return self._run_once(purpose, payload, frames, call.get('analysis_as_of') or now,
+                (instruction or '') + REVIEW_JSON_RECOVERY, call_scope,
+                recovery=recovery)
+
+    def _run_once(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None,
+                  *, recovery=None):
         if not self.config.get('enabled'):
             raise ValueError('Production model usage must be explicitly enabled')
         moment = parse_time(self.clock()).isoformat()
@@ -111,6 +164,13 @@ class ModelGateway:
         frame_hashes = [(s, h) for s, h, _ in frame_data]
         scope = stable_id('model-logical-call-v1', call_scope or stable_id(purpose, payload), frame_hashes)
         fingerprint = stable_id('model-v2', self.cache_identity(), SYSTEM, instruction, purpose, payload, frame_hashes)
+        if recovery:
+            # Keep the original logical fence and a configuration-independent
+            # child ID. Changing generation settings cannot create attempt 2.
+            if scope != recovery['call_scope']:
+                raise UnknownModelOutcome('Recovery cannot change the original logical model scope')
+            fingerprint = recovery['id']
+            self._unknown_scope_gate(scope, purpose)
         cached = self.store.get('model_response', fingerprint)
         if cached:
             return cached['output']
@@ -140,6 +200,9 @@ class ModelGateway:
                 'analysis_as_of': analysis_as_of,
                 'call_scope': scope, 'request_controls': generation,
                 'budget_basis': 'estimated_reservation_not_provider_enforced_cap'}
+        if recovery:
+            call.update(recovery_parent_id=recovery['parent_call_id'],
+                        recovery_parent_receipt_hash=recovery['parent_receipt_hash'], recovery_attempt=1)
         with self.store.transaction():
             cached = self.store.get('model_response', fingerprint)
             if cached:
@@ -167,12 +230,15 @@ class ModelGateway:
                     raise UnknownModelOutcome(f'Model HTTP {result.status_code}; receipt reconciliation required')
                 response = result.json()
             # Store provider response before parsing, preserving charged malformed output.
-            self.store.put('model_receipt', fingerprint, {'id': fingerprint, 'timestamp': moment,
+            receipt = {'id': fingerprint, 'timestamp': moment,
                 'received_at': parse_time(self.clock()).isoformat(), 'analysis_as_of': analysis_as_of,
                 'response': response, 'usage': response.get('usage'),
                 'cost_usd': response.get('cost_usd'), 'actual_cost_known': response.get('cost_usd') is not None,
                 'budget_basis': 'estimated_reservation_not_provider_enforced_cap',
-                'reserved_cost_usd': str(ceiling)}, immutable=True)
+                'reserved_cost_usd': str(ceiling)}
+            if recovery:
+                receipt.update(recovery_parent_id=recovery['parent_call_id'], recovery_attempt=1)
+            self.store.put('model_receipt', fingerprint, receipt, immutable=True)
             try:
                 choice = response['choices'][0]
                 if choice.get('finish_reason') != 'stop':
@@ -186,6 +252,16 @@ class ModelGateway:
                 if not isinstance(output, dict):
                     raise ModelOutputInvalid('Completed model response is not a JSON object; receipt preserved',
                         call_id=fingerprint, reason='not_json_object')
+                if recovery and not (isinstance(output.get('accepted'), bool)
+                        and isinstance(output.get('issues'), list)
+                        and all(isinstance(issue, str) for issue in output['issues'])
+                        and isinstance(output.get('checks'), dict)
+                        and all(isinstance(output['checks'].get(key), bool)
+                                for key in ('provenance', 'currency', 'unit', 'adr'))
+                        and ('position_basis_accepted' not in output
+                             or isinstance(output['position_basis_accepted'], bool))):
+                    raise ModelOutputInvalid('Recovery review does not satisfy the minimal review schema; receipt preserved',
+                        call_id=fingerprint, reason='review_recovery_schema_invalid')
             except ModelOutputInvalid:
                 raise
             except (ValueError, KeyError, IndexError, TypeError, AttributeError):

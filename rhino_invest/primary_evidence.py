@@ -29,6 +29,10 @@ TSM_PAGE = "https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter
 GOOGLE_PDF = "https://s206.q4cdn.com/479360582/files/doc_financials/{year}/q{quarter}/{year}q{quarter}-alphabet-earnings-release.pdf"
 SOXX_PAGE = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf"
 SOXX_HOLDINGS = "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf/latest-holdings.csv"
+CIRCLE_IR = "https://investor.circle.com/overview/default.aspx"
+CIRCLE_Q2_2026 = "https://s206.q4cdn.com/265218871/files/doc_news/2026/Aug/05/CIRCLE_Q2-2026.pdf"
+CIRCLE_FY2025 = "https://s206.q4cdn.com/265218871/files/doc_earnings/2025/q4/earnings-result/4Q25-Earnings-Release.pdf"
+SOXX_SPLIT_PDF = "https://www.ishares.com/us/literature/summary-prospectus/sp-ishares-phlx-semiconductor-etf-3-31.pdf"
 DATE = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s*\d{4}"
 NUMBER = r"\(?-?\d[\d,]*(?:\.\d+)?\)?"
 
@@ -100,6 +104,9 @@ def _allowed(url):
         return False
     return ((p.hostname == "investor.tsmc.com" and p.path.startswith("/english/")) or
             (p.hostname == "s206.q4cdn.com" and p.path.startswith("/479360582/files/doc_financials/")) or
+            (p.hostname == "s206.q4cdn.com" and p.path.startswith("/265218871/files/")) or
+            (p.hostname == "investor.circle.com" and p.path == "/overview/default.aspx") or
+            (p.hostname == "www.ishares.com" and p.path == "/us/literature/summary-prospectus/sp-ishares-phlx-semiconductor-etf-3-31.pdf") or
             (p.hostname == "www.ishares.com" and p.path.startswith("/us/products/239705/")) or
             (p.hostname == "www.blackrock.com" and p.path.startswith("/varnish-api/blk-one01-product-data/")))
 
@@ -380,6 +387,170 @@ def _google(store, out, now, transport):
         "reason": "Shared group earnings release does not separately resolve class-specific diluted EPS."}
 
 
+def _circle_row(text, label, count=4):
+    """Read a complete explicit column row; return its unmodified source span."""
+    match = re.search(label + r"(?P<values>(?:\s*\$?\s*" + NUMBER + r"){" + str(count) + r"})(?![\d,.])", text, re.I)
+    if not match:
+        raise EvidenceError("SOURCE_TABLE_LAYOUT_CHANGED")
+    tokens = re.findall(NUMBER, match.group("values"))
+    if len(tokens) != count:
+        raise EvidenceError("SOURCE_TABLE_LAYOUT_CHANGED")
+    values = [decimal_value(token.replace(",", "").replace("(", "-").replace(")", "")) for token in tokens]
+    return values, match.group()
+
+
+def _circle_release(store, source, now, year, quarter):
+    """Parse issuer GAAP statements and separately labelled non-GAAP reconciliation."""
+    text = source["content"]
+    if not re.search(r"Circle\s+Internet\s+Group,\s*Inc\.\s*\(NYSE:\s*CRCL\)", text, re.I):
+        raise EvidenceError("SOURCE_ISSUER_OR_UNIT_MISMATCH")
+    published = _published(_line(text, DATE).group())
+    if parse_time(published) > parse_time(now):
+        raise EvidenceError("SOURCE_NOT_AVAILABLE_AS_OF")
+    period = f"{year}-{quarter * 3:02d}-" + ("30" if quarter in {2, 3} else "31")
+    statement = re.search(r"CONSOLIDATED\s+STATEMENTS\s+OF\s+OPERATIONS(?P<table>.*?)Weighted.average\s+(?:common\s+)?shares\s+used", text, re.I | re.S)
+    if not statement:
+        raise EvidenceError("SOURCE_TABLE_LAYOUT_CHANGED")
+    table = statement.group()
+    unit = re.search(r"\(in\s+(?:\$\s*)?thousands,\s*except\s+per\s+share\s+information\)", table, re.I)
+    if not unit or not re.search(r"Three\s+Months\s+Ended", table, re.I):
+        raise EvidenceError("SOURCE_ISSUER_OR_UNIT_MISMATCH")
+    if quarter == 4:
+        if not re.search(r"Year\s+Ended", table, re.I):
+            raise EvidenceError("SOURCE_PERIOD_MISMATCH")
+    elif not re.search(r"Six\s+Months\s+Ended", table, re.I) and quarter == 2:
+        raise EvidenceError("SOURCE_PERIOD_MISMATCH")
+    # Column order is verified from all four headings. YTD is not full-year EPS.
+    header = re.split(r"Revenue\s+and\s+reserve\s+income", table, maxsplit=1, flags=re.I)[0]
+    dates = [_date(m.group()) for m in re.finditer(DATE, header, re.I)]
+    previous = str(year - 1) + period[4:]
+    if dates != [period, previous, period, previous]:
+        raise EvidenceError("SOURCE_PERIOD_MISMATCH")
+    evidence = _evidence(store, source, published_at=published, period_end=period)
+    facts = []
+    eps_part = re.search(r"Earnings\s+\(loss\)\s+per\s+share\s+attributable\s+to\s+common\s+stockholders\s*:(.*)", table, re.I | re.S)
+    if not eps_part:
+        raise EvidenceError("SOURCE_TABLE_LAYOUT_CHANGED")
+    long_eps = r"Diluted\s+earnings\s+\(loss\)\s+per\s+common\s+share\s+attributable\s+to\s+common\s+stockholders\s*(?!:)"
+    eps, eps_excerpt = _circle_row(eps_part.group(1), long_eps if quarter == 4 else r"Diluted\b")
+    specs = [("eps_diluted", eps, eps_excerpt, "per_share", Decimal(1)),
+        ("revenue", *_circle_row(table, r"Total\s+revenue\s+and\s+reserve\s+income"), None, Decimal(1000)),
+        ("reserve_income", *_circle_row(table, r"Reserve\s+income"), None, Decimal(1000)),
+        ("operating_income", *_circle_row(table, r"Operating\s+income\s+\(loss\)\s+from\s+continuing\s+operations"), None, Decimal(1000)),
+        ("net_income_continuing_operations", *_circle_row(table, r"Net\s+income\s+\(loss\)\s+from\s+continuing\s+operations\b(?!\s+before)"), None, Decimal(1000))]
+    for metric, values, excerpt, price_unit, scale in specs:
+        for index, q in ((0, quarter), (2, None)) if quarter == 4 else ((0, quarter),):
+            fact = _fact(metric, values[index] * scale, evidence, excerpt, year=year, quarter=q,
+                price_unit=price_unit, locator="Circle issuer consolidated GAAP statement; dollar thousands except per-share; explicit current/prior quarter and YTD columns")
+            fact.update(accounting_basis="GAAP", source_unit_label=unit.group(),
+                currency_basis="Circle US issuer dollar financial-statement presentation; no currency conversion")
+            if metric == "eps_diluted":
+                fact.update(eps_scope="consolidated_common_stockholders",
+                    source_rationale="Reported diluted common EPS, not adjusted EPS, a consensus forecast or annualized quarterly earnings.")
+            facts.append(fact)
+    instrument = {"is_adr": False, "quote_currency": "USD", "quote_price_unit": "per_share",
+        "stock_eps_valuation_applicable": True, "evidence_refs": [evidence["id"]],
+        "source_locator": "Circle issuer NYSE CRCL heading and reported diluted common EPS statement",
+        "source_excerpt": eps_part.group(), "unit_source_excerpt": unit.group()}
+    adjusted = []
+    # Reconciliation row, never the rounded headline or an EPS substitute. The
+    # FY25 definition differs from Q2'26; retain the issuer's exact label.
+    if quarter == 2:
+        pattern = r"Adjusted\s+EBITDA\s*\(New\s+De(?:fi|\ufb01)nition\)"
+        try:
+            values, excerpt = _circle_row(text, pattern, count=5)
+            fact = _fact("adjusted_ebitda", values[0] * 1000, evidence, excerpt,
+                year=year, quarter=quarter, locator="issuer reconciliation to GAAP net income; USD thousands; New Definition")
+            fact.update(accounting_basis="non_GAAP", definition="issuer new definition; includes exclusion of stock-based compensation related payroll expense",
+                warning="Not GAAP net income or EPS; changes in issuer definition impair comparability.")
+            adjusted.append(fact)
+        except EvidenceError:
+            pass  # Missing non-GAAP row is explicit below, never replace GAAP.
+    elif quarter == 4:
+        reconciliation = re.search(r"\(in\s+\$\s+thousands\)\s+Year\s+Ended\s+December\s+31,\s*" + str(year) + r".*?Adjusted\s+EBITDA\s*\$", text, re.I | re.S)
+        if reconciliation:
+            try:
+                tail = text[reconciliation.start():]
+                values, excerpt = _circle_row(tail, r"Adjusted\s+EBITDA", count=2)
+                fact = _fact("adjusted_ebitda", values[0] * 1000, evidence, excerpt,
+                    year=year, locator="issuer annual reconciliation to GAAP net income; USD thousands")
+                fact.update(accounting_basis="non_GAAP", definition="issuer definition in FY25 release",
+                    warning="Not GAAP net income or EPS; do not substitute for reported annual diluted EPS.")
+                adjusted.append(fact)
+            except EvidenceError:
+                pass
+    return evidence, facts, instrument, adjusted
+
+
+def _circle(store, out, now, transport):
+    # IR discovery is bounded to its latest earnings-release link. A release
+    # announcement/presentation or a future-dated document is never a result.
+    targets, discovery_ok, discovery_gaps = [], False, []
+    try:
+        page = _fetch(store, CIRCLE_IR, now, transport)
+        parser = _HTML()
+        parser.feed(base64.b64decode(page["raw_base64"]).decode("utf-8-sig"))
+        for href, title in parser.links:
+            match = re.search(r"Earnings\s+Press\s+Release\s+of\s+Q([1-4])\s+(\d{4})", title, re.I)
+            if match:
+                url = urljoin(CIRCLE_IR, href)
+                if not _allowed(url) or not urlsplit(url).path.lower().endswith(".pdf"):
+                    raise EvidenceError("SOURCE_URL_NOT_ALLOWED")
+                targets.append((int(match[2]), int(match[1]), url))
+        if not targets:
+            raise EvidenceError("SOURCE_LATEST_RELEASE_LINK_UNAVAILABLE")
+        targets = sorted(set(targets), reverse=True)[:1]
+        discovery_ok = True
+    except Exception as exc:
+        _gap(discovery_gaps, str(exc) if isinstance(exc, EvidenceError) else "PRIMARY_SOURCE_UNAVAILABLE", "CRCL_LATEST_RELEASE_DISCOVERY", CIRCLE_IR)
+    # Exact original public documents independently located through Circle IR.
+    # They are dated historical fallbacks, not a claim to be the newest release.
+    targets.extend([(2026, 2, CIRCLE_Q2_2026), (2025, 4, CIRCLE_FY2025)])
+    seen, latest = set(), None
+    for year, quarter, url in targets:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            source = _fetch(store, url, now, transport)
+            evidence, facts, instrument, adjusted = _circle_release(store, source, now, year, quarter)
+            out["primary_evidence"].append(evidence)
+            existing = {(f["metric"], f["period_end"], f["period_type"]) for f in out["primary_financials"]["facts"]}
+            out["primary_financials"]["facts"].extend(f for f in facts if (f["metric"], f["period_end"], f["period_type"]) not in existing)
+            out["primary_financials"].setdefault("non_gaap_facts", []).extend(adjusted)
+            if latest is None or evidence["period_end"] > latest:
+                latest = evidence["period_end"]
+                out["primary_financials"]["instrument"] = instrument
+            if not adjusted:
+                _gap(out["primary_gaps"], "NON_GAAP_RECONCILIATION_NOT_PARSED", "CRCL_NON_GAAP", url)
+                out["primary_gaps"][-1]["blocking"] = False
+        except Exception as exc:
+            _gap(out["primary_gaps"], str(exc) if isinstance(exc, EvidenceError) else "PRIMARY_SOURCE_UNAVAILABLE", f"CRCL_{year}Q{quarter}", url)
+    out["primary_financials"].update(latest_reported_period_end=latest,
+        eps_scope="consolidated_common_stockholders",
+        annual_forecast_verified=False,
+        forecast_limitation="Issuer historical GAAP statements only. Quarterly or year-to-date EPS is never multiplied into a full-year consensus forecast.")
+    # Discovery health belongs to collection audit, never to the material facts
+    # digest. A transient IR outage must not manufacture a new paid review.
+    out["primary_collection"] = {"status": "issuer_release_discovered" if discovery_ok else "dated_historical_fallback",
+        "attempted_at": now, "gaps": discovery_gaps, "retry_required": not discovery_ok}
+    cached = (store.get("fundamental_cache", "CRCL") or {}).get("data") or {}
+    previous = cached.get("primary_financials") or {}
+    previous_latest = previous.get("latest_reported_period_end")
+    if previous_latest and (latest is None or previous_latest > latest):
+        from .market import _primary_verified
+        old_facts = previous.get("facts") or []
+        if old_facts and all(_primary_verified(store, fact) for fact in old_facts):
+            out["primary_collection"].update(status="retained_last_known_evidence", retry_required=True,
+                gaps=discovery_gaps + out["primary_gaps"], retained_period_end=previous_latest)
+            out["primary_financials"] = copy.deepcopy(previous)
+            for fact in out["primary_financials"]["facts"]:
+                fact.pop("source_verified", None)
+            out["primary_financials"].get("instrument", {}).pop("source_verified", None)
+            out["primary_evidence"] = copy.deepcopy(cached.get("primary_evidence", []))
+            out["primary_gaps"] = copy.deepcopy(cached.get("primary_gaps", []))
+
+
 def _spreadsheet(raw):
     text = raw.decode("utf-8-sig")
     if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
@@ -392,6 +563,104 @@ def _spreadsheet(raw):
     return {sheet.attrib.get("{" + ns["s"] + "}Name"): [
         ["".join(cell.itertext()).strip() for cell in row.findall("s:Cell", ns)]
         for row in sheet.findall("s:Table/s:Row", ns)] for sheet in root.findall("s:Worksheet", ns)}
+
+
+def _soxx_split_supplement(store, out, now, transport):
+    """Issuer announcement only: no ledger split, position or price conversion."""
+    valuation = out["etf_valuation"]
+    try:
+        source = _fetch(store, SOXX_SPLIT_PDF, now, transport)
+        text = source["content"]
+        sections = list(re.finditer(r"Supplement\s+dated\s+(?P<date>" + DATE
+            + r")(?P<body>.*?)PLEASE\s+RETAIN\s+THIS\s+SUPPLEMENT", text, re.I | re.S))
+        if not sections:
+            raise EvidenceError("SOURCE_SPLIT_SUPPLEMENT_LAYOUT_CHANGED")
+        published = max(_published(m["date"]) for m in sections)
+        # The changing PDF can include a later confirming supplement. Never
+        # date the entire bytes/text bundle as the older announcement alone.
+        if parse_time(published) > parse_time(now):
+            raise EvidenceError("SOURCE_NOT_AVAILABLE_AS_OF")
+        parsed = []
+        for section in sections:
+            body = section["body"]
+            if not re.search(r"iShares\s+Semiconductor\s+ETF\s*\(SOXX\)", body):
+                continue
+            ratio = re.search(r"iShares\s+Semiconductor\s+ETF\s+SOXX\s+(\d+)\s*:\s*(\d+)", body)
+            words = re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)-for-(one|two|three|four|five|six|seven|eight|nine|ten)\s+forward\s+stock\s+split", body, re.I)
+            if ratio:
+                numerator, denominator = int(ratio[1]), int(ratio[2])
+            elif words:
+                numbers = {word: index for index, word in enumerate(("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"), 1)}
+                numerator, denominator = numbers[words[1].lower()], numbers[words[2].lower()]
+            else:
+                raise EvidenceError("SOURCE_SPLIT_RATIO_UNAVAILABLE")
+            record = re.search(r"record\s+date\s+for\s+the\s+(?:forward\s+stock\s+)?split\s+will\s+be\s+(" + DATE + r")", body, re.I)
+            distribution = re.search(r"(?:distribution\s+date\s+will\s+be|effectuated\s+after\s+the\s+close\s+of\s+trading\s+on)\s+(" + DATE + r")", body, re.I)
+            effective = re.search(r"(?:split-adjusted\s+basis\s+on|Nasdaq\s+Stock\s+Market\s+LLC\s+on)\s+(" + DATE + r")", body, re.I)
+            if not (record and distribution and effective and numerator > denominator > 0):
+                raise EvidenceError("SOURCE_SPLIT_DATES_OR_RATIO_UNAVAILABLE")
+            days = (_date(record[1]), _date(distribution[1]), _date(effective[1]))
+            if not (_date(section["date"]) <= days[0] <= days[1] < days[2]):
+                raise EvidenceError("SOURCE_SPLIT_DATE_CONFLICT")
+            parsed.append((section, numerator, denominator, days))
+        if not parsed or len({(n, d, days) for _,n,d,days in parsed}) != 1:
+            raise EvidenceError("SOURCE_SPLIT_SUPPLEMENTS_CONFLICT")
+        # Prefer the original numeric table's full literal span. It also states
+        # the split-adjusted trading date consumed by the existing price gate.
+        section, numerator, denominator, days = next((item for item in parsed
+            if re.search(r"\bSOXX\s+\d+\s*:\s*\d+", item[0].group())), parsed[0])
+        evidence = _evidence(store, source, published_at=published, period_end=days[2])
+        out["primary_evidence"].append(evidence)
+        action = {"type": "split", "announced_at": min(_date(m["date"]) for m,_,_,_ in parsed),
+            "source_published_at": published, "confirmed_at": published, "record_date": days[0],
+            "distribution_date": days[1], "effective_at": days[2],
+            "status": "announced_not_effective" if days[2] > parse_time(now).date().isoformat() else "effective_requires_unit_check",
+            "ratio": f"{numerator}:{denominator}", "new_shares_per_old": str(Decimal(numerator) / Decimal(denominator)),
+            "evidence_refs": [evidence["id"]], "source_excerpt": section.group(), "source_url": SOXX_SPLIT_PDF,
+            "source_locator": "issuer dated split supplements; record/distribution/split-adjusted trading dates",
+            "automatic_price_adjustment": False, "ledger_confirmation_required": True}
+        existing = valuation["corporate_actions"]
+        if any(old.get("type") == "split" and old.get("effective_at") != days[2] for old in existing):
+            raise EvidenceError("SOURCE_SPLIT_ANNOUNCEMENT_CONFLICT")
+        valuation["corporate_actions"] = [old for old in existing if old.get("type") != "split"] + [action]
+    except Exception as exc:
+        code = str(exc) if isinstance(exc, EvidenceError) else "PRIMARY_SOURCE_UNAVAILABLE"
+        if code in {"SOURCE_SPLIT_SUPPLEMENTS_CONFLICT", "SOURCE_SPLIT_ANNOUNCEMENT_CONFLICT", "SOURCE_SPLIT_DATE_CONFLICT"}:
+            # A new contradictory issuer disclosure is material evidence, not
+            # a collection outage. Keep its original text/hash visible to the
+            # research gate; restoring the cached ratio would hide the change.
+            evidence = _evidence(store, source, published_at=published)
+            out["primary_evidence"].append(evidence)
+            valuation["corporate_action_conflict"] = True
+            valuation["corporate_action_conflict_evidence_refs"] = [evidence["id"]]
+            _gap(out["primary_gaps"], code, "SOXX_SPLIT_SUPPLEMENT", SOXX_SPLIT_PDF)
+            return
+        # A temporary failed refresh cannot erase previously sealed ratio/date
+        # evidence. The portfolio itself is never transformed by this collector.
+        cached = (store.get("fundamental_cache", "SOXX") or {}).get("data") or {}
+        from .market import _primary_verified
+        kept = []
+        for old in (cached.get("etf_valuation") or {}).get("corporate_actions", []):
+            try:
+                published_before_cutoff = parse_time(old.get("source_published_at")) <= parse_time(now)
+            except (TypeError, ValueError):
+                published_before_cutoff = False
+            if (old.get("type") == "split" and old.get("new_shares_per_old")
+                    and _primary_verified(store, old)
+                    and published_before_cutoff
+                    and not any(current.get("type") == "split" and current.get("effective_at") != old.get("effective_at")
+                                for current in valuation["corporate_actions"])):
+                retained = copy.deepcopy(old)
+                retained["status"] = ("announced_not_effective" if old["effective_at"] > parse_time(now).date().isoformat()
+                                      else "effective_requires_unit_check")
+                valuation["corporate_actions"] = [item for item in valuation["corporate_actions"] if item.get("type") != "split"] + [retained]
+                kept.extend(old["evidence_refs"])
+        for ref in kept:
+            record = store.get("external_evidence", ref)
+            out["primary_evidence"].append({key: record[key] for key in
+                ("id", "source_url", "sha256", "raw_sha256", "published_at", "period_end", "observed_at")})
+        out["primary_collection"] = {"status": "split_supplement_retained" if kept else "split_supplement_unavailable",
+            "attempted_at": now, "retry_required": True, "gaps": [{"code": code, "field": "SOXX_SPLIT_SUPPLEMENT", "source_url": SOXX_SPLIT_PDF}]}
 
 
 def _soxx(store, out, now, transport):
@@ -426,6 +695,7 @@ def _soxx(store, out, now, transport):
                 "status": "announced_not_effective" if effective > parse_time(now).date().isoformat() else "effective_requires_unit_check",
                 "new_shares_per_old": None, "evidence_refs": [page_ev["id"]], "source_excerpt": action.group(),
                 "automatic_price_adjustment": False})
+    _soxx_split_supplement(store, out, now, transport)
     try:
         holdings = _fetch(store, SOXX_HOLDINGS, now, transport)
         csv_rows = list(csv.reader(io.StringIO(holdings["content"])))
@@ -502,14 +772,14 @@ def _soxx(store, out, now, transport):
 def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transport=None):
     """Return public facts separately from native provider data and forecasts.
 
-    Only TSM, GOOG, GOOGL and SOXX are implemented. ``now`` is the information cutoff;
+    Only TSM, GOOG, GOOGL, CRCL and SOXX are implemented. ``now`` is the information cutoff;
     fetching a newer source never changes its source date to that cutoff.
     """
     symbol = symbol_value(symbol)
     now = parse_time(now or utc_now()).isoformat()
     out = copy.deepcopy(fundamentals or {})
     out["symbol"] = symbol
-    if symbol not in {"TSM", "GOOG", "GOOGL", "SOXX"}:
+    if symbol not in {"TSM", "GOOG", "GOOGL", "CRCL", "SOXX"}:
         return out
     out.update(primary_financials={"symbol": symbol, "facts": [], "instrument": {}}, primary_evidence=[], primary_gaps=[])
     out.pop("etf_valuation", None)
@@ -517,7 +787,7 @@ def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transp
         import requests
         transport = requests.Session()
     try:
-        {"TSM": _tsm, "GOOG": _google, "GOOGL": _google, "SOXX": _soxx}[symbol](store, out, now, transport)
+        {"TSM": _tsm, "GOOG": _google, "GOOGL": _google, "CRCL": _circle, "SOXX": _soxx}[symbol](store, out, now, transport)
     except Exception as exc:
         _gap(out["primary_gaps"], str(exc) if isinstance(exc, EvidenceError) else "PRIMARY_SOURCE_UNAVAILABLE", symbol)
     out["primary_evidence"] = list({item["id"]: item for item in out["primary_evidence"]}.values())
@@ -526,6 +796,7 @@ def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transp
     out["primary_evidence_hash"] = stable_id(VERSION, symbol,
         [(item["id"], item["sha256"]) for item in out["primary_evidence"]],
         out["primary_financials"], out.get("etf_valuation"))
-    retry = any(gap.get("blocking") is True for gap in out["primary_gaps"])
+    retry = (any(gap.get("blocking") is True for gap in out["primary_gaps"])
+             or (out.get("primary_collection") or {}).get("retry_required") is True)
     out["primary_refresh_after"] = (parse_time(now) + timedelta(hours=6 if retry else 24)).isoformat()
     return out

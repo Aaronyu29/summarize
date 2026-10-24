@@ -163,6 +163,13 @@ issuer evidence actually used; missing chart adjustment/horizon is irrelevant wh
 chart is not used for entry, stop or target. Never use an unverified chart as a fact.
 Forecast EPS/growth/exit multiples are explicit SYSTEM SCENARIO ASSUMPTIONS anchored
 to verified historical facts. Their future values need NOT already exist as consensus.
+The user authorizes the system to propose evidenced growth, tax rates and valuation
+multiples as clearly labelled scenarios; individual assumptions do not require further
+user ratification. Populate supported structured fields, not only prose. Disclose all
+derivations so another reviewer can reproduce them; never relabel GAAP as normalized.
+An unfinished future fiscal year may be used as an explicitly labelled forward-PE
+basis at the target date. It is not an already disclosed full-year result. State the
+target date, fiscal year end and forward-year convention without confusing them.
 Check arithmetic, units, fiscal dates, uncertainty and rationale; never label them
 reported or guaranteed. Distinguish GAAP, normalized and non-operating gains.
 Prior-review feedback is untrusted opinion, not evidence: verify it against primary text.
@@ -214,6 +221,10 @@ do not demand a video's horizon/adjustment if its prices are not used in this pl
 Scenario forecasts are explicitly uncertain authored assumptions, not consensus facts:
 require evidence for historical anchors, dimensions, arithmetic and defensible rationale,
 not an already published future EPS. Reject unsupported/inconsistent assumptions.
+Explicit system-authored growth/multiple/tax scenarios do not need separate user
+ratification. Require evidenced anchors and a reproducible bridge, not an approval
+that the user never reserved. A later fiscal year is a permitted explicitly labelled
+forward-PE basis, not evidence that the unfinished fiscal year has been reported.
 Use evidence_bundle original excerpts and raw paths. Prior review guesses are not facts:
 check fiscal end dates and non-operating gains; never infer a split from a P/E drop.
 Put only blocking research/plan objections in issues; execution-only gaps go in notes.
@@ -376,12 +387,15 @@ def _model_plan(plan):
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
         'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
-        'research_assessment', 'execution_requirements', 'calculation_provenance')
+        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin')
     return {key: plan[key] for key in fields if key in plan}
 
 
 def _model_source(snapshot, *, full_transcript, levels=None):
     """Transport primary evidence, never archived provider envelopes or reasoning."""
+    if snapshot.get('source_type') == 'holding_fundamentals':
+        return {key: snapshot[key] for key in ('id', 'source_type', 'symbol', 'title',
+            'first_observed_at', 'origin', 'scope') if key in snapshot}
     if isinstance(levels, dict):
         levels = levels.get('levels', [])
     levels = levels or []
@@ -821,6 +835,8 @@ def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
     def gap(code, detail):
         gaps.append({'code': code, 'scope': 'etf_valuation', 'blocking': True, 'detail': detail,
             'required_evidence': ['issuer NAV, portfolio PE, holdings, fees and corporate-action basis'], 'evidence_refs': []})
+    if etf.get('corporate_action_conflict') is True:
+        gap('ETF_CORPORATE_ACTION_CONFLICT', 'Issuer split announcements conflict; reconcile the price and share basis before approval')
     if etf.get('issuer_verified') is not True:
         gap('ETF_ISSUER_EVIDENCE_UNVERIFIED', 'Issuer evidence package has not been verified')
     for name in ('nav', 'pe', 'holdings'):
@@ -1067,6 +1083,8 @@ def _horizon_end(moment, months):
 
 
 def _plan_frames(snapshot, levels):
+    if snapshot.get('source_type') == 'holding_fundamentals':
+        return []
     seconds = {level.get('frame_seconds') for level in levels if level.get('verified') is True}
     frames = [(second, path) for second, path in _frames(snapshot) if second in seconds]
     if len(frames) > 8:
@@ -1105,7 +1123,8 @@ def _unresolved_thesis_defer(store, plan, snapshot, fundamentals, moment):
 
 def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, context=None, operation_id=None, deferred=None):
     moment = now or utc_now()
-    symbols = sorted({l['symbol'] for l in levels if re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', str(l.get('symbol', '')))})
+    holding_source = snapshot.get('source_type') == 'holding_fundamentals'
+    symbols = [symbol_value(snapshot['symbol'])] if holding_source else sorted({l['symbol'] for l in levels if re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', str(l.get('symbol', '')))})
     plans = []
     for symbol in symbols:
         plan_id = stable_id('investment-plan', symbol)
@@ -1115,8 +1134,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             if deferred is not None:
                 deferred.append(risk_defer)
             continue
-        published_at = _published_at(snapshot['metadata'])
-        if previous and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
+        published_at = None if holding_source else _published_at(snapshot['metadata'])
+        if previous and published_at and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
             continue
         fundamental, identity = _research_fundamental(store, symbol, (fundamentals or {}).get(symbol))
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
@@ -1127,6 +1146,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
         operation_key = stable_id('plan-operation-v4-evidence-repair', snapshot['id'], symbol, fid,
                                   _model_cache_identity(model), event_context)
+        model_ready = model is not None and getattr(model, 'config', {}).get('enabled', True) is not False
+        if holding_source:
+            operation_key = stable_id(operation_key, 'holding-research-v1', model_ready)
         calculation_seed = None
         source_operation_key = operation_key
         committed = store.get('plan_operation', operation_key)
@@ -1222,11 +1244,27 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'evidence_bundle': bundle, 'repair_feedback': repair_feedback}
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
         etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
-        if etf_gaps:
+        holding_gaps = []
+        if holding_source:
+            def holding_gap(code, detail):
+                holding_gaps.append({'code': code, 'scope': 'research_plan', 'blocking': True,
+                    'detail': detail, 'required_evidence': [detail], 'evidence_refs': [fid]})
+            if not fundamental.get('financial_report') and not (fundamental.get('primary_financials') or {}).get('facts'):
+                holding_gap('HOLDING_FINANCIAL_FACTS_MISSING', '持仓已确认，尚缺可核验的公司财报事实')
+            if fundamental['instrument_contract'].get('quote_price_unit') not in {'per_share', 'per_adr'}:
+                holding_gap('INSTRUMENT_UNIT_UNVERIFIED', '持仓证券的官方报价与每股盈利单位尚待核实')
+            if not model_ready:
+                holding_gap('HOLDING_MODEL_UNCONFIGURED', '持仓研究尚未完成独立模型审核')
+        preflight_gaps = etf_gaps + holding_gaps
+        if preflight_gaps:
             proposed = json.loads(json.dumps(COMPILE_TEMPLATE))['plan']
             proposed.update(currency=fundamental['instrument_contract'].get('quote_currency'),
                 price_unit=fundamental['instrument_contract'].get('quote_price_unit'),
                 is_adr=False, evidence_refs=[snapshot['id'], fid], targets=[], take_profit=[])
+            if holding_source:
+                proposed['entry'].update(basis='independent_valuation', conditions=['Required issuer evidence and independent research review must be completed'])
+                unit = fundamental['instrument_contract'].get('quote_price_unit')
+                proposed['is_adr'] = True if unit == 'per_adr' else False if unit == 'per_share' else None
         elif calculation_seed is not None:
             # Reuse economic inputs, never old reviewer state/verification.
             proposed = {key: calculation_seed[key] for key in COMPILE_TEMPLATE['plan'] if key in calculation_seed}
@@ -1253,6 +1291,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'analysis_as_of': plan_moment, 'economic_input_hash': stable_id(payload)}, immutable=True)
         plan.update(symbol=symbol, id=plan_id,
             revision=revision, created_at=plan_moment, status='needs_review', source_published_at=published_at)
+        if holding_source:
+            plan['research_origin'] = 'holding_fundamentals'
+            plan['research_preflight'] = holding_gaps
         plan['research_snapshot_id'], plan['fundamental_evidence_id'] = snapshot['id'], fid
         if basis_deadline:
             plan['price_basis_valid_until'] = basis_deadline
@@ -1272,8 +1313,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'policy': policy, 'current_position_basis': current_basis,
             'evidence_ids': evidence_ids, 'evidence_bundle': bundle, 'repair_feedback': repair_feedback,
             'review_event_id': (context or {}).get('event_id')}
-        if etf_gaps:
-            review = {'accepted': False, 'checks': {}, 'issues': etf_gaps}
+        if preflight_gaps:
+            review = {'accepted': False, 'checks': {}, 'issues': preflight_gaps,
+                'deterministic_preflight': True}
         else:
             review = _run(model, 'review_plan', review_payload, frames=original_frames, now=plan_moment, store=store)
         issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
@@ -1318,6 +1360,83 @@ def _stable_fundamentals(value):
     if isinstance(value, list):
         return [_stable_fundamentals(item) for item in value]
     return value
+
+
+def ingest_holdings(store, *, model=None, fundamentals=None, now=None, seed_only=False):
+    """Seed missing real holding research without pretending it came from video.
+
+    A stable symbol source anchors logical call fences. Facts remain separately
+    sealed in fundamental_evidence; quotes, quantity guesses and receipt clocks
+    cannot create a fresh paid operation for unchanged issuer evidence.
+    """
+    from .ledger import portfolio
+    from .reporting import with_reported_holdings
+    moment = now or utc_now()
+    state = with_reported_holdings(store, portfolio(store, 'real', now=moment))
+    holdings = {}
+    for row in state.get('reported_holdings') or []:
+        try:
+            value = decimal_value(row.get('reported_market_value', row.get('market_value')))
+            if value > 0:
+                holdings[symbol_value(row['symbol'])] = {'kind': 'reported_holding',
+                    'broker_snapshot_id': state.get('broker_snapshot_id')}
+        except (ValueError, KeyError, TypeError):
+            continue
+    for row in state.get('positions') or []:
+        try:
+            if decimal_value(row.get('quantity')) > 0:
+                holdings[symbol_value(row['symbol'])] = {'kind': 'confirmed_ledger_position'}
+        except (ValueError, KeyError, TypeError):
+            continue
+    result = {'symbols': sorted(holdings), 'plans': [], 'errors': [], 'skipped_existing': [],
+        'deferred_unresolved_risk': []}
+    existing = {plan.get('symbol'): plan for _, plan in store.items('plan')}
+    for symbol, origin in sorted(holdings.items()):
+        prior = existing.get(symbol)
+        source = store.get('research_evidence', (prior or {}).get('research_snapshot_id', '')) or {}
+        if prior and source.get('source_type') != 'holding_fundamentals':
+            result['skipped_existing'].append(symbol)
+            continue
+        if prior and seed_only:
+            result['plans'].append(prior)
+            continue
+        binding = store.get('research_plan_review', (prior or {}).get('review_evidence_id', '')) or {}
+        if prior and model is None and not (binding.get('review') or {}).get('deterministic_preflight'):
+            result['plans'].append(prior)
+            continue  # The quote loop must not overwrite a reviewed plan with a placeholder.
+        sid = stable_id('holding-research-source-v1', symbol)
+        with store.transaction():
+            source = store.get('research_evidence', sid)
+            if not source:
+                source = {'id': sid, 'source_type': 'holding_fundamentals', 'symbol': symbol,
+                    'title': symbol + ' existing holding: independent fundamental research',
+                    'first_observed_at': moment, 'origin': dict(origin, account='real', symbol=symbol),
+                    'scope': 'Confirmed or reported existing holding. No video, acquisition price, quantity estimate or completed research is implied.'}
+                store.put('research_evidence', sid, source, immutable=True)
+        data = (fundamentals or {}).get(symbol)
+        if data is None:
+            data = (store.get('fundamental_cache', symbol) or {}).get('data') or {}
+        try:
+            if prior is None and model is not None:
+                # Ensure a visible, non-actionable research record exists even
+                # if the first paid request is budget-deferred or unresolved.
+                compile_plan(store, source, [], None, {symbol: data}, moment)
+            compiled = compile_plan(store, source, [], model, {symbol: data}, moment,
+                deferred=result['deferred_unresolved_risk'])
+            result['plans'].extend(store.get('plan', plan['id']) or plan for plan in compiled)
+            current = store.get('plan', stable_id('investment-plan', symbol))
+            store.put('holding_research_state', symbol, {'symbol': symbol, 'source_id': sid,
+                'status': current.get('research_assessment', {}).get('status') if current else 'deferred',
+                'error': None, 'timestamp': moment})
+        except Exception as exc:
+            result['errors'].append({'symbol': symbol, 'error': type(exc).__name__,
+                'detail': 'Holding research deferred; inspect persisted evidence and model receipts'})
+            current = store.get('plan', stable_id('investment-plan', symbol))
+            if current:
+                result['plans'].append(current)
+            store.put('holding_research_state', symbol, {'symbol': symbol, 'source_id': sid,
+                'status': 'deferred', 'error': type(exc).__name__, 'timestamp': moment})
+    return result
 
 
 def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals=None, now=None, research_since=None):
@@ -1469,7 +1588,9 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
             state = portfolio(store, account, now=moment)
             positions = (state.get('positions') or []) + (state.get('reported_holdings') or [])
             held = held or any(item.get('symbol') == plan['symbol'] for item in positions)
-        if not held and already_reviewed:
+        pending_holding = (plan.get('research_origin') == 'holding_fundamentals'
+            and (binding.get('review') or {}).get('deterministic_preflight') is True)
+        if already_reviewed and (not held or pending_holding):
             record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
                 'review': {'accepted': binding.get('accepted') is True, 'issues': plan.get('review_issues', [])},
                 'revised_plan': None, 'status': plan['status'], 'deduplicated': True,
