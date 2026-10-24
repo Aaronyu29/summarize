@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from finance_archive import publish, validate
+from finance_archive import publish, validate, render, render_markdown, rich_text, validate_readability
 from finance_collect import parse_feed
 
 
@@ -101,6 +101,57 @@ class EvidenceTests(unittest.TestCase):
         <entry><yt:videoId>bbbbbbbbbbb</yt:videoId><title>new</title><published>2026-10-22</published>
         <link href="https://www.youtube.com/watch?v=bbbbbbbbbbb"/></entry></feed>'''
         self.assertEqual(parse_feed(raw)[0]["title"], "new")
+
+    def test_emphasis_preserves_conditions_escapes_html_and_does_not_duplicate_summary(self):
+        phrase = '**若QQQ跌破698；当前尚未触发**'
+        self.analysis['summary'] = phrase
+        video = self.analysis['videos'][0]
+        video['overview'] = phrase + '\n关注价格与条件。'
+        video['claims'][0]['text'] = phrase + '\n<script>保持转义</script>'
+        video['claims'][0]['uncertainty'] = '**期权链未展示**'
+        video['review_questions'] = '**若收复737–746，则下调偏紧判断**'
+        records = validate(self.analysis, self.capture)
+        rendered = render(self.analysis, records)
+        self.assertIn("<strong class='focus'>若QQQ跌破698；当前尚未触发</strong>", rendered)
+        self.assertIn('&lt;script&gt;', rendered)
+        self.assertNotIn('<script>', rendered)
+        self.assertIn("<strong class='focus'>期权链未展示</strong>", rendered)
+        markdown = render_markdown(self.analysis, records)
+        self.assertIn('## 本期速读', markdown)
+        self.assertNotIn('核心判断：', markdown)
+        self.assertEqual(markdown.count(phrase), 2)  # summary and evidence, not a second overview
+        validate_readability(video)
+        video['claims'][0]['text'] = 'QQQ跌破698'
+        with self.assertRaisesRegex(ValueError, 'claim 0'):
+            validate_readability(video)
+
+    def test_readability_rejects_long_summary_and_unbalanced_emphasis(self):
+        video = self.analysis['videos'][0]
+        video['overview'] = '**重点**' + '长' * 220
+        with self.assertRaisesRegex(ValueError, '220'):
+            validate_readability(video)
+        video['overview'] = '**缺失结束\n第二行'
+        with self.assertRaisesRegex(ValueError, 'balanced'):
+            validate_readability(video)
+
+    def test_multiline_body_and_uncertainty_keep_markdown_breaks(self):
+        self.analysis['summary'] = '**重点**\n• 风险\n• 条件'
+        claim = self.analysis['videos'][0]['claims'][0]
+        claim['text'] = '**关键价位**\n**尚未触发**'
+        claim['uncertainty'] = '**未核实**\n不能当成成交'
+        markdown = render_markdown(self.analysis, validate(self.analysis, self.capture))
+        self.assertIn('**重点**  \n• 风险  \n• 条件', markdown)
+        self.assertIn('**关键价位**  \n**尚未触发**', markdown)
+        self.assertIn('> 核对说明：**未核实**  \n> 不能当成成交', markdown)
+
+    def test_readability_rejects_unbroken_summary_and_paragraph_highlighting(self):
+        video = self.analysis['videos'][0]
+        video['overview'] = '**一大段**'
+        with self.assertRaisesRegex(ValueError, 'separate takeaway'):
+            validate_readability(video)
+        video['overview'] = '**' + '大段' * 46 + '**\n第二行'
+        with self.assertRaisesRegex(ValueError, 'long paragraph'):
+            validate_readability(video)
 
 
 if __name__ == "__main__":

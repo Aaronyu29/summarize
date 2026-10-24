@@ -20,6 +20,13 @@ def main():
         raise ValueError('CI must build application and dependency wheels first')
     for name in ('install.sh', 'rhino-invest.service'):
         shutil.copyfile(Path(__file__).parent / name, root / name)
+    # Ship both services from the same checked-out CI revision. Never add local research data or credentials.
+    source = Path(__file__).resolve().parents[2]
+    finance = root / 'finance' / 'scripts'
+    finance.mkdir(parents=True, exist_ok=True)
+    for pattern in ('finance_*.py', 'test_finance*.py'):
+        for path in sorted((source / 'scripts').glob(pattern)):
+            shutil.copyfile(path, finance / path.name)
     files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
              for p in sorted(root.rglob('*')) if p.is_file() and p.name != 'manifest.json'}
     manifest = {'revision': args.revision, 'python': '3.12', 'platform': 'linux-x86_64',
