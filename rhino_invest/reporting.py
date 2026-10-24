@@ -82,7 +82,8 @@ def actionable_notice(recommendation, current_plans, *, now=None):
                 return False
         except (TypeError, ValueError, AttributeError):
             return False
-    return bool(plan and plan.get("status") == "active" and plan.get("revision") == recommendation.get("revision")
+    return bool(plan and (plan.get("research_assessment") or {}).get("status") != "approved_conditional"
+                and plan.get("status") == "active" and plan.get("revision") == recommendation.get("revision")
                 and recommendation.get("status") == "actionable"
                 and recommendation.get("action") in {"buy", "add", "reduce", "exit"})
 
@@ -189,7 +190,10 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
             days_text = str(days) + "天" if isinstance(days, int) and not isinstance(days, bool) and days >= 0 else "天数待补"
             lines.append(f"计划持有{horizon_text}；现持{days_text}；建议有效至{beijing_time(rec.get('expires_at'))}。")
     else:
-        pending = sum(p.get("status") != "active" for p in current_plans)
+        conditional = sum((p.get("research_assessment") or {}).get("status") == "approved_conditional"
+                          and p.get("status") not in {"invalidated", "superseded"} for p in current_plans)
+        pending = sum(p.get("status") != "active" and (p.get("research_assessment") or {}).get("status") != "approved_conditional"
+                      for p in current_plans)
         risky_symbols = {_symbol(r.get("symbol")) for r in recommendations
                          if {reason for reason in r.get("reasons", []) if isinstance(reason, str)} &
                          {"confirmed_price_stop", "verified_thesis_invalidation"}}
@@ -199,7 +203,10 @@ def notification_text(report, *, current_plans=(), recommendations=(), watch_eve
         if risky_symbols & exposed:
             lines.append("结论：持仓风险需人工核查，当前不是下单指令。")
         else:
-            lines.append("结论：暂无新增操作建议" + (f"；{pending}项研究待核实。" if pending else "。"))
+            details = ([f"{conditional}项估值已审核，入场条件待满足"] if conditional else [])
+            if pending:
+                details.append(f"{pending}项研究待核实")
+            lines.append("结论：暂无新增操作建议" + ("；" + "；".join(details) if details else "") + "。")
     gaps = []
     if snapshot.get("cash") is None:
         gaps.append("实际现金")
@@ -356,6 +363,8 @@ def plan_row(plan, recommendation=None):
     entry = entry if isinstance(entry, dict) else {}
     stop = stop if isinstance(stop, dict) else {}
     risk = rec.get("risk_context") or {}
+    conditional = ((plan.get("research_assessment") or {}).get("status") == "approved_conditional"
+                   and plan.get("status") not in {"invalidated", "superseded"})
     row = {"系统标识": plan["id"], "股票": plan.get("symbol", ""),
             "版本": readable(plan.get("revision")), "状态": {"active": "已审核", "candidate": "待审核", "needs_review": "待审核", "invalidated": "已失效", "superseded": "已替代"}.get(plan.get("status"), "待审核"),
             "建议动作": ACTIONS.get(rec.get("action"), "等待审核"), "理由": human_reasons(rec.get("reasons", [])),
@@ -379,7 +388,7 @@ def plan_row(plan, recommendation=None):
             "风险状态": ("最大回撤硬限制未配置；需人工判断" if risk.get("drawdown_limit") is None else
                          f"已设置回撤上限{risk['drawdown_limit']}；评估状态：{risk.get('drawdown_status', '未知')}；缺少历史净值时不能确认通过"),
             "更新时间": utc_now()}
-    if plan.get("status") != "active":
+    if plan.get("status") != "active" or conditional:
         for key in ("买入区间", "目标情景", "分批止盈", "止损价", "止损确认方式", "情景年化收益估算",
                     "每股止损风险美元", "价格止损风险百分比", "本次投入止损风险美元", "当前持仓止损风险美元",
                     "投资逻辑", "逻辑失效条件", "到期处理", "单次买入美元", "期限月数", "下次复核"):
@@ -393,6 +402,11 @@ def plan_row(plan, recommendation=None):
             if isinstance(g, dict) and g.get("blocking") and g.get("code") in labels and g.get("scope") != "execution"))
         row["理由"] = "；".join(gaps[:3]) if gaps else "研究资料尚未通过独立审核，暂无新增操作建议"
         row["证据引用"] = "来源记录已内部留存，待独立审核"
+    if conditional:
+        row["状态"] = "估值已审核·入场条件待满足"
+        row["建议动作"] = "等待入场条件"
+        row["理由"] = "估值已通过独立审核；仍需核实入场条件并形成完整入场规则，当前暂无操作建议"
+        row["证据引用"] = "估值证据与独立审核记录已内部留存；入场条件待满足"
     return row
 
 

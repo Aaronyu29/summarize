@@ -3,11 +3,13 @@ import copy
 import hashlib
 from decimal import Decimal
 import unittest
+from unittest.mock import patch
 
 from rhino_invest.common import stable_id
 from rhino_invest.ledger import stage_entry, confirm_entry
 from rhino_invest.research import (ingest_archives, review_plan, bind_research_supplement,
-    _etf_input_gaps, _validate_etf_target, _stable_fundamentals, _primary_text_transport, _run)
+    _etf_input_gaps, _validate_etf_target, _stable_fundamentals, _primary_text_transport, _run,
+    _calculate_target_prices, plan_fingerprint)
 from tests_invest import test_research as research_tests
 from tests_invest.test_research import FixtureModel, NOW
 
@@ -133,7 +135,7 @@ class EvidenceContractTests(unittest.TestCase):
         self.assertEqual(len(model.calls), count + 2)
         self.assertTrue(self.store.items('research_gap'))
 
-    def test_same_failed_initial_facts_event_deduplicates_but_active_or_held_review_does_not(self):
+    def test_same_failed_initial_facts_event_deduplicates_but_held_risk_review_remains(self):
         data, _ = self.primary()
         model = IndependentModel(reject=True)
         plan = self.ingest(model, data)
@@ -143,7 +145,83 @@ class EvidenceContractTests(unittest.TestCase):
         self.assertEqual(len(model.calls), count)
         self.store.put('reported_holding', 'note', {'symbol': 'NVDA', 'account': 'real', 'reported_at': NOW, 'market_value': '5'})
         review_plan(self.store, plan, model, event_id='held-report', evidence={'fundamentals': {'NVDA': data}}, now=NOW)
-        self.assertEqual(model.calls[count:], ['event_review', 'compile_plan', 'review_plan'])
+        self.assertEqual(model.calls[count:], ['event_review'])
+
+    def test_promoted_active_plan_does_not_pay_again_for_the_same_fundamental_event(self):
+        data, _ = self.primary()
+        model = IndependentModel(reject=True)
+        old = self.ingest(model, data)
+        newer = copy.deepcopy(data)
+        newer['primary_financials']['facts'][0]['value'] = '4.5'
+        model.reject = False
+        plan = self.ingest(model, newer)
+        self.assertEqual((old['status'], plan['status']), ('needs_review', 'active'))
+        before = len(model.calls)
+        for event in ('same-facts-a', 'same-facts-b'):
+            result = review_plan(self.store, plan, model, event_id=event,
+                evidence={'fundamentals': {'NVDA': newer}}, now=NOW)
+            self.assertTrue(result['deduplicated'])
+            self.assertEqual(result['status'], 'active')
+        self.assertEqual(len(model.calls), before)
+
+    def test_old_trigger_and_old_frozen_attempt_cannot_replace_new_reviewed_primary_facts(self):
+        data, _ = self.primary()
+        model = IndependentModel()
+        plan = self.ingest(model, data)
+        old = {'symbol': 'NVDA', 'financial_report': {'period': '2025', 'provider_eps': '10.5478'}}
+        self.store.put('fundamental_cache', 'NVDA', {'data': data})
+        key = stable_id('plan-review', plan['id'], plan['revision'], 'historical-trigger', _stable_fundamentals(old))
+        frozen = {'timestamp': NOW, 'fundamentals': {'NVDA': old}, 'evidence': old}
+        self.store.put('review_attempt', key, frozen, immutable=True)
+        before = len(model.calls)
+        result = review_plan(self.store, plan, model, event_id='historical-trigger', evidence=old, now=NOW)
+        self.assertTrue(result['deduplicated'])
+        self.assertEqual(len(model.calls), before)
+        self.assertEqual(self.store.get('plan', plan['id']), plan)
+        self.assertEqual(self.store.get('review_attempt', key), frozen)
+
+    def test_held_same_facts_keep_independent_invalidation_without_duplicate_compilation(self):
+        data, _ = self.primary()
+        plan = self.ingest(IndependentModel(), data)
+        self.store.put('fundamental_cache', 'NVDA', {'data': data})
+        self.store.put('reported_holding', 'held', {'symbol': 'NVDA', 'account': 'real',
+            'reported_at': NOW, 'reported_market_value': '10'})
+        calls, contexts = [], []
+        class Risk:
+            def run(self, purpose, payload, **kwargs):
+                calls.append(purpose)
+                contexts.append(payload['current_research_context'])
+                if purpose == 'event_review':
+                    return {'assessment': {'triggered': True, 'condition': 'cashflow_failed',
+                        'evidence_refs': payload['new_evidence_refs'], 'rationale': 'Current original disclosure demonstrates failure'}}
+                return {'accepted': True, 'condition': 'cashflow_failed',
+                    'evidence_refs': payload['assessment']['evidence_refs'], 'issues': []}
+        result = review_plan(self.store, plan, Risk(), event_id='held-current-facts', evidence={'fundamentals': {'NVDA': data}}, now=NOW)
+        self.assertEqual(calls, ['event_review', 'verify_invalidation'])
+        self.assertEqual(contexts[0], contexts[1])
+        self.assertEqual(result['status'], 'invalidated')
+        self.assertEqual(len(self.store.items('plan_revision')), 1)
+
+    def test_stale_held_trigger_risk_context_contains_current_issuer_evidence_and_does_not_restore_old_report(self):
+        data, ref = self.primary()
+        model = IndependentModel()
+        plan = self.ingest(model, data)
+        self.store.put('fundamental_cache', 'NVDA', {'data': data})
+        self.store.put('reported_holding', 'held', {'symbol': 'NVDA', 'account': 'real', 'reported_at': NOW})
+        old = {'financial_report': {'period': '2024'}}
+        before = len(model.calls)
+        result = review_plan(self.store, plan, model, event_id='stale-held', evidence=old, now=NOW)
+        self.assertEqual(model.calls[before:], ['event_review'])
+        payload = model.payloads[-1][1]
+        context = payload['current_research_context']
+        self.assertFalse(context['original_trigger_is_current'])
+        self.assertIn(ref, context['current_evidence_bundle']['evidence_ids'])
+        self.assertEqual(payload['new_evidence'], old)
+        self.assertTrue(result['risk_review_only'])
+        self.assertEqual(self.store.get('plan', plan['id']), plan)
+        raw = self.store.items('review_event_evidence')[0][1]
+        self.assertEqual(raw['raw_evidence'], old)
+        self.assertEqual(raw['current_research_context'], context)
 
     def test_complete_etf_nav_scenario_is_independently_reviewed_and_split_deadline_sealed(self):
         data, _ = self.primary('SOXX', etf=True)
@@ -250,6 +328,81 @@ class EvidenceContractTests(unittest.TestCase):
             _run(model, 'compile_plan', {'symbol': 'NVDA', 'source': snapshot, 'fundamentals': new}, store=self.store)
         self.assertEqual(len(calls), 1)
         self.assertEqual(_stable_fundamentals(old), _stable_fundamentals(new))
+
+    def test_calculator_changes_only_disclosed_arithmetic_and_exact_unambiguous_tp(self):
+        plan = {'entry': {'low': '90'}, 'stop': {'price': '80'}, 'targets': [
+            {'scenario': 'base', 'method': 'eps_multiple', 'price': '609', 'assumptions': {'eps': '10.5', 'multiple': '40'}},
+            {'scenario': 'bear', 'method': 'eps_multiple', 'price': '434', 'assumptions': {'eps': '8', 'multiple': '30'}}],
+            'take_profit': [{'price': '609', 'fraction': '.5'}, {'price': '600', 'fraction': '.5'}]}
+        raw = copy.deepcopy(plan)
+        calculated, provenance = _calculate_target_prices(plan)
+        self.assertEqual(plan, raw)
+        self.assertEqual([t['price'] for t in calculated['targets']], ['420.00', '240.00'])
+        self.assertEqual([t['price'] for t in calculated['take_profit']], ['420.00', '600'])
+        self.assertEqual(calculated['entry'], raw['entry'])
+        self.assertEqual(calculated['stop'], raw['stop'])
+        self.assertEqual(provenance['proposal_hash'], stable_id(raw))
+        raw['targets'][1]['price'] = '609'
+        ambiguous, _ = _calculate_target_prices(raw)
+        self.assertEqual(ambiguous['take_profit'][0]['price'], '609')
+
+    def test_legacy_etf_arithmetic_reuses_completed_proposal_only_one_new_independent_review(self):
+        data, _ = self.primary('SOXX', etf=True)
+        class BadETF(IndependentModel):
+            def run(self, purpose, payload, **kwargs):
+                result = super().run(purpose, payload, **kwargs)
+                if purpose == 'compile_plan':
+                    result['plan']['targets'][0]['price'] = '609'
+                    result['plan']['targets'][1]['price'] = '434'
+                    result['plan']['take_profit'][0]['price'] = '609'
+                if purpose == 'review_plan':
+                    valid = payload['plan']['targets'][0]['price'] == '121.00'
+                    result.update(accepted=valid, issues=[] if valid else ['Authored target arithmetic does not reproduce inputs'])
+                    if valid:
+                        self.assert_clean = 'review_issues' not in payload['plan'] and 'review_evidence_id' not in payload['plan']
+                return result
+        model = BadETF('SOXX')
+        def old_keys(*parts):
+            parts = list(parts)
+            if len(parts) > 1 and parts[1] == 'workflow-v6-calculator-v1':
+                parts[1] = 'workflow-v5-evidence-repair'
+            return stable_id(*parts)
+        def no_old_calculator(proposal):
+            return copy.deepcopy(proposal), {'contract': 'pre-calculator-fixture', 'targets': []}
+        with patch('rhino_invest.research._calculate_target_prices', no_old_calculator), patch('rhino_invest.research.stable_id', old_keys):
+            old = self.ingest(model, data)
+        self.assertEqual(old['status'], 'needs_review')
+        before, old_hash = len(model.calls), plan_fingerprint(old)
+        fixed = self.ingest(model, data)
+        self.assertEqual(model.calls[before:], ['review_plan'])
+        self.assertEqual(fixed['status'], 'active', fixed['review_issues'])
+        self.assertTrue(model.assert_clean)
+        self.assertEqual(fixed['targets'][0]['price'], '121.00')
+        self.assertEqual(fixed['take_profit'][0]['price'], '121.00')
+        self.assertTrue(fixed['calculation_provenance']['reused_completed_proposal'])
+        binding = self.store.get('research_plan_review', fixed['review_evidence_id'])
+        self.assertEqual(binding['plan_hash'], plan_fingerprint(fixed))
+        self.assertEqual(self.store.get('plan_revision', stable_id(old['id'], old['revision']))['calculation_provenance'], old['calculation_provenance'])
+        self.assertEqual(plan_fingerprint(old), old_hash)
+        self.ingest(model, data, '2026-10-24T15:00:00+00:00')
+        self.assertEqual(len(model.calls), before + 1)
+
+    def test_conditional_research_can_pass_without_becoming_an_actionable_plan(self):
+        data, _ = self.primary()
+        class Conditional(IndependentModel):
+            def run(self, purpose, payload, **kwargs):
+                result = super().run(purpose, payload, **kwargs)
+                if purpose == 'compile_plan':
+                    result['plan']['entry'].update(low=None, high=None, conditions=['Issuer confirms the modeled margin improvement'])
+                    result['plan']['conditions_parsed'] = False
+                return result
+        plan = self.ingest(Conditional(), data)
+        self.assertEqual(plan['status'], 'needs_review')
+        self.assertEqual(plan['research_assessment']['status'], 'approved_conditional')
+        self.assertTrue(self.store.get('research_plan_review', plan['review_evidence_id'])['accepted'])
+        self.assertTrue(all(not gap['blocking'] for gap in plan['research_gaps']))
+        rejected = self.ingest(Conditional(reject=True), dict(data, new_fact='changed'))
+        self.assertEqual(rejected['research_assessment']['status'], 'needs_evidence')
 
 
 if __name__ == '__main__':

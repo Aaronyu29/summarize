@@ -152,3 +152,35 @@ def validate_plan(plan) -> list[str]:
     if plan.get("conditions_parsed") is False:
         errors.append("entry conditions are unparsed")
     return errors
+
+
+def classify_plan_validation(plan) -> dict[str, list[str]]:
+    """Separate a conditional valuation's entry gaps from research defects.
+
+    This does not approve a plan or certify that a condition is satisfied.
+    ``validate_plan`` remains the unchanged, strict execution contract. Only
+    an independently valued thesis with explicit conditions may await a price
+    band or a future fundamental event; wrong numbers and all other defects
+    still require research correction and independent review.
+    """
+    errors = validate_plan(plan)
+    entry = plan.get("entry") if isinstance(plan, dict) else None
+    entry = entry if isinstance(entry, dict) else {}
+    conditions = entry.get("conditions")
+    conditional = (entry.get("basis") == "independent_valuation"
+        and isinstance(conditions, list) and bool(conditions)
+        and all(isinstance(value, str) and value.strip() for value in conditions))
+    deferred = set()
+    if conditional:
+        if plan.get("conditions_parsed") is False:
+            deferred.add("entry conditions are unparsed")
+        for field in ("low", "high"):
+            if entry.get(field) is None:
+                deferred.add(f"entry.{field} must be positive")
+    return {"research_errors": [error for error in errors if error not in deferred],
+            "execution_gaps": [error for error in errors if error in deferred]}
+
+
+def validate_research_plan(plan) -> list[str]:
+    """Research-only validation; never substitute this for execution checks."""
+    return classify_plan_validation(plan)["research_errors"]

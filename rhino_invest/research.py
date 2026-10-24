@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from datetime import timedelta, datetime, timezone
 from decimal import Decimal, localcontext, InvalidOperation
-from .common import utc_now, stable_id, validate_plan, decimal_value, parse_time
+from .common import utc_now, stable_id, validate_research_plan, classify_plan_validation, decimal_value, parse_time
 from .market import symbol_value, instrument_contract, normalize_fundamentals
 
 
@@ -219,6 +219,13 @@ check fiscal end dates and non-operating gains; never infer a split from a P/E d
 Put only blocking research/plan objections in issues; execution-only gaps go in notes.
 For ETF method check issuer NAV/current PE alignment, freshness, holdings/fees,
 corporate actions, years and exact formula. Never apply operating-company EPS to a fund.
+The permitted ETF authored scenario uses E0=NAV/current_PE as an implied portfolio
+earnings-per-ETF-share proxy, NOT reported company EPS. E_future=E0*(1+growth)^years,
+target=E_future*exit_PE, algebraically NAV*(1+growth)^years*(exit_PE/current_PE).
+Growth is an explicit portfolio per-share earnings scenario assumption, not an issuer
+forecast or a claim that NAV itself is earnings. Check its rationale and fee treatment.
+calculation_provenance records deterministic arithmetic only: independently judge all
+inputs, source units and economic reasoning. Correct calculation never mandates acceptance.
 Read supplied original images, not just frame metadata. Verify EPS growth arithmetic,
 forecast fiscal years versus holding horizon, exact entry-zone bounds/conditions and
 stop-edge attribution. Review the supplied policy dates and authoritative per-buy amount.
@@ -369,7 +376,7 @@ def _model_plan(plan):
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
         'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
-        'research_assessment', 'execution_requirements')
+        'research_assessment', 'execution_requirements', 'calculation_provenance')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -515,7 +522,7 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                 continue
             if target['method'] != 'eps_multiple' or not isinstance(assumptions, dict):
                 raise ValueError('Unsupported target method')
-            if decimal_value(assumptions['eps']) * decimal_value(assumptions['multiple']) != decimal_value(target['price']):
+            if abs(decimal_value(assumptions['eps']) * decimal_value(assumptions['multiple']) - decimal_value(target['price'])) > Decimal('.01'):
                 raise ValueError('Target arithmetic mismatch')
             if assumptions.get('currency') != plan.get('currency') or assumptions.get('price_unit') != plan.get('price_unit'):
                 raise ValueError('Target unit/currency mismatch')
@@ -540,7 +547,7 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
     for key in ('currency', 'price_unit'):
         if metadata.get(key) and plan.get(key) != metadata[key]:
             issues.append('Plan ' + key + ' differs from reviewed instrument identity')
-    issues.extend(validate_plan(plan))
+    issues.extend(validate_research_plan(plan))
     return list(dict.fromkeys(issues))
 
 
@@ -911,6 +918,69 @@ def _validate_etf_target(target, plan, fundamentals, known):
             raise ValueError('Unknown ETF scenario evidence references')
 
 
+CALCULATION_CONTRACT = 'scenario-price-decimal-v1'
+
+
+def _calculate_target_prices(proposal):
+    """Calculate disclosed formulas only; never select or repair assumptions."""
+    plan = json.loads(json.dumps(proposal))
+    rows, mappings = [], {}
+    for index, target in enumerate(plan.get('targets') or []):
+        if not isinstance(target, dict):
+            continue
+        assumptions = target.get('assumptions') or {}
+        try:
+            with localcontext() as precision:
+                precision.prec = 40
+                if target.get('method') == 'eps_multiple':
+                    eps, multiple = decimal_value(assumptions['eps']), decimal_value(assumptions['multiple'])
+                    if eps <= 0 or multiple <= 0:
+                        continue
+                    price = eps * multiple
+                    formula = 'eps * multiple'
+                elif target.get('method') == 'etf_nav_scenario':
+                    nav, pe = decimal_value(assumptions['nav_per_share']), decimal_value(assumptions['current_pe'])
+                    growth, exit_pe = decimal_value(assumptions['annual_earnings_growth']), decimal_value(assumptions['exit_pe'])
+                    years = decimal_value(assumptions['years'])
+                    if (nav <= 0 or pe <= 0 or exit_pe <= 0 or growth <= -1 or not 1 <= years <= 3
+                            or abs(years - decimal_value(target['horizon_months']) / 12) > Decimal('.000001')):
+                        continue
+                    price = nav * (1 + growth) ** years * exit_pe / pe
+                    formula = '(nav_per_share / current_pe) * (1 + annual_earnings_growth) ** years * exit_pe'
+                else:
+                    continue
+                corrected = str(price.quantize(Decimal('.01')))
+            original = target.get('price')
+            try:
+                old = decimal_value(original)
+                changed = abs(old - decimal_value(corrected)) > Decimal('.005')
+                mappings.setdefault(old, set()).add(corrected)
+            except ValueError:
+                changed = True
+            target['price'] = corrected
+            rows.append({'index': index, 'scenario': target.get('scenario'), 'method': target['method'],
+                'formula': formula, 'inputs': assumptions, 'original_price': original,
+                'calculated_price': corrected, 'changed': changed})
+        except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
+            continue  # Missing/invalid inputs remain defects for independent review.
+    profit_changes = []
+    for index, step in enumerate(plan.get('take_profit') or []):
+        if not isinstance(step, dict):
+            continue
+        try:
+            matches = mappings.get(decimal_value(step.get('price')), set())
+            if len(matches) == 1:
+                replacement = next(iter(matches))
+                if decimal_value(replacement) != decimal_value(step['price']):
+                    profit_changes.append({'index': index, 'original_price': step['price'], 'calculated_price': replacement})
+                    step['price'] = replacement
+        except (ValueError, TypeError):
+            pass
+    return plan, {'contract': CALCULATION_CONTRACT, 'rounding': 'USD cents; Decimal precision 40, half-even',
+        'proposal_hash': stable_id(proposal), 'targets': rows, 'take_profit_exact_target_mappings': profit_changes,
+        'inputs_selected_by_calculator': False, 'entry_and_stop_modified': False}
+
+
 def _price_basis_deadline(fundamentals, moment, refs, store=None):
     from zoneinfo import ZoneInfo
     etf = fundamentals.get('etf_valuation') or {}
@@ -1057,10 +1127,22 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
         operation_key = stable_id('plan-operation-v4-evidence-repair', snapshot['id'], symbol, fid,
                                   _model_cache_identity(model), event_context)
+        calculation_seed = None
+        source_operation_key = operation_key
         committed = store.get('plan_operation', operation_key)
         if committed:
-            plans.append(committed['plan'])
-            continue
+            _, preview = _calculate_target_prices(committed['plan'])
+            if (committed['plan'].get('status') == 'needs_review'
+                    and any(row['changed'] for row in preview['targets'])):
+                calculation_seed = committed['plan']
+                operation_key = stable_id(source_operation_key, CALCULATION_CONTRACT)
+                completed_calculation = store.get('plan_operation', operation_key)
+                if completed_calculation:
+                    plans.append(completed_calculation['plan'])
+                    continue
+            else:
+                plans.append(committed['plan'])
+                continue
         attempt = store.get('plan_attempt', operation_key)
         if not attempt:
             attempt = {'timestamp': moment, 'revision': previous['revision'] + 1 if previous else 1}
@@ -1145,9 +1227,21 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             proposed.update(currency=fundamental['instrument_contract'].get('quote_currency'),
                 price_unit=fundamental['instrument_contract'].get('quote_price_unit'),
                 is_adr=False, evidence_refs=[snapshot['id'], fid], targets=[], take_profit=[])
+        elif calculation_seed is not None:
+            # Reuse economic inputs, never old reviewer state/verification.
+            proposed = {key: calculation_seed[key] for key in COMPILE_TEMPLATE['plan'] if key in calculation_seed}
         else:
             proposed = _run(model, 'compile_plan', payload, frames=original_frames, now=plan_moment, store=store).get('plan', {})
-        plan = dict(proposed)
+        plan, calculation = _calculate_target_prices(proposed)
+        for field in ('review_issues', 'review_evidence_id', 'research_gaps', 'research_assessment', 'execution_requirements'):
+            plan.pop(field, None)
+        calculation['source_operation_id'] = source_operation_key
+        if calculation_seed:
+            calculation['original_review_evidence_id'] = calculation_seed.get('review_evidence_id')
+            calculation['reused_completed_proposal'] = True
+        calculation_id = stable_id('plan-calculation', calculation)
+        store.put('plan_calculation', calculation_id, dict(calculation, id=calculation_id), immutable=True)
+        plan['calculation_provenance'] = dict(calculation, id=calculation_id)
         # Another source can commit while this attempt is waiting for usable
         # output. Keep economic input/as_of frozen, but let the independent
         # reviewer see the actual final revision before sealing any new plan.
@@ -1185,10 +1279,14 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
         if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
             issues.append('No individually verified source levels')
-        plan['status'] = 'active' if not issues else 'needs_review'
+        execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
+        plan['status'] = 'active' if not issues and not execution_gaps else 'needs_review'
         plan['review_issues'] = issues
         plan['research_gaps'] = _typed_research_gaps(issues, review, evidence_ids)
-        plan['research_assessment'] = {'status': 'approved' if not issues else 'needs_evidence',
+        plan['research_gaps'].extend({'code': 'ENTRY_CONDITION_PENDING', 'scope': 'execution', 'blocking': False,
+            'detail': detail, 'required_evidence': ['Resolved entry conditions and price band'], 'evidence_refs': []}
+            for detail in execution_gaps)
+        plan['research_assessment'] = {'status': 'needs_evidence' if issues else 'approved_conditional' if execution_gaps else 'approved',
             'evidence_bundle_hash': bundle['hash'], 'evidence_generation': fid,
             'repair_status': 'awaiting_new_evidence' if issues else 'reviewed_new_evidence' if repair_feedback else 'initial_review'}
         plan['execution_requirements'] = ['Fresh official execution quote', 'Reconciled account cash/holdings/fees',
@@ -1259,7 +1357,7 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 continue
             identities = {key: value['id'] for key, value in store.items('instrument_identity')}
             supplements = {key: value['id'] for key, value in store.items('research_supplement_current')}
-            workflow_id = stable_id(snapshot['id'], 'workflow-v5-evidence-repair', sorted(symbols or []),
+            workflow_id = stable_id(snapshot['id'], 'workflow-v6-calculator-v1', sorted(symbols or []),
                 _stable_fundamentals(fundamentals or {}), identities, supplements, _model_cache_identity(model))
             completed = store.get('research_workflow', workflow_id)
             if model is None or completed:
@@ -1322,11 +1420,15 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
     if cached:
         return cached
     moment = now or utc_now()
+    financial_event = (isinstance(evidence, dict)
+        and ('financial_report' in evidence or 'fundamentals' in evidence))
     attempt = store.get('review_attempt', key)
     if not attempt:
         prior_fundamental = store.get('fundamental_evidence', plan.get('fundamental_evidence_id', '')) or {}
         latest = store.get('fundamental_cache', plan['symbol']) or {}
-        if (evidence or {}).get('fundamentals'):
+        if financial_event and latest.get('data'):
+            data = {plan['symbol']: latest['data']}
+        elif (evidence or {}).get('fundamentals'):
             data = evidence['fundamentals']
         elif isinstance(evidence, dict) and 'financial_report' in evidence:
             data = {plan['symbol']: evidence}
@@ -1335,12 +1437,31 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
         attempt = {'timestamp': moment, 'fundamentals': data, 'evidence': evidence}
         store.put('review_attempt', key, attempt, immutable=True)
     moment, evidence, data = attempt['timestamp'], attempt['evidence'], attempt['fundamentals']
-    # Ingestion has already independently reviewed these exact new facts. A
-    # failed initial plan without any holding is awaiting NEW evidence, not a
-    # reason to buy another event-review/compile pair for the same package.
-    financial_event = (isinstance(evidence, dict)
-        and ('financial_report' in evidence or 'fundamentals' in evidence))
-    if plan.get('status') == 'needs_review' and financial_event:
+    already_reviewed = False
+    current_context = {}
+    if financial_event:
+        # An old queued trigger/attempt is historical evidence, not permission
+        # to replace a newer independently reviewed issuer package. Information
+        # receipt order selects the current cache; original dates remain intact.
+        latest = (store.get('fundamental_cache', plan['symbol']) or {}).get('data')
+        bound = (store.get('fundamental_evidence', plan.get('fundamental_evidence_id', '')) or {}).get('data')
+        selected = latest or data.get(plan['symbol']) or bound or {}
+        data = {plan['symbol']: selected}
+        current, _ = _research_fundamental(store, plan['symbol'], selected)
+        fid = stable_id('fundamentals', _stable_fundamentals(current))
+        if not store.get('fundamental_evidence', fid):
+            store.put('fundamental_evidence', fid, {'id': fid, 'data': current,
+                'first_observed_at': now or utc_now()}, immutable=True)
+        same_facts = fid == plan.get('fundamental_evidence_id')
+        binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
+        already_reviewed = same_facts and binding.get('plan_hash') == plan_fingerprint(plan)
+        original = (evidence.get('fundamentals') or {}).get(plan['symbol']) if evidence.get('fundamentals') else evidence
+        original, _ = _research_fundamental(store, plan['symbol'], original)
+        current_refs = [fid] + sorted(ref for ref in _nested_refs(current) if store.get('external_evidence', ref))
+        current_context = {'current_fundamentals': current,
+            'current_evidence_bundle': _evidence_bundle(store, current_refs, fid),
+            'original_trigger_is_current': _logical_fundamentals(original) == _logical_fundamentals(current),
+            'instruction': 'Original trigger is historical audit material. Evaluate risk using current dated primary facts; never restore older fundamentals or treat a prior review opinion as fact.'}
         from .ledger import portfolio
         from .reporting import reported_holdings
         held = any(item.get('symbol') == plan['symbol'] for item in reported_holdings(store, now=moment))
@@ -1348,17 +1469,19 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
             state = portfolio(store, account, now=moment)
             positions = (state.get('positions') or []) + (state.get('reported_holdings') or [])
             held = held or any(item.get('symbol') == plan['symbol'] for item in positions)
-        current, _ = _research_fundamental(store, plan['symbol'], data.get(plan['symbol']))
-        same_facts = stable_id('fundamentals', _stable_fundamentals(current)) == plan.get('fundamental_evidence_id')
-        binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
-        if not held and same_facts and binding.get('plan_hash') == plan_fingerprint(plan):
+        if not held and already_reviewed:
             record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
-                'review': {'accepted': False, 'issues': plan.get('review_issues', [])},
-                'revised_plan': None, 'status': 'needs_review', 'deduplicated': True,
+                'review': {'accepted': binding.get('accepted') is True, 'issues': plan.get('review_issues', [])},
+                'revised_plan': None, 'status': plan['status'], 'deduplicated': True,
+                'original_trigger_preserved_in': key, 'current_fundamental_evidence_id': fid,
                 'reason': 'ALREADY_INDEPENDENTLY_REVIEWED_SAME_EVIDENCE'}
             store.put('plan_review', key, record, immutable=True)
             return record
     raw = {'event_id': event_id, 'symbol': plan['symbol'], 'timestamp': moment, 'raw_evidence': evidence}
+    if current_context:
+        # Bind the actual current facts seen by both risk reviewers, as well as
+        # the historical trigger; raw_id must not refer to the old report alone.
+        raw['current_research_context'] = current_context
     raw_id = stable_id('review-event-evidence', raw)
     store.put('review_event_evidence', raw_id, dict(raw, id=raw_id), immutable=True)
     snapshot = store.get('research_evidence', plan.get('research_snapshot_id', ''))
@@ -1371,12 +1494,14 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
         store.put('plan_review', key, record, immutable=True)
         return record
     result = _run(model, 'event_review', {'instruction': EVENT_REVIEW, 'plan': plan,
-        'event_id': event_id, 'new_evidence': evidence, 'new_evidence_refs': [raw_id]}, now=moment)
+        'event_id': event_id, 'new_evidence': evidence, 'new_evidence_refs': [raw_id],
+        'current_research_context': current_context}, now=moment)
     assessment = result.get('assessment') or {}
     if assessment.get('triggered') is True:
         independent = _run(model, 'verify_invalidation', {'instruction': VERIFY_INVALIDATION,
             'plan': plan, 'event_id': event_id, 'assessment': assessment,
-            'new_evidence': evidence, 'new_evidence_refs': [raw_id]}, now=moment)
+            'new_evidence': evidence, 'new_evidence_refs': [raw_id],
+            'current_research_context': current_context}, now=moment)
         if independent.get('accepted') is True:
             from .decisions import record_thesis_risk
             risk = record_thesis_risk(store, plan, assessment, independent, now=moment)
@@ -1394,6 +1519,13 @@ def review_plan(store, plan, model, *, event_id, evidence=None, now=None):
                     'review': result, 'risk_evidence_id': risk['id'], 'revised_plan': None, 'status': 'invalidated'}
                 store.put('plan_review', key, record, immutable=True)
             return record
+    if financial_event and already_reviewed:
+        record = {'id': key, 'timestamp': moment, 'plan_id': plan['id'], 'event_id': event_id,
+            'review': result, 'revised_plan': None, 'status': plan['status'], 'risk_review_only': True,
+            'deduplicated': True, 'current_fundamental_evidence_id': fid,
+            'reason': 'ALREADY_INDEPENDENTLY_REVIEWED_SAME_EVIDENCE'}
+        store.put('plan_review', key, record, immutable=True)
+        return record
     revised = None
     if snapshot:
         levels = [v for _, v in store.items('research_level') if snapshot['id'] in v.get('evidence_refs', [])
