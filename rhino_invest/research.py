@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import calendar
 import hashlib
+import itertools
 import json
 import re
 import sqlite3
@@ -815,6 +816,50 @@ def _evidence_bundle(store, refs, fundamental_id):
     return bundle
 
 
+def _operation_evidence_bundle(store, operation_key, refs, fundamental_id):
+    """Freeze request ordering; reconcile legacy order only by its exact sealed hash."""
+    frozen = store.get('plan_evidence_order', operation_key)
+    repair = store.get('research_repair', operation_key) or {}
+    if frozen:
+        if (set(refs) != set(frozen['evidence_ids'])
+                or fundamental_id != frozen['fundamental_evidence_id']):
+            raise ValueError('Frozen plan evidence membership changed')
+        bundle = _evidence_bundle(store, frozen['evidence_ids'], fundamental_id)
+        if bundle['hash'] != frozen['bundle_hash']:
+            raise ValueError('Frozen plan evidence content changed')
+    else:
+        bundle = _evidence_bundle(store, refs, fundamental_id)
+        expected = repair.get('evidence_bundle_hash')
+        if expected and bundle['hash'] != expected:
+            # Legacy nested references came from a set, whose order varies by process.
+            # Keep every other field/position intact and require the exact historic hash.
+            external = {item['id'] for item in bundle['artifacts'] if item['kind'] == 'external_evidence'}
+            if len(external) > 6:
+                raise ValueError('Legacy evidence order requires explicit reconciliation')
+            positions = [index for index, ref in enumerate(refs) if ref in external]
+            artifacts = {item['id']: item for item in bundle['artifacts']}
+            matched = None
+            for order in itertools.permutations(sorted(external)):
+                ordered = list(refs)
+                for index, ref in zip(positions, order):
+                    ordered[index] = ref
+                candidate = {key: value for key, value in bundle.items() if key != 'hash'}
+                candidate.update(evidence_ids=ordered, artifacts=[artifacts[ref] for ref in ordered if ref in artifacts])
+                digest = stable_id(candidate)
+                if digest == expected:
+                    matched = dict(candidate, hash=digest)
+                    break
+            if matched is None:
+                raise ValueError('Legacy evidence content differs from its sealed hash')
+            bundle = matched
+        store.put('plan_evidence_order', operation_key, {
+            'evidence_ids': bundle['evidence_ids'], 'fundamental_evidence_id': fundamental_id,
+            'bundle_hash': bundle['hash']}, immutable=True)
+    if repair.get('evidence_bundle_hash', bundle['hash']) != bundle['hash']:
+        raise ValueError('Frozen evidence differs from the original repair record')
+    return bundle
+
+
 def _typed_research_gaps(issues, review, refs):
     raw = review.get('issues') if isinstance(review.get('issues'), list) else []
     structured = {json.dumps(item, sort_keys=True, ensure_ascii=False, separators=(',', ':')): item
@@ -1336,12 +1381,15 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         evidence_ids = [snapshot['id'], fid] + [l['id'] for l in levels if l.get('symbol') == symbol and l.get('verified')]
         if identity:
             evidence_ids.extend(ref for ref in identity.get('evidence_refs', []) if store.get('external_evidence', ref))
-        evidence_ids.extend(ref for ref in _nested_refs(fundamental) if store.get('external_evidence', ref))
+        evidence_ids.extend(ref for ref in sorted(_nested_refs(fundamental)) if store.get('external_evidence', ref))
         evidence_ids.extend(item['id'] for item in fundamental.get('primary_evidence', [])
             if isinstance(item, dict) and store.get('external_evidence', item.get('id', '')))
         evidence_ids = list(dict.fromkeys(evidence_ids))
-        bundle = _evidence_bundle(store, evidence_ids, fid)
-        symbol_levels = [l for l in levels if l.get('symbol') == symbol and l.get('verified') is True]
+        bundle = _operation_evidence_bundle(store, operation_key, evidence_ids, fid)
+        evidence_ids = bundle['evidence_ids']
+        evidence_order = {ref: index for index, ref in enumerate(evidence_ids)}
+        symbol_levels = sorted((l for l in levels if l.get('symbol') == symbol and l.get('verified') is True),
+            key=lambda level: evidence_order[level['id']])
         chart_limit_note = None
         try:
             original_frames = _plan_frames(snapshot, symbol_levels)
@@ -1472,12 +1520,23 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         # Another source can commit while this attempt is waiting for usable
         # output. Keep economic input/as_of frozen, but let the independent
         # reviewer see the actual final revision before sealing any new plan.
-        current_revision = (store.get('plan', plan_id) or {}).get('revision', 0)
-        revision = max(attempt['revision'], current_revision + 1)
-        assignment_key = stable_id('plan-revision-assignment', operation_key, revision)
-        store.put('plan_revision_assignment', assignment_key, {'operation_id': operation_key, 'plan_id': plan_id,
-            'attempt_revision': attempt['revision'], 'prior_revision': current_revision, 'revision': revision,
-            'analysis_as_of': plan_moment, 'economic_input_hash': stable_id(payload)}, immutable=True)
+        checkpoint = store.get('research_critique_review_input', operation_key) if critique else None
+        if checkpoint:
+            if (stable_id(checkpoint['payload']) != checkpoint['payload_hash']
+                    or checkpoint['payload']['evidence_bundle']['hash'] != bundle['hash']):
+                raise ValueError('Frozen independent review input changed')
+            revision = checkpoint['payload']['plan']['revision']
+            assigned = store.get('plan_revision_assignment', stable_id('plan-revision-assignment', operation_key, revision))
+            if (not assigned or assigned['operation_id'] != operation_key or assigned['plan_id'] != plan_id
+                    or assigned['revision'] != revision or assigned['analysis_as_of'] != plan_moment):
+                raise ValueError('Frozen independent review revision assignment missing or changed')
+        else:
+            current_revision = (store.get('plan', plan_id) or {}).get('revision', 0)
+            revision = max(attempt['revision'], current_revision + 1)
+            assignment_key = stable_id('plan-revision-assignment', operation_key, revision)
+            store.put('plan_revision_assignment', assignment_key, {'operation_id': operation_key, 'plan_id': plan_id,
+                'attempt_revision': attempt['revision'], 'prior_revision': current_revision, 'revision': revision,
+                'analysis_as_of': plan_moment, 'economic_input_hash': stable_id(payload)}, immutable=True)
         plan.update(symbol=symbol, id=plan_id,
             revision=revision, created_at=plan_moment, status='needs_review', source_published_at=published_at)
         if holding_source:
@@ -1506,7 +1565,6 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             review_payload['instruction'] = critique['review_instruction']
             review_payload['critique_context'] = {'id': critique['id'], 'prior_issues_are_opinions': True,
                 'blocking_review_issues': critique['blocking_review_issues']}
-            checkpoint = store.get('research_critique_review_input', operation_key)
             if checkpoint:
                 review_payload = checkpoint['payload']
                 plan = json.loads(json.dumps(review_payload['plan']))
