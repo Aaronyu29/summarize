@@ -15,6 +15,16 @@ from tests_invest import test_research_critique as critique
 from tests_invest.test_research import NOW
 
 
+class TwoLevelModel(critique.CritiqueModel):
+    def run(self, purpose, payload, **kwargs):
+        result = super().run(purpose, payload, **kwargs)
+        if purpose == 'extract_levels':
+            result['levels'].append(dict(result['levels'][0], low='80', high='85'))
+        if purpose == 'verify_levels':
+            result['checks'].append({'index': 1, 'verified': True, 'issues': []})
+        return result
+
+
 class EvidenceOrderTests(unittest.TestCase):
     def setUp(self):
         self.store = Store(':memory:')
@@ -52,6 +62,26 @@ with Store(sys.argv[1]) as store:
         self.assertEqual(self.store.get('research_repair', 'op'), record)
         self.assertEqual(_operation_evidence_bundle(self.store, 'op', ['a', 'b'], 'fid'), old)
 
+    def test_legacy_level_and_external_order_changes_recover_complete_original_bundle(self):
+        for ref in ('level-a', 'level-b'):
+            self.store.put('research_level', ref, {'id': ref, 'verified': True}, immutable=True)
+        old = _evidence_bundle(self.store, ['level-b', 'level-a', 'b', 'a'], 'fid')
+        record = {'evidence_bundle_hash': old['hash']}
+        self.store.put('research_repair', 'legacy-levels', record, immutable=True)
+        restored = _operation_evidence_bundle(self.store, 'legacy-levels', ['level-a', 'level-b', 'a', 'b'], 'fid')
+        self.assertEqual(restored, old)
+        self.assertEqual(self.store.get('research_repair', 'legacy-levels'), record)
+
+    def test_large_legacy_level_set_uses_original_extraction_order_without_factorial_search(self):
+        refs = ['level-'+str(index) for index in range(9)]
+        for ref in refs:
+            self.store.put('research_level', ref, {'id': ref}, immutable=True)
+        original = refs[2:] + refs[:2]
+        self.store.put('research_extraction', 'source', {'levels': [{'id': ref} for ref in original]}, immutable=True)
+        old = _evidence_bundle(self.store, original + ['b', 'a'], 'fid')
+        self.store.put('research_repair', 'large', {'evidence_bundle_hash': old['hash']}, immutable=True)
+        self.assertEqual(_operation_evidence_bundle(self.store, 'large', refs + ['a','b'], 'fid'), old)
+
     def test_real_content_or_membership_change_never_becomes_order_repair(self):
         _operation_evidence_bundle(self.store, 'op', ['a', 'b'], 'fid')
         with self.assertRaisesRegex(ValueError, 'membership'):
@@ -88,7 +118,9 @@ class LegacyResearchResumeTests(unittest.TestCase):
     def old_order(store, operation, refs, fid):
         external = [ref for ref in refs if store.get('external_evidence', ref)]
         rest = [ref for ref in refs if ref not in external]
-        return _evidence_bundle(store, rest + sorted(external, reverse=True), fid)
+        levels = [ref for ref in rest if store.get('research_level', ref)]
+        fixed = [ref for ref in rest if ref not in levels]
+        return _evidence_bundle(store, fixed + sorted(levels, reverse=True) + sorted(external, reverse=True), fid)
 
     def test_budget_resume_restores_legacy_request_and_does_not_repay_completed_phases(self):
         data, calls, clock = self.data_with_two_sources(), [], [NOW]
@@ -123,16 +155,8 @@ class LegacyResearchResumeTests(unittest.TestCase):
         self.assertEqual(len(calls), 5)
 
     def test_cached_compile_survives_reversed_level_order_without_repeat_charge(self):
-        class TwoLevels(critique.CritiqueModel):
-            def run(self, purpose, payload, **kwargs):
-                result = super().run(purpose, payload, **kwargs)
-                if purpose == 'extract_levels':
-                    result['levels'].append(dict(result['levels'][0], low='80', high='85'))
-                if purpose == 'verify_levels':
-                    result['checks'].append({'index': 1, 'verified': True, 'issues': []})
-                return result
         data, calls = self.data_with_two_sources(), []
-        transport = self.provider(TwoLevels(), calls)
+        transport = self.provider(TwoLevelModel(), calls)
         first = self.ingest(self.gateway(transport, daily=3), data)
         self.assertEqual(first['errors'][0]['error'], 'ModelBudgetExceeded')
         levels = [value for _, value in self.store.items('research_level')]
@@ -143,6 +167,23 @@ class LegacyResearchResumeTests(unittest.TestCase):
         self.assertEqual(len(plans), 1)
         self.assertEqual([purpose for purpose, _ in calls],
             ['extract_levels', 'verify_levels', 'compile_plan', 'review_plan'])
+
+    def test_legacy_completed_critique_draft_and_review_resume_with_multiple_reordered_levels(self):
+        data, calls, clock = self.data_with_two_sources(), [], [NOW]
+        transport = self.provider(TwoLevelModel(), calls)
+        with patch('rhino_invest.research._operation_evidence_bundle', side_effect=self.old_order):
+            self.ingest(self.gateway(transport, daily=5, clock=lambda: clock[0]), data)
+            result = self.ingest(self.gateway(transport, daily=5, clock=lambda: clock[0]), data)
+        self.assertEqual(result['errors'][0]['error'], 'ModelBudgetExceeded')
+        frozen = copy.deepcopy(self.store.items('research_critique_review_input'))
+        clock[0] = '2026-10-24T15:00:00+00:00'
+        model = self.gateway(transport, clock=lambda: clock[0])
+        result = self.ingest(model, data, clock[0])
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['plans'][0]['status'], 'active')
+        self.assertEqual(self.store.items('research_critique_review_input'), frozen)
+        self.ingest(model, data, clock[0])
+        self.assertEqual(len(calls), 6)
 
     def test_review_checkpoint_keeps_original_revision_assignment_before_reconstruction(self):
         data, calls, clock = self.data_with_two_sources(), [], [NOW]

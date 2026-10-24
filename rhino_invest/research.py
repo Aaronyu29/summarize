@@ -6,6 +6,7 @@ import calendar
 import hashlib
 import itertools
 import json
+import math
 import re
 import sqlite3
 from pathlib import Path
@@ -831,18 +832,37 @@ def _operation_evidence_bundle(store, operation_key, refs, fundamental_id):
         bundle = _evidence_bundle(store, refs, fundamental_id)
         expected = repair.get('evidence_bundle_hash')
         if expected and bundle['hash'] != expected:
-            # Legacy nested references came from a set, whose order varies by process.
-            # Keep every other field/position intact and require the exact historic hash.
+            # Legacy sets and fresh-extraction versus cached level lists had different orders.
+            # Prefer a frozen review, then known extraction orders, then bounded permutations.
             external = {item['id'] for item in bundle['artifacts'] if item['kind'] == 'external_evidence'}
+            level_refs = {item['id'] for item in bundle['artifacts'] if item['kind'] == 'research_level'}
             if len(external) > 6:
                 raise ValueError('Legacy evidence order requires explicit reconciliation')
             positions = [index for index, ref in enumerate(refs) if ref in external]
+            level_positions = [index for index, ref in enumerate(refs) if ref in level_refs]
             artifacts = {item['id']: item for item in bundle['artifacts']}
             matched = None
-            for order in itertools.permutations(sorted(external)):
-                ordered = list(refs)
-                for index, ref in zip(positions, order):
-                    ordered[index] = ref
+            checkpoint = store.get('research_critique_review_input', operation_key)
+            checkpoint_refs = ((checkpoint or {}).get('payload') or {}).get('evidence_ids')
+            direct_orders = [checkpoint_refs] if checkpoint_refs and set(checkpoint_refs) == set(refs) else []
+            level_orders = [tuple(ref for ref in refs if ref in level_refs), tuple(sorted(level_refs))]
+            for _, extraction in store.items('research_extraction'):
+                order = tuple(level['id'] for level in extraction['levels'] if level['id'] in level_refs)
+                if len(order) == len(level_refs) and set(order) == level_refs:
+                    level_orders.append(order)
+            if math.factorial(len(level_refs)) * math.factorial(len(external)) <= 4096:
+                level_orders.extend(itertools.permutations(sorted(level_refs)))
+            level_orders = list(dict.fromkeys(level_orders))
+            def candidates():
+                yield from direct_orders
+                for level_order in level_orders:
+                    for order in itertools.permutations(sorted(external)):
+                        ordered = list(refs)
+                        for slots, values in ((positions, order), (level_positions, level_order)):
+                            for index, ref in zip(slots, values):
+                                ordered[index] = ref
+                        yield ordered
+            for ordered in itertools.islice(candidates(), 4096):
                 candidate = {key: value for key, value in bundle.items() if key != 'hash'}
                 candidate.update(evidence_ids=ordered, artifacts=[artifacts[ref] for ref in ordered if ref in artifacts])
                 digest = stable_id(candidate)
