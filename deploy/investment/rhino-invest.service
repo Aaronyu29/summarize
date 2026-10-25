@@ -23,7 +23,7 @@ ReadOnlyPaths=/opt/rhino-video-digest
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=OMP_NUM_THREADS=1
 CPUQuota=50%
-MemoryHigh=512M
+MemoryHigh=640M
 MemoryMax=768M
 MemorySwapMax=128M
 TasksMax=64

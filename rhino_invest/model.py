@@ -5,10 +5,75 @@ import base64
 import hashlib
 import json
 import os
+import itertools
 from pathlib import Path
 from decimal import Decimal
 from .common import utc_now, parse_time, decimal_value, stable_id
 from .budget import load_limits, utc_day
+
+
+def recover_plan_delimiters(content):
+    """Recover only a unique parse obtained by deleting <=2 extra object closers.
+
+    Never insert punctuation, change a scalar, remove a key, or guess missing data.
+    Duplicate keys are rejected so parsing cannot silently discard evidence/values.
+    The result is still an unreviewed proposal, not an accepted investment plan.
+    """
+    if not isinstance(content, str) or len(content) > 65536:
+        return None
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Duplicate JSON key')
+            result[key] = value
+        return result
+    def bad_constant(value):
+        raise ValueError('Nonfinite JSON number')
+    def decode(value):
+        return json.loads(value, object_pairs_hook=pairs, parse_constant=bad_constant)
+    try:
+        decode(content)
+        return None  # Already valid output is handled by the normal parser.
+    except ValueError:
+        pass
+    quoted = escaped = False
+    positions = []
+    for index, char in enumerate(content):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == '}':
+            positions.append(index)
+    if quoted or not 1 <= len(positions) <= 128:
+        return None
+    for count in (1, 2):
+        unique = {}
+        for removed in itertools.combinations(positions, count):
+            parts, previous = [], 0
+            for index in removed:
+                parts.append(content[previous:index])
+                previous = index + 1
+            parts.append(content[previous:])
+            try:
+                output = decode(''.join(parts))
+            except ValueError:
+                continue
+            if not (isinstance(output, dict) and set(output) == {'plan'} and isinstance(output['plan'], dict)):
+                continue
+            canonical = json.dumps(output, sort_keys=True, ensure_ascii=False)
+            unique.setdefault(canonical, (output, list(removed)))
+            if len(unique) > 1:
+                return None  # Never choose between alternative interpretations.
+        if unique:
+            return next(iter(unique.values()))
+    return None
 
 
 class UnknownModelOutcome(RuntimeError):
@@ -100,6 +165,36 @@ class ModelGateway:
             'configuration_revision': self.config.get('configuration_revision', 1),
             'generation': self.generation_options(), 'image_detail': 'original'}
 
+    def _recover_completed_plan(self, fingerprint, scope, purpose):
+        if purpose != 'compile_plan' or self.store.get('model_rejection', fingerprint):
+            return None
+        receipt = self.store.get('model_receipt', fingerprint)
+        call = self.store.get('model_call', fingerprint)
+        if not receipt or not call or call.get('purpose') != purpose:
+            return None
+        choices = receipt.get('response', {}).get('choices')
+        if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)
+                and choices[0].get('finish_reason') == 'stop'):
+            return None
+        message = choices[0].get('message')
+        if not isinstance(message, dict):
+            return None
+        content = message.get('content')
+        recovered = recover_plan_delimiters(content)
+        if recovered is None:
+            return None
+        self._unknown_scope_gate(scope, purpose)
+        output, removed = recovered
+        proof = {'call_id': fingerprint, 'rule': 'unique-extra-object-closers-v1',
+                 'removed_character_offsets': removed, 'receipt_hash': stable_id(receipt),
+                 'raw_content_sha256': hashlib.sha256(content.encode()).hexdigest(),
+                 'output_hash': stable_id(output), 'scalar_text_modified': False,
+                 'independent_review_required': True}
+        self.store.put('model_syntax_recovery', fingerprint, proof, immutable=True)
+        self.store.put('model_response', fingerprint, {'output': output,
+                       'timestamp': receipt['timestamp'], 'syntax_recovery': proof}, immutable=True)
+        return output
+
     def _existing_call_gate(self, fingerprint, scope, purpose):
         if self.store.get('model_call', fingerprint):
             if self.store.get('model_rejection', fingerprint):
@@ -182,6 +277,9 @@ class ModelGateway:
         cached = self.store.get('model_response', fingerprint)
         if cached:
             return cached['output']
+        recovered = self._recover_completed_plan(fingerprint, scope, purpose)
+        if recovered is not None:
+            return recovered
         self._existing_call_gate(fingerprint, scope, purpose)
         ceiling = decimal_value(self.config.get('max_cost_usd_per_call'), 'max_cost_usd_per_call')
         if ceiling <= 0:
@@ -277,6 +375,9 @@ class ModelGateway:
             except ModelOutputInvalid:
                 raise
             except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                recovered = self._recover_completed_plan(fingerprint, scope, purpose)
+                if recovered is not None:
+                    return recovered
                 raise ModelOutputInvalid('Completed model response has invalid JSON or structure; receipt preserved',
                     call_id=fingerprint, reason='malformed_json_or_structure') from None
             self.store.put('model_response', fingerprint, {'output': output, 'timestamp': moment}, immutable=True)

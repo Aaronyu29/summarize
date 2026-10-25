@@ -1,7 +1,8 @@
 import json
 import unittest
+from unittest.mock import patch
 from rhino_invest.store import Store
-from rhino_invest.model import ModelGateway, UnknownModelOutcome, ModelBudgetExceeded, ModelOutputInvalid
+from rhino_invest.model import ModelGateway, UnknownModelOutcome, ModelBudgetExceeded, ModelOutputInvalid, recover_plan_delimiters
 
 CONFIG = {'enabled': True, 'model': 'offline-fixture', 'base_url': 'https://model.invalid/v1',
     'max_cost_usd_per_call': '0.5', 'max_cost_usd_per_day': '1', 'max_calls_per_day': 2}
@@ -9,6 +10,62 @@ NOW = '2026-10-23T15:00:00+00:00'
 
 
 class ModelTests(unittest.TestCase):
+    def test_unique_extra_braces_recovery_preserves_values_and_embedded_punctuation(self):
+        raw = '{"plan":{"targets":[{"assumptions":{"eps":10.65,"eps_bridge":{"years":3}}},"evidence_refs":["issuer"]},{"assumptions":{"eps":12.5}},"evidence_refs":["issuer"]}],"thesis":"keep } and \\\"quotes\\\" intact"}}'
+        result = recover_plan_delimiters(raw)
+        self.assertIsNotNone(result)
+        output, offsets = result
+        self.assertEqual(len(offsets),2)
+        self.assertEqual(output['plan']['targets'][0]['assumptions']['eps'],10.65)
+        self.assertEqual(output['plan']['targets'][1]['assumptions']['eps'],12.5)
+        self.assertEqual(output['plan']['thesis'],'keep } and "quotes" intact')
+        self.assertEqual(output['plan']['targets'][0]['evidence_refs'],['issuer'])
+
+    def test_recovery_rejects_missing_data_duplicates_and_ambiguous_structure(self):
+        for raw in ['{"plan":{"price":10,"price":20}}}', '{"plan":{"targets":[}',
+                    '{"plan":{"entry":{"price":3},"targets":[]}}}',
+                    '{"plan":{"a":{"b":{},"c":1},"d":2}}}',
+                    '{"plan":{"x":NaN}}}', '{"plan":{}}' + ' ' * 65536]:
+            self.assertIsNone(recover_plan_delimiters(raw),raw)
+
+    def test_completed_recovery_is_audited_cached_and_does_not_buy_a_retry(self):
+        raw='{"plan":{"price":10}}}'
+        calls=[]
+        def transport(body):
+            calls.append(body)
+            return {'choices':[{'finish_reason':'stop','message':{'content':raw}}]}
+        for day in [NOW,'2026-10-25T15:00:00+00:00']:
+            result=ModelGateway(self.store,CONFIG,transport).run('compile_plan',{},call_scope='same',now=day)
+            self.assertEqual(result['plan']['price'],10)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(len(self.store.items('model_syntax_recovery')),1)
+        self.assertEqual(self.store.items('model_receipt')[0][1]['response']['choices'][0]['message']['content'],raw)
+
+    def test_recovery_does_not_apply_to_review_or_truncated_response(self):
+        for purpose,finish in [('review_plan','stop'),('compile_plan','length')]:
+            with self.subTest(purpose=purpose):
+                def transport(body):
+                    return {'choices':[{'finish_reason':finish,'message':{'content':'{"plan":{}}}'}}]}
+                with self.assertRaises(ModelOutputInvalid):
+                    ModelGateway(self.store,dict(CONFIG,max_calls_per_day=10,max_cost_usd_per_day='5'),transport).run(purpose,{'purpose':purpose},call_scope=purpose)
+                self.assertEqual(self.store.items('model_syntax_recovery'),[])
+
+    def test_old_completed_recovery_cannot_bypass_unknown_sibling_request(self):
+        calls=[]
+        def transport(body):
+            calls.append(body)
+            return {'choices':[{'finish_reason':'stop','message':{'content':'{"plan":{"price":10}}}'}}]}
+        model=ModelGateway(self.store,CONFIG,transport)
+        with patch('rhino_invest.model.recover_plan_delimiters',return_value=None):
+            with self.assertRaises(ModelOutputInvalid):
+                model.run('compile_plan',{},call_scope='same')
+        call=self.store.items('model_call')[0][1]
+        self.store.put('model_call','unknown-sibling',dict(call,id='unknown-sibling'),immutable=True)
+        with self.assertRaises(UnknownModelOutcome):
+            model.run('compile_plan',{},call_scope='same')
+        self.assertEqual(len(calls),1)
+        self.assertEqual(self.store.items('model_syntax_recovery'),[])
+
     def setUp(self):
         self.store = Store(':memory:')
         self.addCleanup(self.store.close)
