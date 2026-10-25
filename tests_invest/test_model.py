@@ -25,7 +25,7 @@ class ModelTests(unittest.TestCase):
         for raw in ['{"plan":{"price":10,"price":20}}}', '{"plan":{"targets":[}',
                     '{"plan":{"entry":{"price":3},"targets":[]}}}',
                     '{"plan":{"a":{"b":{},"c":1},"d":2}}}',
-                    '{"plan":{"x":NaN}}}', '{"plan":{}}' + ' ' * 65536]:
+                    '{"plan":{"x":NaN}}}', '{"plan":{"x":1e999}}}', '{"plan":{}}' + ' ' * 65536]:
             self.assertIsNone(recover_plan_delimiters(raw),raw)
 
     def test_completed_recovery_is_audited_cached_and_does_not_buy_a_retry(self):

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import itertools
+import math
 from pathlib import Path
 from decimal import Decimal
 from .common import utc_now, parse_time, decimal_value, stable_id
@@ -30,8 +31,13 @@ def recover_plan_delimiters(content):
         return result
     def bad_constant(value):
         raise ValueError('Nonfinite JSON number')
+    def finite_float(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError('Nonfinite JSON number')
+        return result
     def decode(value):
-        return json.loads(value, object_pairs_hook=pairs, parse_constant=bad_constant)
+        return json.loads(value, object_pairs_hook=pairs, parse_constant=bad_constant, parse_float=finite_float)
     try:
         decode(content)
         return None  # Already valid output is handled by the normal parser.
