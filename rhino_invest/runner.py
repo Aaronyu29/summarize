@@ -773,8 +773,10 @@ class Runner:
                            "UnknownModelOutcome": "模型请求结果不明，需核对供应商回执，已禁止重复付费请求",
                            "UnknownOutcome": "远端写入结果不明，需核对回执，已禁止重复写入",
                            "ModelRejected": "模型接口已明确拒绝请求，需检查权限、额度或配置",
-                           "ModelBudgetConfigError": "模型预算配置无效，已暂停新付费请求"}
-                lines.append("原因：" + "；".join(reasons.get(code, "组件检查未通过（" + code + "）") for code in sorted(codes)) + "。")
+                           "ModelBudgetConfigError": "模型预算配置无效，已暂停新付费请求",
+                           "ConnectionError": "远端服务连接失败，等待后续检查恢复",
+                           "TimeoutError": "远端请求超时，等待后续检查恢复"}
+                lines.append("原因：" + "；".join(dict.fromkeys(reasons.get(code, "组件检查未通过，需核查对应任务记录") for code in sorted(codes))) + "。")
                 lines.append("处理：保留证据、账本和检查点；系统继续检查，无需重复提交。非投资建议。")
             elif deferred:
                 lines.append("影响：已核实风险尚未解除，相关新计划暂缓。" if unresolved_risk else "影响：新研究暂时延后，现有账本保留。")
