@@ -11,7 +11,11 @@ from finance_feishu import signature
 
 def reason(error):
     text = str(error)
-    rules = [('Second-pass review', '二次审核未通过，已停止发布，需检查证据与结论'),
+    rules = [('Join this channel to get access', '当前账号无权读取会员专享视频'),
+             ('members-only content', '当前账号无权读取会员专享视频'),
+             ("Sign in to confirm", 'YouTube 要求重新验证登录状态，需更新授权凭据'),
+             ('Unknown video availability', '尚未确认视频是否公开可读取'),
+             ('Second-pass review', '二次审核未通过，已停止发布，需检查证据与结论'),
              ('publication', '无法确认视频的真实发布时间'),
              ('cookies', 'YouTube 登录凭据缺失或权限不符合要求'),
              ('8 GiB', '剩余磁盘不足 8 GiB，已停止新下载以保留档案'),

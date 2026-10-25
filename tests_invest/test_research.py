@@ -726,7 +726,7 @@ class ResearchTests(unittest.TestCase):
         self.assertTrue(any(r['response']['choices'][0]['message']['content'] == malformed for _, r in receipts))
         self.assertEqual(len(self.store.items('model_response')), 1)
 
-    def test_compile_regeneration_second_invalid_is_fenced_at_two_calls(self):
+    def test_compile_regeneration_exhaustion_is_fenced_at_three_calls(self):
         calls = []
         def transport(body):
             calls.append(body)
@@ -736,9 +736,39 @@ class ResearchTests(unittest.TestCase):
             with self.assertRaises(ModelOutputInvalid):
                 _run(ModelGateway(self.store, model.config, transport), 'compile_plan', payload,
                     frames=frames, now=moment, store=self.store)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(len(self.store.items('model_receipt')), 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(self.store.items('model_receipt')), 3)
         self.assertEqual(self.store.items('model_response'), [])
+
+    def test_two_completed_bad_outputs_recover_with_final_compact_request(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            content = '{bad json' if len(calls)<3 else '{"plan":{"status":"needs_review"}}'
+            return {'choices':[{'finish_reason':'stop','message':{'content':content}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        for moment in [NOW, '2026-10-25T15:00:00+00:00']:
+            result = _run(ModelGateway(self.store, model.config, transport), 'compile_plan', payload,
+                          frames=frames, now=moment, store=self.store)
+            self.assertEqual(result, {'plan':{'status':'needs_review'}})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0]['messages'][1], calls[2]['messages'][1])
+        self.assertIn('compile-json-v2-final',calls[2]['messages'][0]['content'])
+
+    def test_final_format_request_unknown_is_not_replayed(self):
+        calls = []
+        def transport(body):
+            calls.append(body)
+            if len(calls) == 3:
+                raise TimeoutError('unknown third request')
+            return {'choices':[{'finish_reason':'stop','message':{'content':'{bad json'}}]}
+        model, payload, frames = self.regeneration_fixture(transport)
+        for moment in [NOW, NOW, '2026-10-25T15:00:00+00:00']:
+            with self.assertRaises(UnknownModelOutcome):
+                _run(ModelGateway(self.store,model.config,transport),'compile_plan',payload,
+                     frames=frames,now=moment,store=self.store)
+        self.assertEqual(len(calls),3)
+        self.assertEqual(len(self.store.items('model_receipt')),2)
 
     def test_compile_regeneration_unknown_blocks_across_ticks_restart_and_day(self):
         calls = []

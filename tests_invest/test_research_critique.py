@@ -154,7 +154,7 @@ class CritiqueTests(unittest.TestCase):
         self.assertEqual(calls, [(p, False) for p in ('extract_levels', 'verify_levels', 'compile_plan', 'review_plan')]
             + [('compile_plan', True), ('review_plan', True)])
 
-    def test_known_double_bad_draft_is_terminal_not_reissued(self):
+    def test_known_triple_bad_draft_is_terminal_not_reissued(self):
         data, calls = self.facts(), []
         def fail(purpose, payload, body):
             if purpose == 'compile_plan' and payload.get('critique'):
@@ -163,11 +163,11 @@ class CritiqueTests(unittest.TestCase):
         self.ingest(model, data)
         result = self.ingest(model, data)
         self.assertEqual(result['errors'][0]['error'], 'ModelOutputInvalid')
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 7)
         for _ in range(3):
             result = self.ingest(model, data)
             self.assertEqual(result['errors'], [])
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 7)
         self.assertEqual(self.store.items('research_critique_result')[0][1]['status'], 'output_invalid')
 
     def test_precise_etf_intermediates_and_explicit_eps_bridge_never_parse_prose(self):

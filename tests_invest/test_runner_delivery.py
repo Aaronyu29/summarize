@@ -269,6 +269,14 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(record))
         self.assertNotIn('private-id', json.dumps(self.store.get('ops_health', 'latest')))
 
+    def test_completed_bad_output_notice_does_not_claim_unknown_outcome(self):
+        notices = []
+        self.feishu.notify = lambda key,text: notices.append(text) or {'status':'provider_ack'}
+        self.store.put('research_worker','latest',{'status':'blocked','errors':[{'error':'ModelOutputInvalid'}]})
+        self.runner._observe_health({'errors':[]},self.now)
+        self.assertIn('草稿格式无效',notices[0])
+        self.assertNotIn('请求结果不明',notices[0])
+
 
 if __name__ == '__main__':
     unittest.main()

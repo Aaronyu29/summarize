@@ -5,10 +5,42 @@ import json
 from unittest.mock import patch
 from finance_jobs import Jobs
 from finance_cloud import unseen_entries, batches, canonicalize_evidence, publication_time, delivery_title
-from finance_cloud import process
+from finance_cloud import process, members_only_error, skip_nonpublic, main
 
 
 class JobsTests(unittest.TestCase):
+    def test_membership_restriction_is_durable_but_not_a_public_frontier(self):
+        restricted = dict(self.entry, discovery_method='channel_playlist')
+        skip_nonpublic(pathlib.Path(self.temp.name), self.jobs, restricted)
+        other = dict(restricted, video_id='NEWvideo123')
+        self.assertEqual([e['video_id'] for e in unseen_entries([restricted, other], self.jobs)], ['NEWvideo123'])
+        self.assertEqual(self.jobs.pending(), [])
+        self.jobs.save(restricted['video_id'], metadata_recheck_after=0)
+        self.assertEqual(list(unseen_entries([restricted, other], self.jobs)), [restricted, other])
+        self.assertTrue(members_only_error(RuntimeError('Join this channel to get access to members-only content')))
+        for message in ['HTTP Error 429', 'Sign in to confirm you are not a bot', 'Read timed out']:
+            self.assertFalse(members_only_error(RuntimeError(message)))
+
+    def test_real_membership_failure_does_not_fail_scan_or_stop_later_public_video(self):
+        import sys
+        from unittest.mock import MagicMock
+        restricted = dict(self.entry, discovery_method='channel_playlist')
+        public = dict(restricted, video_id='NEWvideo123')
+        fake = MagicMock()
+        fake.YoutubeDL.return_value.__enter__.return_value.extract_info.side_effect = [
+            RuntimeError('Join this channel to get access to members-only content'),
+            {'availability':'public', 'timestamp':1792900000}]
+        env = {key:'test' for key in ['LLM_BASE_URL','LLM_API_KEY','LLM_MODEL','FEISHU_APP_ID','FEISHU_APP_SECRET','LARK_WEBHOOK_URL']}
+        with patch.dict(sys.modules, {'yt_dlp':fake}), patch.dict('os.environ',env), \
+             patch('sys.argv', ['finance_cloud.py','--data',self.temp.name,'--scan-only']), \
+             patch('finance_cloud.discover',return_value=[restricted,public]), patch('finance_cloud.Jobs',return_value=self.jobs), \
+             patch('finance_cloud.failure_notice') as notice, patch('finance_cloud.flush_notices',return_value={}):
+            main()
+        self.assertEqual(self.jobs.get(restricted['video_id'])['status'], 'skipped_nonpublic')
+        self.assertEqual(self.jobs.get(public['video_id'])['status'], 'queued')
+        self.assertFalse(json.loads((pathlib.Path(self.temp.name)/'last-run.json').read_text())['failed'])
+        notice.assert_not_called()
+
     def test_publication_uses_matching_video_and_beijing_calendar_date(self):
         entries = [{'video_id': 'other', 'published_utc': '2026-10-20T02:00:00Z'},
                    {'video_id': 'target', 'published_utc': '2026-10-22T18:10:36Z'}]

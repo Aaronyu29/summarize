@@ -277,6 +277,15 @@ again from the SAME original evidence and original images. Return one compact, v
 JSON object following the original schema, with correctly nested braces and commas.
 Do not reconstruct, quote, repair or rely on the previous output. Preserve uncertainty,
 source references and all required fields; do not invent numbers to complete the JSON.'''
+COMPILE_COMPACT_REGENERATION = '''
+FORMAT_REGENERATION_ATTEMPT=compile-json-v2-final
+Both prior completed responses failed JSON syntax validation. This is the FINAL
+format attempt for these exact facts. Generate from the SAME evidence and images.
+Return exactly one JSON object with a plan object. Keep narrative strings concise,
+use plain text rather than embedded quotation marks, and put calculations in the
+structured numeric fields. Preserve every required field, source reference and
+uncertainty. No Markdown, no trailing text, no extra closing braces. Never invent
+facts or reuse previous malformed text. The independent review still applies.'''
 
 
 def _run(model, purpose, payload, frames=(), now=None, store=None):
@@ -319,8 +328,16 @@ def _run(model, purpose, payload, frames=(), now=None, store=None):
         # This exception guarantees a completed durable receipt. The fixed
         # instruction changes only this request fingerprint; its own receipt or
         # unknown fence permits no further attempt across ticks/restarts/days.
-        return model.run(purpose, payload, frames=frames, now=now,
-            instruction=(instruction or '') + COMPILE_FORMAT_REGENERATION, call_scope=scope)
+        try:
+            return model.run(purpose, payload, frames=frames, now=now,
+                instruction=(instruction or '') + COMPILE_FORMAT_REGENERATION, call_scope=scope)
+        except ModelOutputInvalid as second:
+            if not _completed_stop_receipt(store or getattr(model, 'store', None), second):
+                raise
+            # Fixed third fingerprint: receipt/unknown gates and daily budget still
+            # apply. Replays can never buy a fourth request for this frozen payload.
+            return model.run(purpose, payload, frames=frames, now=now,
+                instruction=(instruction or '') + COMPILE_COMPACT_REGENERATION, call_scope=scope)
 
 
 def _completed_stop_receipt(store, error):
@@ -1382,7 +1399,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                         'blocking_review_issues': binding['review']['issues'], 'review_is_untrusted_opinion': True,
                         'calculation_book': _calculate_target_prices(parent_plan)[1],
                         'timestamp': moment, 'compile_instruction': COMPILE + CRITIQUE_INSTRUCTION,
-                        'review_instruction': REVIEW, 'max_semantic_attempts': 1, 'max_paid_requests_including_json_recovery': 4}
+                        'review_instruction': REVIEW, 'max_semantic_attempts': 1, 'max_paid_requests_including_json_recovery': 5}
                     store.put('research_critique_attempt', operation_key, critique, immutable=True)
             elif calculation_seed is None:
                 plans.append(committed['plan'])

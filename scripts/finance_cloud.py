@@ -127,11 +127,32 @@ def capture(root, entry):
 def unseen_entries(entries, jobs):
     """The /videos fallback is newest-first; stop at a durable known frontier."""
     for entry in entries:
-        if jobs.get(entry['video_id']) is not None:
+        known = jobs.get(entry['video_id'])
+        if known is not None:
+            if known['status'] == 'skipped_nonpublic':
+                # A restricted item is not a public-history frontier. Recheck daily
+                # because creators may later make membership content public.
+                if known['checkpoint'].get('metadata_recheck_after', 0) <= dt.datetime.now(dt.timezone.utc).timestamp():
+                    yield entry
+                continue
             if entry.get('discovery_method') == 'channel_playlist':
                 break
             continue
         yield entry
+
+
+def members_only_error(error):
+    # Only explicit access restrictions qualify; login/bot/network errors remain failures.
+    text = str(error).lower()
+    return ('join this channel to get access' in text or 'members-only content' in text
+            or 'available to this channel\'s members' in text)
+
+
+def skip_nonpublic(root, jobs, entry):
+    jobs.add(entry, status='skipped_nonpublic')
+    jobs.save(entry['video_id'], status='skipped_nonpublic', access_reason='membership_or_nonpublic',
+              metadata_recheck_after=dt.datetime.now(dt.timezone.utc).timestamp() + 86400)
+    log('nonpublic_skipped', video_id=entry['video_id'], recheck_hours=24)
 
 
 def tools(script, capture_dir, *arguments):
@@ -460,15 +481,24 @@ def main():
         if not entry.get('published_utc'):
             from yt_dlp import YoutubeDL
             try:
-                with YoutubeDL(ydl_options()) as ydl:
+                with YoutubeDL(ydl_options(ignore_no_formats_error=True)) as ydl:
                     metadata = ydl.extract_info(entry['url'], download=False)
             except Exception as error:
+                if members_only_error(error):
+                    skip_nonpublic(root, jobs, entry)
+                    continue
                 log('metadata_unavailable', video_id=entry['video_id'], error_type=type(error).__name__)
                 failure_notice(root, entry, '获取视频元数据', error, '下次扫描重试；发布日期暂未取得')
                 metadata_failures += 1
                 continue
             if metadata.get('availability') != 'public':
-                log('nonpublic_skipped', video_id=entry['video_id'])
+                if metadata.get('availability') in {'subscriber_only', 'premium_only', 'private', 'unlisted'}:
+                    skip_nonpublic(root, jobs, entry)
+                    continue
+                # Unknown availability is not proof of an access restriction.
+                failure_notice(root, entry, '获取视频元数据', ValueError('Unknown video availability'),
+                               '下次扫描重试；公开视频权限尚未确认')
+                metadata_failures += 1
                 continue
             timestamp = metadata.get('release_timestamp') or metadata.get('timestamp')
             if not timestamp:
@@ -476,6 +506,13 @@ def main():
             entry['published_utc'] = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat()
         published = dt.datetime.fromisoformat(entry['published_utc'].replace('Z', '+00:00'))
         added = jobs.add(entry, status='baseline' if published < cutoff else 'queued')
+        known = jobs.get(entry['video_id'])
+        if not added and known and known['status'] == 'skipped_nonpublic':
+            # The original discovery record may lack a timestamp; persist the verified one.
+            with jobs.db:
+                jobs.db.execute('UPDATE jobs SET source=? WHERE video_id=?',
+                                (json.dumps(entry, ensure_ascii=False), entry['video_id']))
+            jobs.save(entry['video_id'], status='baseline' if published < cutoff else 'queued')
         if added:
             log('video_discovered', video_id=entry['video_id'], published=entry['published_utc'])
     failed = metadata_failures > 0
@@ -484,6 +521,9 @@ def main():
             try:
                 process(jobs, vid, root, os.environ)
             except Exception as error:
+                if members_only_error(error):
+                    skip_nonpublic(root, jobs, jobs.get(vid)['source'])
+                    continue
                 # Never log exceptions containing credentials or signed download URLs.
                 capture_dir = root / 'videos' / vid
                 if (capture_dir / vid).is_dir():

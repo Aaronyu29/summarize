@@ -768,7 +768,14 @@ class Runner:
                            "notification": "部分报告通知延后", "export": "工作台更新暂时延后"}
                 impact = list(dict.fromkeys(effects.get(stage, "投资任务暂不可用") for stage, _ in failures))
                 lines.append("影响：" + "；".join(impact[:2]) + "。")
-                lines.append("处理：系统继续检查；结果不明的请求已禁止盲目重试，无需重复提交。非投资建议。")
+                codes = {code for _, code in failures}
+                reasons = {"ModelOutputInvalid": "模型已返回，但研究草稿格式无效；有界格式重生成后仍失败的研究保留待核查",
+                           "UnknownModelOutcome": "模型请求结果不明，需核对供应商回执，已禁止重复付费请求",
+                           "UnknownOutcome": "远端写入结果不明，需核对回执，已禁止重复写入",
+                           "ModelRejected": "模型接口已明确拒绝请求，需检查权限、额度或配置",
+                           "ModelBudgetConfigError": "模型预算配置无效，已暂停新付费请求"}
+                lines.append("原因：" + "；".join(reasons.get(code, "组件检查未通过（" + code + "）") for code in sorted(codes)) + "。")
+                lines.append("处理：保留证据、账本和检查点；系统继续检查，无需重复提交。非投资建议。")
             elif deferred:
                 lines.append("影响：已核实风险尚未解除，相关新计划暂缓。" if unresolved_risk else "影响：新研究暂时延后，现有账本保留。")
                 lines.append("处理：等待专门复核风险，无需重复提交。非投资建议。" if unresolved_risk else
