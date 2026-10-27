@@ -129,6 +129,67 @@ when every original condition is covered by the supported price interval. Future
 issuer releases, operating results or other unresolved fundamental conditions remain
 price_and_fundamental with coverage false; never turn them into a price-only rule.'''
 
+SOURCE_JSON_RECOVERY = '''
+SOURCE_JSON_RECOVERY_ATTEMPT=1
+A completed source-processing response had invalid JSON syntax. Process the SAME
+original transcript, original frames and supplied evidence independently again.
+Do not reconstruct the malformed response, invent numbers or presume verification.
+Return ONLY one compact valid JSON object matching the original instruction.
+For extract_levels return {"levels":[...]} with every original field, source
+reference, unit, condition and uncertainty. For verify_levels return {"checks":[
+{"index":0,"verified":false,"issues":[]}]} with exactly one check per original
+level. Unclear evidence remains unverified. No Markdown or optional long prose.
+Extraction is never approval: a separate original-evidence verification must follow.'''
+
+
+def load_recovery_output(content):
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Duplicate recovery output key')
+            result[key] = value
+        return result
+    def bad_constant(value):
+        raise ValueError('Nonfinite recovery output')
+    return json.loads(content, object_pairs_hook=unique, parse_constant=bad_constant)
+
+
+def valid_recovery_output(purpose, output):
+    """A recovered source response must still pass independent evidence checks."""
+    def finite_or_null(value):
+        if value is None:
+            return True
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+    if purpose == 'extract_levels':
+        levels = output.get('levels')
+        fields = {'symbol', 'kind', 'value', 'low', 'high', 'currency', 'price_unit',
+                  'source_date', 'adjustment', 'source_horizon', 'timestamp_seconds',
+                  'evidence_segment_ids', 'frame_seconds', 'conditions', 'uncertainty'}
+        return isinstance(levels, list) and all(
+            isinstance(level, dict) and fields <= set(level) and
+            isinstance(level['evidence_segment_ids'], list) and
+            all(type(ref) is int for ref in level['evidence_segment_ids']) and
+            isinstance(level['kind'], str) and
+            level['kind'] in {'creator_entry', 'technical_support', 'valuation', 'historical_quote', 'target', 'stop'} and
+            all(finite_or_null(level[key])
+                for key in ('value', 'low', 'high', 'timestamp_seconds', 'frame_seconds'))
+            for level in levels)
+    if purpose == 'verify_levels':
+        checks = output.get('checks')
+        return isinstance(checks, list) and all(isinstance(item, dict) and
+            type(item.get('index')) is int and item['index'] >= 0 and
+            type(item.get('verified')) is bool and isinstance(item.get('issues'), list) and
+            all(isinstance(issue, str) for issue in item['issues']) for item in checks)
+    return (isinstance(output.get('accepted'), bool) and isinstance(output.get('issues'), list) and
+        all(isinstance(issue, str) for issue in output['issues']) and
+        isinstance(output.get('checks'), dict) and
+        all(isinstance(output['checks'].get(key), bool) for key in ('provenance', 'currency', 'unit', 'adr')) and
+        ('position_basis_accepted' not in output or isinstance(output['position_basis_accepted'], bool)))
+
 
 class ModelGateway:
     def __init__(self, store, config, transport=None, *, clock=None):
@@ -219,18 +280,18 @@ class ModelGateway:
                 raise UnknownModelOutcome('Unresolved logical model call; changing request/configuration cannot bypass receipt reconciliation')
 
     def run(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None):
-        # Only a completed, syntactically broken review qualifies. A child attempt
+        # Only a completed, syntactically broken source/review qualifies. A child attempt
         # calls _run_once directly, so it can never recursively buy another retry.
         frames = tuple(frames)
         try:
             return self._run_once(purpose, payload, frames, now, instruction, call_scope)
         except ModelOutputInvalid as error:
-            if purpose != 'review_plan':
+            if purpose not in {'review_plan', 'extract_levels', 'verify_levels'}:
                 raise
             parent_id = error.call_id
             call = self.store.get('model_call', parent_id) if parent_id else None
             receipt = self.store.get('model_receipt', parent_id) if parent_id else None
-            if not (call and receipt and call.get('purpose') == 'review_plan'
+            if not (call and receipt and call.get('purpose') == purpose
                     and call.get('call_scope') and not call.get('recovery_parent_id')
                     and not self.store.get('model_rejection', parent_id)):
                 raise
@@ -246,13 +307,15 @@ class ModelGateway:
                 raise error from None
             else:
                 raise error  # Valid arrays/scalars and schema defects are not format retries.
-            child_id = stable_id('review-json-recovery-v1', parent_id)
+            child_id = stable_id('review-json-recovery-v1' if purpose == 'review_plan'
+                                 else 'source-json-recovery-v1', parent_id)
             recovery = {'id': child_id, 'parent_call_id': parent_id,
                 'parent_receipt_hash': stable_id(receipt), 'call_scope': call['call_scope'],
-                'attempt': 1, 'purpose': purpose, 'reason': 'completed_review_json_syntax_invalid'}
+                'attempt': 1, 'purpose': purpose, 'reason': 'completed_review_json_syntax_invalid'
+                    if purpose == 'review_plan' else 'completed_source_json_syntax_invalid'}
             self.store.put('model_recovery', child_id, recovery, immutable=True)
             return self._run_once(purpose, payload, frames, call.get('analysis_as_of') or now,
-                (instruction or '') + REVIEW_JSON_RECOVERY, call_scope,
+                (instruction or '') + (REVIEW_JSON_RECOVERY if purpose == 'review_plan' else SOURCE_JSON_RECOVERY), call_scope,
                 recovery=recovery)
 
     def _run_once(self, purpose, payload, frames=(), now=None, instruction=None, call_scope=None,
@@ -364,18 +427,11 @@ class ModelGateway:
                 if not isinstance(content, str):
                     raise ModelOutputInvalid('Completed model response content is not text; receipt preserved',
                         call_id=fingerprint, reason='content_not_text')
-                output = json.loads(content)
+                output = load_recovery_output(content) if recovery else json.loads(content)
                 if not isinstance(output, dict):
                     raise ModelOutputInvalid('Completed model response is not a JSON object; receipt preserved',
                         call_id=fingerprint, reason='not_json_object')
-                if recovery and not (isinstance(output.get('accepted'), bool)
-                        and isinstance(output.get('issues'), list)
-                        and all(isinstance(issue, str) for issue in output['issues'])
-                        and isinstance(output.get('checks'), dict)
-                        and all(isinstance(output['checks'].get(key), bool)
-                                for key in ('provenance', 'currency', 'unit', 'adr'))
-                        and ('position_basis_accepted' not in output
-                             or isinstance(output['position_basis_accepted'], bool))):
+                if recovery and not valid_recovery_output(purpose, output):
                     raise ModelOutputInvalid('Recovery review does not satisfy the minimal review schema; receipt preserved',
                         call_id=fingerprint, reason='review_recovery_schema_invalid')
             except ModelOutputInvalid:

@@ -769,7 +769,7 @@ class Runner:
                 impact = list(dict.fromkeys(effects.get(stage, "投资任务暂不可用") for stage, _ in failures))
                 lines.append("影响：" + "；".join(impact[:2]) + "。")
                 codes = {code for _, code in failures}
-                reasons = {"ModelOutputInvalid": "模型已返回，但研究草稿格式无效；有界格式重生成后仍失败的研究保留待核查",
+                reasons = {"ModelOutputInvalid": "模型已返回，但输出格式校验未通过，相关研究尚未完成；原回执已保留，恢复状态需核查",
                            "UnknownModelOutcome": "模型请求结果不明，需核对供应商回执，已禁止重复付费请求",
                            "UnknownOutcome": "远端写入结果不明，需核对回执，已禁止重复写入",
                            "ModelRejected": "模型接口已明确拒绝请求，需检查权限、额度或配置",

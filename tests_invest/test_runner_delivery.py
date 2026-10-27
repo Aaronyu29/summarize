@@ -274,7 +274,8 @@ class RunnerTests(unittest.TestCase):
         self.feishu.notify = lambda key,text: notices.append(text) or {'status':'provider_ack'}
         self.store.put('research_worker','latest',{'status':'blocked','errors':[{'error':'ModelOutputInvalid'}]})
         self.runner._observe_health({'errors':[]},self.now)
-        self.assertIn('草稿格式无效',notices[0])
+        self.assertIn('输出格式校验未通过',notices[0])
+        self.assertNotIn('重生成后仍失败',notices[0])
         self.assertNotIn('请求结果不明',notices[0])
 
 

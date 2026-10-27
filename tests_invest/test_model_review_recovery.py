@@ -121,7 +121,7 @@ class ReviewRecoveryTests(unittest.TestCase):
                 self.assertEqual(store.items('model_recovery'), [])
 
     def test_compile_and_event_reviews_are_not_recovered_by_gateway(self):
-        for purpose in ('compile_plan', 'event_review', 'extract_levels'):
+        for purpose in ('compile_plan', 'event_review'):
             with self.subTest(purpose=purpose), Store(':memory:') as store:
                 calls = []
                 model = ModelGateway(store, CONFIG, lambda body: calls.append(body) or response())
