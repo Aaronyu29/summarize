@@ -130,8 +130,10 @@ def remediate_plans(store, model, fundamentals, now):
             context=store.get('research_system_repair_input',phase_id)
             if not context:
                 latest=store.get('plan',current['id']) or current
+                first=store.get('research_system_repair_input',stable_id(key,'round',0))
+                original=(first or {}).get('prior_plan') or latest
                 context={'event_id':phase_id,'kind':CONTRACT,'round':round_index,
-                         'prior_plan':latest,'system_owned':True}
+                         'prior_plan':original,'latest_failed_plan':latest,'system_owned':True}
                 store.put('research_system_repair_input',phase_id,context,immutable=True)
             levels=[level for _,level in store.items('research_level') if level.get('symbol')==symbol
                     and source['id'] in level.get('evidence_refs',[])]

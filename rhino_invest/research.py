@@ -1342,7 +1342,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan_id = stable_id('investment-plan', symbol)
         previous = store.get('plan', plan_id)
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
-            seed = context.get('prior_plan')
+            seed = context.get('latest_failed_plan') or context.get('prior_plan')
             if previous and seed and plan_fingerprint(previous) != plan_fingerprint(seed):
                 plans.append(previous)
                 continue  # A stale repair cannot overwrite a newer or already committed revision.
@@ -1700,7 +1700,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 plans.append(current)
                 continue
             if (context or {}).get('kind') == 'system-plan-remediation-v1':
-                seed = context.get('prior_plan')
+                seed = context.get('latest_failed_plan') or context.get('prior_plan')
                 if current and seed and plan_fingerprint(current) != plan_fingerprint(seed):
                     plans.append(current)
                     continue

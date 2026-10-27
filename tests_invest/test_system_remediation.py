@@ -61,6 +61,10 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(len(model.calls),4)
         jobs=self.store.items('research_system_repair');self.assertEqual(len(jobs),1)
         self.assertTrue(jobs[0][1]['terminal']);self.assertEqual(jobs[0][1]['round'],2)
+        inputs=[v for k,v in self.store.items('research_system_repair_input')]
+        self.assertEqual(len(inputs),2)
+        self.assertEqual(inputs[0]['prior_plan'],inputs[1]['prior_plan'])
+        self.assertNotEqual(inputs[0]['latest_failed_plan']['revision'],inputs[1]['latest_failed_plan']['revision'])
 
     def test_unknown_request_blocks_new_repair_identity_and_never_calls_model(self):
         data,_=self.seed();model=RepairModel()
