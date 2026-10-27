@@ -112,5 +112,21 @@ class RemediationTests(unittest.TestCase):
         self.assertTrue(Config.load(environ={'INVEST_SYSTEM_REMEDIATION_ENABLED':'true'}).system_remediation_enabled)
         with self.assertRaises(ValueError):Config(system_remediation_enabled='maybe')
 
+    def test_budget_work_order_follows_configured_watchlist(self):
+        from rhino_invest.store import Store
+        with Store(':memory:') as store:
+            store.put('research_evidence','source',{'id':'source'})
+            for symbol in ('CRCL','GOOG','TSM'):
+                store.put('plan',symbol,{'id':symbol,'symbol':symbol,'status':'needs_review','revision':1,'research_snapshot_id':'source'})
+            calls=[]
+            def compile_fixture(store,source,levels,model,fundamentals,now,context):
+                symbol=next(iter(fundamentals));calls.append(symbol)
+                return [{'symbol':symbol,'id':symbol,'revision':2,'status':'active'}]
+            with patch('rhino_invest.remediation._unresolved_thesis_defer',return_value=None), \
+                 patch('rhino_invest.remediation._research_fundamental',side_effect=lambda store,symbol,data:({'symbol':symbol},None)), \
+                 patch('rhino_invest.remediation.compile_plan',side_effect=compile_fixture):
+                remediate_plans(store,None,{},NOW,('TSM','GOOG','CRCL'))
+            self.assertEqual(calls,['TSM','GOOG','CRCL'])
+
 
 if __name__=='__main__':unittest.main()

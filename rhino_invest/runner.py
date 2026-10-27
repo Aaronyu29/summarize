@@ -685,7 +685,7 @@ class Runner:
                     summary["deferred" if item["error"] == "ModelBudgetExceeded" else "errors"].append(item)
             if getattr(self.config, 'system_remediation_enabled', False) and not self._stop.is_set():
                 from .remediation import remediate_plans
-                repair = remediate_plans(self.store, model, fundamentals, self.clock())
+                repair = remediate_plans(self.store, model, fundamentals, self.clock(), self.config.symbols)
                 summary['system_remediation'] = repair
                 summary['errors'].extend({'stage':'system_remediation', 'error':_safe_error(item.get('error'))}
                     for item in repair['errors'])

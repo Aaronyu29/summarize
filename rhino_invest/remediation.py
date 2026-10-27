@@ -96,10 +96,11 @@ def economic_consistency_errors(plan):
         return []  # Do not manufacture a numeric substitute for an invalid proposal.
 
 
-def remediate_plans(store, model, fundamentals, now):
+def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
     summary = {'processed':0, 'results':[], 'errors':[], 'deferred':[]}
     plans = [p for _,p in store.items('plan') if p.get('status') == 'needs_review']
-    for current in sorted(plans,key=lambda p:p.get('symbol','')):
+    order={symbol:index for index,symbol in enumerate(priority_symbols)}
+    for current in sorted(plans,key=lambda p:(order.get(p.get('symbol'),len(order)),p.get('symbol',''))):
         symbol=current['symbol']; source=store.get('research_evidence',current.get('research_snapshot_id',''))
         if not source:
             continue
