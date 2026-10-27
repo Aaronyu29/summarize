@@ -9,6 +9,7 @@ from .ledger import portfolio
 from .market import MarketData, quote_gate
 from .research import ingest_archives, ingest_holdings, review_plan, _logical_fundamentals
 from .model import ModelGateway
+from .research_attention import notify_attention
 from .budget import budget_status
 from .decisions import evaluate, _has_provenance, valid_thesis_events
 from .paper import paper_account, simulate
@@ -624,6 +625,11 @@ class Runner:
                         result["previews"].append(receipt)
                 except Exception as exc:
                     self._error(result, "notification:" + key, exc)
+        try:
+            result['research_attention'] = notify_attention(self.store, self.feishu, plans,
+                now=now, when=beijing_time(now), enabled=self.config.notifications_enabled, execute=self.execute)
+        except Exception as exc:
+            self._error(result, 'research_attention', exc)
         self.store.put("worker", "latest", {"timestamp": now, "execute": self.execute,
             "notifications_enabled": self.config.notifications_enabled,
             "model_budget": budget_status(self.store, self.config.model, now=self.clock()),
@@ -765,7 +771,7 @@ class Runner:
             if failures:
                 effects = {"research": "研究待核查，新研究建议暂缓", "archive_ingestion": "研究待核查，新研究建议暂缓",
                            "official_quotes": "行情暂不可用，相关操作建议暂缓", "feishu_input": "账本暂无法核对，新增操作建议暂缓",
-                           "notification": "部分报告通知延后", "export": "工作台更新暂时延后"}
+                           "notification": "部分报告通知延后", "research_attention": "研究审核结果通知待核实", "export": "工作台更新暂时延后"}
                 impact = list(dict.fromkeys(effects.get(stage, "投资任务暂不可用") for stage, _ in failures))
                 lines.append("影响：" + "；".join(impact[:2]) + "。")
                 codes = {code for _, code in failures}

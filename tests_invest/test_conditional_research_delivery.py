@@ -103,7 +103,7 @@ class ConditionalResearchValidationTests(unittest.TestCase):
     def test_rejected_or_invalidated_research_is_not_labelled_conditionally_approved(self):
         plan = conditional_plan()
         plan.update(status='needs_review', research_assessment={'status': 'needs_evidence'})
-        self.assertEqual(plan_row(plan)['状态'], '待审核')
+        self.assertEqual(plan_row(plan)['状态'], '已自动审核·未通过')
         plan.update(status='invalidated', research_assessment={'status': 'approved_conditional'})
         self.assertEqual(plan_row(plan)['状态'], '已失效')
 

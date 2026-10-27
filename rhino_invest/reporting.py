@@ -407,6 +407,12 @@ def plan_row(plan, recommendation=None):
         row["建议动作"] = "等待入场条件"
         row["理由"] = "估值已通过独立审核；仍需核实入场条件并形成完整入场规则，当前暂无操作建议"
         row["证据引用"] = "估值证据与独立审核记录已内部留存；入场条件待满足"
+    elif plan.get('status') == 'needs_review' and (plan.get('research_assessment') or {}).get('status') == 'needs_evidence':
+        from .research_attention import attention_items
+        item = attention_items([plan])[0]
+        row['状态'] = item['status']
+        row['建议动作'] = '等待补证据后复核'
+        row['理由'] = '；'.join(item['reasons']) + '；证据更新后继续自动复核'
     return row
 
 
