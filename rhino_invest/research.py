@@ -1356,6 +1356,15 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             continue
         fundamental, identity = _research_fundamental(store, symbol, (fundamentals or {}).get(symbol))
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
+        if (not context and previous and previous.get('condition_resolution') is not None
+                and previous.get('research_snapshot_id') == snapshot['id']
+                and previous.get('fundamental_evidence_id') == fid
+                and (previous.get('status') == 'active' or
+                     (previous.get('research_assessment') or {}).get('status') == 'approved_conditional')):
+            from .decisions import _has_provenance
+            if _has_provenance(store, previous):
+                plans.append(previous)
+                continue  # Preserve a reviewed replacement over an old malformed generator cache.
         # Workflow discovery changes with the watch list; paid plans depend only
         # on their own immutable source, relevant facts, model and explicit event.
         event_context = None if not context or not context.get('event_id') else {

@@ -45,6 +45,13 @@ class RemediationTests(unittest.TestCase):
         self.assertFalse(review_payload['policy']['cash_verified'])
         remediate_plans(self.store,model,{'NVDA':data},'2026-10-24T00:00:00Z')
         self.assertEqual(len(model.calls),2)
+        original_get=self.store.get
+        def without_legacy_operation(kind,key):
+            return None if kind=='plan_operation' else original_get(kind,key)
+        with patch.object(self.store,'get',side_effect=without_legacy_operation):
+            replay=ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':data},now=NOW)
+        self.assertEqual(len(model.calls),2)
+        self.assertEqual(replay['plans'][0]['status'],'active')
 
     def test_rejection_is_two_rounds_and_does_not_reset_on_restarts_or_new_revision(self):
         data,old=self.seed();model=RepairModel(reject=True)
