@@ -93,7 +93,7 @@ def condition_catalog(context):
             for text in ((context.get('prior_plan') or {}).get('entry') or {}).get('conditions',[])]
 
 
-def expand_condition_ids(proposal,context):
+def expand_condition_ids(proposal,context,*,pre_split_deadline=None):
     """Expand explicit IDs only; never infer semantic matches from similar prose."""
     import copy
     result=copy.deepcopy(proposal)
@@ -101,6 +101,17 @@ def expand_condition_ids(proposal,context):
     rows=result.get('condition_resolution')
     if not isinstance(rows,list) or any(not isinstance(row,dict) for row in rows):
         raise ValueError('Condition ID rows required')
+    ids=[row.get('condition_id') for row in rows]
+    # This existing engine-enforced quote/cash clause can be supplied by the
+    # system and reviewed explicitly. Never infer a missing business condition.
+    missing=set(catalog)-set(ids)
+    for identity in list(missing):
+        text=catalog[identity]
+        if (text.startswith('Execution requires a fresh official regular-session quote and verified available cash; policy.amount_usd=')
+                and text.endswith(' is a per-buy strategy setting, not proof of cash.')):
+            rows.append({'condition_id':identity,'disposition':'execution_gate',
+                'reason':'System-supplied mapping of the already enforced official quote and verified cash gate; independent review required.',
+                'evidence_refs':[],'system_supplied_execution_mapping':True})
     ids=[row.get('condition_id') for row in rows]
     if len(ids)!=len(catalog) or set(ids)!=set(catalog):
         raise ValueError('Condition IDs must cover the original conditions exactly once')
@@ -110,13 +121,37 @@ def expand_condition_ids(proposal,context):
             raise ValueError('Condition ID conflicts with original condition text')
         row['previous_condition']=text
     entry=result.setdefault('entry',{})
-    retained=entry.pop('retained_condition_ids',[])
+    candidates=[]
+    if 'retained_condition_ids' in entry:candidates.append(entry.pop('retained_condition_ids'))
+    for name in ('retained_condition_ids','entry_retained_condition_ids'):
+        if name in result:candidates.append(result.pop(name))
+    if candidates and any(value!=candidates[0] for value in candidates[1:]):
+        raise ValueError('Conflicting retained-condition ID envelopes')
+    retained=candidates[0] if candidates else []
     expected={row['condition_id'] for row in rows if row.get('disposition')=='retained'}
     if not isinstance(retained,list) or len(retained)!=len(expected) or set(retained)!=expected:
         raise ValueError('Retained condition IDs must match the declared dispositions')
     conditions=entry.setdefault('conditions',[])
     for identity in retained:
         if catalog[identity] not in conditions:conditions.append(catalog[identity])
+    if pre_split_deadline:
+        from .common import parse_time
+        day=str(parse_time(pre_split_deadline).date())
+        for row in rows:
+            text=row['previous_condition']
+            if (row.get('disposition')=='retained' and row.get('evidence_refs')
+                    and text.startswith('Fundamental discovery: fresh issuer NAV/discount or premium and issuer-published fund P/E')
+                    and f'after {day} (post 3:1 split)' in text):
+                # An explicit SYSTEM-AUTHORED alternative, not a source fact or
+                # a claim that the split occurred. Full review follows expansion.
+                row.update(disposition='replaced_authored_constraint',
+                    reason='NEW SYSTEM PROPOSAL: the old post-split-only entry timing conflicts with this pre-split price expiry. Permit a pre-split proposal only after rechecking current issuer NAV/premium and aligned valuation units; prohibit entry at a NAV premium. Invalidate at the known split deadline and rederive/review after the split. No future event is claimed satisfied.',
+                    system_authored_timing_replacement=True)
+                conditions.remove(text)
+                conditions.append('Before entry, reverify current issuer NAV and premium/discount and aligned portfolio valuation units; no entry at a market premium to NAV. This PRE-SPLIT proposal expires at '+str(pre_split_deadline)+'; after that deadline all prices require recalculation and independent review.')
+                result.setdefault('valuation_basis',{})['system_timing_proposal']={
+                    'source_condition_id':row['condition_id'],'deadline':str(pre_split_deadline),
+                    'independent_review_required':True,'split_has_occurred':False}
     return result
 
 REVIEW_REPAIR = '''
@@ -277,7 +312,7 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
             # spend on an already accepted conditional baseline.
             mapping_error=any('Condition resolution' in str(issue) or 'Retained entry condition' in str(issue)
                               for issue in current.get('review_issues',[]))
-            if (not economic_consistency_errors(current) and not mapping_error) or (current.get('research_assessment') or {}).get('status')=='approved_conditional':
+            if (not economic_consistency_errors(current) and not mapping_error) or (current.get('research_assessment') or {}).get('status') in ('approved_conditional','approved_no_buy'):
                 continue
             key=stable_id(ECONOMIC_REPAIR_CONTRACT,parent_key)
             job=store.get('research_system_repair',key)
@@ -287,7 +322,15 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
                 key=stable_id(CONDITION_REPAIR_CONTRACT,parent_key)
                 job=store.get('research_system_repair',key)
                 replacement_contract=CONDITION_REPAIR_CONTRACT
-                if job and job.get('terminal'):continue
+                if job and job.get('terminal'):
+                    if (job.get('status')=='system_error' and job.get('error')=='ValueError'
+                            and not job.get('plan_revision') and not job.get('local_envelope_recovery')):
+                        # Replay the SAME frozen compile operation/cache; never
+                        # create a second paid draft identity for field relocation.
+                        job.update(terminal=False,status='local_envelope_recovery',
+                                   local_envelope_recovery='retained-condition-envelope-v1')
+                        store.put('research_system_repair',key,job)
+                    else:continue
         if not job:
             job={'id':key,'contract':replacement_contract,'symbol':symbol,'source_id':source['id'],
                  'generation':generation,'round':0,'max_rounds':1 if replacement_contract==CONDITION_REPAIR_CONTRACT else MAX_ROUNDS,'timestamp':now,
@@ -325,6 +368,9 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
             levels=[level for _,level in store.items('research_level') if level.get('symbol')==symbol
                     and source['id'] in level.get('evidence_refs',[])]
             job.update(round=round_index,status='processing');store.put('research_system_repair',key,job)
+            if job.get('local_envelope_recovery'):
+                store.put('research_local_draft_replay',phase_id,{'contract':job['local_envelope_recovery'],
+                    'event_id':phase_id,'paid_generation_allowed':False},immutable=True)
             try:
                 candidates=compile_plan(store,source,levels,model,{symbol:fundamental},job['timestamp'],
                                         context=context)
@@ -340,7 +386,7 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
             revised=next((p for p in candidates if p.get('symbol')==symbol),None)
             if not revised:
                 job.update(status='risk_or_source_deferred',terminal=True);store.put('research_system_repair',key,job);break
-            accepted=revised.get('status')=='active' or (revised.get('research_assessment') or {}).get('status')=='approved_conditional'
+            accepted=revised.get('status')=='active' or (revised.get('research_assessment') or {}).get('status') in ('approved_conditional','approved_no_buy')
             job.update(round=round_index+1,plan_revision=revised['revision'],
                        status='completed' if accepted else 'needs_system_review')
             summary['processed']+=1

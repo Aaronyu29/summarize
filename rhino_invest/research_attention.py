@@ -13,6 +13,7 @@ def attention_items(plans, store=None):
         if plan.get('status') == 'active' and not ready:
             continue
         conditional = assessment.get('status') == 'approved_conditional'
+        no_buy = assessment.get('status') == 'approved_no_buy'
         preflight = bool(plan.get('research_preflight'))
         reviewed = not preflight and (bool(plan.get('review_evidence_id')) or assessment.get('status') == 'needs_evidence')
         details = ' '.join(str(v) for v in plan.get('review_issues', []))
@@ -28,7 +29,10 @@ def attention_items(plans, store=None):
             (('entry_condition', 'executable price predicate', 'price unit', 'split'), '入场规则或价格单位待核实')]:
             if any(token in lower for token in tokens):
                 reasons.append(label)
-        if ready:
+        if no_buy:
+            status='研究已通过·暂不买'
+            reasons=['估值不支持新增买入，本次新增投入0美元']
+        elif ready:
             status = '研究已通过·按条件观察'
             reasons = ['只有价位、账户资金和执行检查均满足时才考虑买入']
         elif conditional:
@@ -42,6 +46,7 @@ def attention_items(plans, store=None):
             reasons = ['独立审核仍有证据缺口'] if reviewed else ['尚无完整审核结果']
         item = {'symbol': plan.get('symbol', '?'), 'status': status,
                 'reasons': sorted(set(reasons)), 'conditional': conditional}
+        if no_buy:item['no_buy']=True
         if ready:
             item['research_ready'] = True
         if store is not None and (ready or conditional):
@@ -67,10 +72,14 @@ def attention_text(items, when):
     else:
         ready = [item for item in items if item.get('research_ready')]
         conditional = [item for item in items if item['conditional']]
-        rejected = [item for item in items if not item['conditional'] and not item.get('research_ready')]
+        rejected = [item for item in items if not item['conditional'] and not item.get('research_ready') and not item.get('no_buy')]
+        no_buy = [item for item in items if item.get('no_buy')]
         lines.append('结论：本次更新没有可直接执行的买入建议。' if not ready
                      else '结论：有研究通过，但买入前仍需检查最新报价和账户资金。')
         lines.append('你无需补财报；这条通知不要求你下单。')
+        if no_buy:
+            lines += ['', '已完成研究，暂不买：']
+            lines += [item['symbol']+'｜估值不支持新增买入；本次新增投入0美元。' for item in no_buy]
         if ready or conditional:
             lines += ['', '可以继续关注：']
         for item in ready + conditional:

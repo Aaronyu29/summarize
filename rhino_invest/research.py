@@ -300,6 +300,19 @@ def _run(model, purpose, payload, frames=(), now=None, store=None):
         [second for second, _ in frames])
     if store is not None and purpose in {'compile_plan', 'review_plan'}:
         _guard_plan_scope(store, purpose, payload, frames, scope)
+    event=(payload.get('review_context') or {}).get('event_id')
+    if store is not None and purpose=='compile_plan' and event and store.get('research_local_draft_replay',event):
+        gateway_scope=stable_id('model-logical-call-v1',scope,[(second,_sha(Path(path))) for second,path in frames])
+        calls=[key for key,value in store.items('model_call') if value.get('purpose')==purpose and value.get('call_scope')==gateway_scope]
+        if len(calls)!=1:
+            raise ModelOutputInvalid('Local draft replay requires one uniquely completed original operation')
+        call_id=calls[0]
+        receipt=store.get('model_receipt',call_id);cached=store.get('model_response',call_id)
+        if not receipt or not cached or store.get('model_rejection',call_id):
+            raise ModelOutputInvalid('Local draft replay requires the preserved receipt and parsed original response')
+        store.put('research_completed_draft_replay',event,{'call_id':call_id,'receipt_hash':stable_id(receipt),
+            'output_hash':stable_id(cached['output']),'new_paid_generation':False},immutable=True)
+        return json.loads(json.dumps(cached['output']))
     if source:
         payload['source'] = _model_source(source, full_transcript=purpose in {'extract_levels', 'verify_levels'},
                                           levels=payload.get('levels'))
@@ -423,7 +436,7 @@ def _model_plan(plan):
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
         'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
-        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin', 'entry_condition_review', 'condition_resolution')
+        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin', 'entry_condition_review', 'condition_resolution', 'research_intent')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -527,6 +540,8 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
     issues = _review_issues(review.get('issues'))
     if review.get('accepted') is not True:
         issues.append('Independent review not accepted')
+    if plan.get('research_intent')=='no_buy' and review.get('no_buy_reviewed') is not True:
+        issues.append('Independent no-buy research review required')
     known = set(evidence_ids)
     refs = plan.get('evidence_refs') or []
     if not refs or not set(refs).issubset(known):
@@ -1595,7 +1610,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if (context or {}).get('repair_policy')=='system-condition-ids-v1' and not context.get('review_only_candidate'):
             from .remediation import expand_condition_ids
             raw_hash=stable_id(proposed)
-            proposed=expand_condition_ids(proposed,context)
+            proposed=expand_condition_ids(proposed,context,pre_split_deadline=basis_deadline if is_etf else None)
+            text=' '.join([str(proposed.get('thesis',''))]+[str(v) for v in proposed.get('entry',{}).get('conditions',[])]).lower()
+            if (proposed.get('entry',{}).get('low') is None and proposed.get('entry',{}).get('high') is None
+                    and proposed.get('take_profit')==[] and (proposed.get('stop') or {}).get('price') is None
+                    and ('research-only' in text or 'no purchase' in text)):
+                proposed['research_intent']='no_buy'
             store.put('research_condition_expansion',operation_key,{'raw_proposal_hash':raw_hash,
                 'expanded_proposal_hash':stable_id(proposed),'catalog':context['original_condition_catalog']},immutable=True)
         if critique:
@@ -1671,6 +1691,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             from .remediation import REVIEW_REPAIR
             review_payload['instruction'] = REVIEW + REVIEW_REPAIR
             review_payload['review_context'] = context
+            if plan.get('research_intent')=='no_buy':
+                review_payload['instruction'] += '\nThis explicitly declares no purchase (research_intent=no_buy). Review the valuation and the no-buy conclusion; do not demand invented entry, stop or take-profit prices for a purchase it does not propose. Return no_buy_reviewed:true only if the no-buy reasoning, sources and scenario math pass. Execution remains prohibited; no-buy approval is not permission to trade.\n'
             if checkpoint:
                 review_payload=checkpoint['payload'];plan=json.loads(json.dumps(review_payload['plan']));revision=plan['revision']
             else:
@@ -1734,6 +1756,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan['research_assessment'] = {'status': 'needs_evidence' if issues else 'approved_conditional' if execution_gaps else 'approved',
             'evidence_bundle_hash': bundle['hash'], 'evidence_generation': fid,
             'repair_status': 'awaiting_new_evidence' if issues else 'reviewed_new_evidence' if repair_feedback else 'initial_review'}
+        if not issues and plan.get('research_intent')=='no_buy':
+            plan['research_assessment']['status']='approved_no_buy'
         if critique:
             plan['research_assessment'].update(critique_id=critique['id'],
                 repair_status='critique_exhausted' if issues else 'critique_accepted')

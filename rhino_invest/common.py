@@ -217,6 +217,11 @@ def classify_plan_validation(plan) -> dict[str, list[str]]:
             for field in ("low", "high"):
                 if entry.get(field) is None:
                     deferred.add(f"entry.{field} must be positive")
+        if (plan.get('research_intent')=='no_buy' and entry.get('low') is None and entry.get('high') is None
+                and plan.get('take_profit')==[] and (plan.get('stop') or {}).get('price') is None):
+            # A reviewed no-buy thesis must not invent sell rules for a purchase
+            # it does not propose. Strict validate_plan still forbids execution.
+            deferred.update({'take_profit schedule required','stop.price must be positive'})
     return {"research_errors": [error for error in errors if error not in deferred],
             "execution_gaps": [error for error in errors if error in deferred]}
 

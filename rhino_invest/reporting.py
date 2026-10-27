@@ -402,7 +402,10 @@ def plan_row(plan, recommendation=None):
             if isinstance(g, dict) and g.get("blocking") and g.get("code") in labels and g.get("scope") != "execution"))
         row["理由"] = "；".join(gaps[:3]) if gaps else "研究资料尚未通过独立审核，暂无新增操作建议"
         row["证据引用"] = "来源记录已内部留存，待独立审核"
-    if conditional:
+    if (plan.get('research_assessment') or {}).get('status')=='approved_no_buy' and plan.get('status') not in {'invalidated','superseded'}:
+        row.update(状态='研究已通过·暂不买',建议动作='不新增买入',单次买入美元='0',买入区间='无买入建议',
+                   理由='独立审核后的估值不支持新增买入；本次新增投入0美元。',证据引用='估值证据与独立审核记录已内部留存')
+    elif conditional:
         row["状态"] = "估值已审核·入场条件待满足"
         row["建议动作"] = "等待入场条件"
         row["理由"] = "估值已通过独立审核；仍需核实入场条件并形成完整入场规则，当前暂无操作建议"

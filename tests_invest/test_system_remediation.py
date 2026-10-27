@@ -237,6 +237,10 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(expanded['entry']['low'],90)
         self.assertEqual(resolution_errors(expanded,{'condition_resolution_reviewed':True},context,set()),[])
         self.assertTrue(resolution_errors(expanded,{},context,set()))
+        for name in ('retained_condition_ids','entry_retained_condition_ids'):
+            misplaced=copy.deepcopy(proposal)
+            misplaced[name]=misplaced['entry'].pop('retained_condition_ids')
+            self.assertEqual(expand_condition_ids(misplaced,context),expanded)
         for bad in ('unknown','duplicate','missing_retained','conflicting_text'):
             changed=copy.deepcopy(proposal)
             if bad=='unknown':changed['condition_resolution'][0]['condition_id']='invented'
@@ -244,6 +248,62 @@ class RemediationTests(unittest.TestCase):
             elif bad=='missing_retained':changed['entry']['retained_condition_ids']=[]
             else:changed['condition_resolution'][0]['previous_condition']='A different fundamental gate'
             with self.assertRaises(ValueError):expand_condition_ids(changed,context)
+        cash='Execution requires a fresh official regular-session quote and verified available cash; policy.amount_usd=1000 is a per-buy strategy setting, not proof of cash.'
+        cash_context={'prior_plan':{'entry':{'conditions':[cash]}}}
+        restored=expand_condition_ids({'entry':{'conditions':['No purchase proposed']},'condition_resolution':[]},cash_context)
+        self.assertEqual(restored['condition_resolution'][0]['disposition'],'execution_gate')
+        self.assertTrue(restored['condition_resolution'][0]['system_supplied_execution_mapping'])
+        self.assertTrue(resolution_errors(restored,{},cash_context,set()))  # Still requires review.
+        timing='Fundamental discovery: fresh issuer NAV/discount or premium and issuer-published fund P/E must be re-verified after 2026-11-05 (post 3:1 split) at a regular-session quote; no entry at a market premium to NAV.'
+        timing_context={'prior_plan':{'entry':{'conditions':[timing]}}}
+        identity=condition_catalog(timing_context)[0]['condition_id']
+        timing_plan={'entry':{'conditions':[],'retained_condition_ids':[identity]},
+                     'condition_resolution':[{'condition_id':identity,'disposition':'retained','reason':'old timing','evidence_refs':['issuer-split']}]}
+        revised=expand_condition_ids(timing_plan,timing_context,pre_split_deadline='2026-11-05T05:00:00Z')
+        self.assertEqual(revised['condition_resolution'][0]['disposition'],'replaced_authored_constraint')
+        self.assertFalse(revised['valuation_basis']['system_timing_proposal']['split_has_occurred'])
+        self.assertIn('no entry at a market premium to NAV',revised['entry']['conditions'][0])
+        self.assertEqual(resolution_errors(revised,{'condition_resolution_reviewed':True},timing_context,{'issuer-split'}),[])
+        self.assertTrue(resolution_errors(revised,{},timing_context,{'issuer-split'}))
+
+    def test_no_buy_research_never_relaxes_execution_and_requires_specific_review(self):
+        from rhino_invest.common import validate_plan,validate_research_plan
+        from rhino_invest.research import _assess_plan
+        from rhino_invest.reporting import plan_row
+        from rhino_invest.research_attention import attention_items,attention_text
+        from tests_invest.test_acceptance_core import approved_plan
+        p=approved_plan('GOOG')
+        p.update(status='needs_review',research_intent='no_buy',take_profit=[],stop={'price':None,'confirmation':'daily_close'},
+                 research_assessment={'status':'approved_no_buy'})
+        p['entry'].update(low=None,high=None,basis='independent_valuation',conditions=['Research-only; no purchase proposed'])
+        self.assertEqual(validate_research_plan(p),[])
+        self.assertIn('stop.price must be positive',validate_plan(p))
+        self.assertIn('take_profit schedule required',validate_plan(p))
+        review={'accepted':True,'checks':{'currency':True,'unit':True,'provenance':True},'issues':[]}
+        data={'instrument_contract':{'quote_price_unit':'per_share'},'financial_report':{'fixture':True}}
+        self.assertIn('Independent no-buy research review required',_assess_plan(p,review,['sealed:1'],data))
+        review['no_buy_reviewed']=True
+        self.assertNotIn('Independent no-buy research review required',_assess_plan(p,review,['sealed:1'],data))
+        self.assertEqual(plan_row(p)['单次买入美元'],'0')
+        text=attention_text(attention_items([p]),'fixture')
+        self.assertIn('本次新增投入0美元',text)
+        self.assertNotIn('这些计划暂时不能用',text)
+
+    def test_local_schema_recovery_reuses_unique_paid_receipt_without_a_generation_call(self):
+        from rhino_invest.research import _run,_logical_fundamentals
+        payload={'symbol':'GOOG','review_context':{'event_id':'frozen'}}
+        scope=stable_id('research-logical-call','compile_plan',None,'GOOG',_logical_fundamentals(None),'frozen',[])
+        gateway=stable_id('model-logical-call-v1',scope,[])
+        self.store.put('research_local_draft_replay','frozen',{'paid_generation_allowed':False},immutable=True)
+        self.store.put('model_call','completed',{'purpose':'compile_plan','call_scope':gateway,'timestamp':NOW},immutable=True)
+        self.store.put('model_receipt','completed',{'completed':True},immutable=True)
+        output={'plan':{'symbol':'GOOG','retained_condition_ids':['original']}}
+        self.store.put('model_response','completed',{'output':output},immutable=True)
+        class NoNewCall:
+            def run(self,*args,**kwargs):raise AssertionError('A local field recovery cannot buy another generation')
+        self.assertEqual(_run(NoNewCall(),'compile_plan',payload,store=self.store),output)
+        self.assertEqual(len(self.store.items('model_call')),1)
+        self.assertFalse(self.store.get('research_completed_draft_replay','frozen')['new_paid_generation'])
 
 
 if __name__=='__main__':unittest.main()
