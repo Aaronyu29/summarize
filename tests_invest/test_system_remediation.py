@@ -125,7 +125,12 @@ class RemediationTests(unittest.TestCase):
         return data,baseline
 
     def test_failed_replacement_keeps_accepted_baseline_and_review_only_phase_never_buys_draft(self):
-        data,baseline=self.conditional_baseline();model=RepairModel(reject=True)
+        class NoBuyDraft(RepairModel):
+            def run(self,purpose,payload,**kwargs):
+                result=super().run(purpose,payload,**kwargs)
+                if purpose=='compile_plan':result['plan']['research_intent']='no_buy'
+                return result
+        data,baseline=self.conditional_baseline();model=NoBuyDraft(reject=True)
         remediate_plans(self.store,model,{'NVDA':data},NOW)
         self.assertEqual(self.store.get('plan',baseline['id']),baseline)
         revisions=[p['revision'] for k,p in self.store.items('plan_revision') if p['id']==baseline['id']]
@@ -134,6 +139,7 @@ class RemediationTests(unittest.TestCase):
         result=adjudicate_research(self.store,model,{'NVDA':data},NOW)
         self.assertEqual(result['processed'],1)
         self.assertEqual(model.calls[before:],['review_plan'])
+        self.assertEqual(model.payloads[-1][1]['plan']['research_intent'],'no_buy')
         adjudicate_research(self.store,model,{'NVDA':data},NOW)
         self.assertEqual(len(model.calls),before+1)
         self.assertEqual(self.store.get('plan',baseline['id']),baseline)
@@ -279,6 +285,10 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(validate_research_plan(p),[])
         self.assertIn('stop.price must be positive',validate_plan(p))
         self.assertIn('take_profit schedule required',validate_plan(p))
+        self.assertIn('no-buy research cannot authorize execution',validate_plan(p))
+        filled=approved_plan('GOOG');filled['research_intent']='no_buy'
+        self.assertIn('no-buy research cannot authorize execution',validate_plan(filled))
+        self.assertIn('no-buy research cannot authorize execution',validate_research_plan(filled))
         review={'accepted':True,'checks':{'currency':True,'unit':True,'provenance':True},'issues':[]}
         data={'instrument_contract':{'quote_price_unit':'per_share'},'financial_report':{'fixture':True}}
         self.assertIn('Independent no-buy research review required',_assess_plan(p,review,['sealed:1'],data))
@@ -304,6 +314,28 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(_run(NoNewCall(),'compile_plan',payload,store=self.store),output)
         self.assertEqual(len(self.store.items('model_call')),1)
         self.assertFalse(self.store.get('research_completed_draft_replay','frozen')['new_paid_generation'])
+
+    def test_authored_review_queue_preserves_inputs_across_budget_deferral(self):
+        from rhino_invest.remediation import review_authored_proposals
+        from rhino_invest.research import plan_fingerprint
+        _,old=self.seed();candidate=copy.deepcopy(old);candidate['research_intent']='no_buy'
+        context={'event_id':'authored-once','kind':'system-plan-remediation-v1','prior_plan':old,
+                 'latest_failed_plan':old,'review_only_candidate':candidate,'candidate_hash':plan_fingerprint(candidate)}
+        self.store.put('research_authored_proposal','once',{'context':context,'as_of':NOW,
+            'source_id':old['research_snapshot_id'],'fundamental_evidence_id':old['fundamental_evidence_id']},immutable=True)
+        seen=[]
+        def review(store,source,levels,model,fundamentals,now,context):
+            seen.append((now,copy.deepcopy(context)))
+            if len(seen)==1:raise ModelBudgetExceeded('budget')
+            return [dict(old,revision=99,research_assessment={'status':'approved_no_buy'})]
+        with patch('rhino_invest.remediation.compile_plan',side_effect=review):
+            first=review_authored_proposals(self.store,None,NOW)
+            self.assertEqual(first['deferred'][0]['error'],'ModelBudgetExceeded')
+            review_authored_proposals(self.store,None,'2026-10-24T00:00:00Z')
+            review_authored_proposals(self.store,None,'2026-10-25T00:00:00Z')
+        self.assertEqual(len(seen),2);self.assertEqual(seen[0],seen[1])
+        self.assertEqual(self.store.get('research_authored_review','once')['status'],'approved_no_buy')
+        self.assertEqual(self.store.items('model_call'),[])
 
 
 if __name__=='__main__':unittest.main()

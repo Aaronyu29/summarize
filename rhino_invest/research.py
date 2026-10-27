@@ -1591,6 +1591,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 raise ValueError('Frozen review-only candidate changed')
             proposed={key:candidate[key] for key in COMPILE_TEMPLATE['plan'] if key in candidate}
             if 'condition_resolution' in candidate:proposed['condition_resolution']=candidate['condition_resolution']
+            if 'research_intent' in candidate:proposed['research_intent']=candidate['research_intent']
         elif calculation_seed is not None:
             # Reuse economic inputs, never old reviewer state/verification.
             proposed = {key: calculation_seed[key] for key in COMPILE_TEMPLATE['plan'] if key in calculation_seed}

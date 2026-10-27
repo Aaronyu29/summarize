@@ -92,6 +92,8 @@ def validate_plan(plan) -> list[str]:
     errors = []
     if not isinstance(plan, dict):
         return ["plan must be an object"]
+    if plan.get('research_intent')=='no_buy':
+        errors.append('no-buy research cannot authorize execution')
     for field in ("id", "revision", "symbol", "status", "created_at", "thesis",
                   "time_exit_policy", "valuation_basis"):
         if not plan.get(field):
@@ -221,7 +223,8 @@ def classify_plan_validation(plan) -> dict[str, list[str]]:
                 and plan.get('take_profit')==[] and (plan.get('stop') or {}).get('price') is None):
             # A reviewed no-buy thesis must not invent sell rules for a purchase
             # it does not propose. Strict validate_plan still forbids execution.
-            deferred.update({'take_profit schedule required','stop.price must be positive'})
+            deferred.update({'take_profit schedule required','stop.price must be positive',
+                             'no-buy research cannot authorize execution'})
     return {"research_errors": [error for error in errors if error not in deferred],
             "execution_gaps": [error for error in errors if error in deferred]}
 

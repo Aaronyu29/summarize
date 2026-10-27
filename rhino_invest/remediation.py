@@ -241,6 +241,44 @@ def adjudicate_research(store,model,fundamentals,now,priority_symbols=()):
         store.put('research_reaudit',key,{'terminal':True,'status':(chosen or {}).get('research_assessment',{}).get('status','deferred'),
             'symbol':job['symbol'],'revision':(chosen or {}).get('revision'),'timestamp':now})
         result['processed']+=1
+    authored=review_authored_proposals(store,model,now)
+    result['processed']+=authored['processed']
+    result['errors'].extend(authored['errors']);result['deferred'].extend(authored['deferred'])
+    return result
+
+
+def review_authored_proposals(store,model,now):
+    """Durable review-only queue for explicit system-authored corrected inputs."""
+    from .research import plan_fingerprint
+    result={'processed':0,'errors':[],'deferred':[]}
+    for key,proposal in store.items('research_authored_proposal'):
+        state=store.get('research_authored_review',key) or {}
+        if state.get('terminal'):continue
+        context=proposal['context'];candidate=context['review_only_candidate']
+        source=store.get('research_evidence',proposal['source_id'])
+        evidence=store.get('fundamental_evidence',proposal['fundamental_evidence_id'])
+        current=store.get('plan',candidate['id'])
+        if (not source or not evidence or not current or plan_fingerprint(candidate)!=context['candidate_hash']
+                or not same_published_seed(current,context)):
+            store.put('research_authored_review',key,{'terminal':True,'status':'superseded_or_invalid_input'})
+            continue
+        if _unresolved_thesis_defer(store,current,source,{candidate['symbol']:evidence['data']},now):
+            result['deferred'].append({'symbol':candidate['symbol'],'reason':'UNRESOLVED_VERIFIED_THESIS_RISK'});continue
+        if any(not store.get('model_receipt',k) and not store.get('model_rejection',k) for k,_ in store.items('model_call')):
+            result['deferred'].append({'symbol':candidate['symbol'],'error':'UnknownModelOutcome'});continue
+        levels=[v for _,v in store.items('research_level') if v.get('symbol')==candidate['symbol'] and source['id'] in v.get('evidence_refs',[])]
+        try:
+            plans=compile_plan(store,source,levels,model,{candidate['symbol']:evidence['data']},proposal['as_of'],context=context)
+        except Exception as error:
+            deferred=isinstance(error,(ModelBudgetExceeded,UnknownModelOutcome))
+            store.put('research_authored_review',key,{'terminal':not deferred,'status':'deferred' if deferred else 'review_error',
+                'error':type(error).__name__})
+            result['deferred' if deferred else 'errors'].append({'symbol':candidate['symbol'],'error':type(error).__name__})
+            continue
+        chosen=next((p for p in plans if p['symbol']==candidate['symbol']),None)
+        store.put('research_authored_review',key,{'terminal':True,'status':(chosen or {}).get('research_assessment',{}).get('status','no_result'),
+            'symbol':candidate['symbol'],'revision':(chosen or {}).get('revision'),'timestamp':now})
+        result['processed']+=1
     return result
 
 
