@@ -31,7 +31,8 @@ def attention_items(plans, store=None):
                 reasons.append(label)
         if no_buy:
             status='研究已通过·暂不买'
-            reasons=['估值不支持新增买入，本次新增投入0美元']
+            reasons=['现有证据不足以支持新增买入，本次新增投入0美元' if (plan.get('valuation_basis') or {}).get('kind')=='insufficient_valuation'
+                     else '估值不支持新增买入，本次新增投入0美元']
         elif ready:
             status = '研究已通过·按条件观察'
             reasons = ['只有价位、账户资金和执行检查均满足时才考虑买入']
@@ -79,7 +80,7 @@ def attention_text(items, when):
         lines.append('你无需补财报；这条通知不要求你下单。')
         if no_buy:
             lines += ['', '已完成研究，暂不买：']
-            lines += [item['symbol']+'｜估值不支持新增买入；本次新增投入0美元。' for item in no_buy]
+            lines += [item['symbol']+'｜'+item['reasons'][0]+'。' for item in no_buy]
         if ready or conditional:
             lines += ['', '可以继续关注：']
         for item in ready + conditional:

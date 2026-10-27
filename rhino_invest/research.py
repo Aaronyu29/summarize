@@ -12,7 +12,7 @@ import sqlite3
 from pathlib import Path
 from datetime import timedelta, datetime, timezone
 from decimal import Decimal, localcontext, InvalidOperation
-from .common import utc_now, stable_id, validate_research_plan, classify_plan_validation, decimal_value, parse_time
+from .common import utc_now, stable_id, validate_research_plan, classify_plan_validation, decimal_value, parse_time, evidence_limited_no_buy
 from .market import symbol_value, instrument_contract, normalize_fundamentals
 
 
@@ -220,6 +220,19 @@ Growth and exit PE are explained scenario assumptions based on holdings/industry
 not corporate EPS or promises. State fees, concentration and corporate-action basis.
 Leave unsupported fields null and state gaps; missing data means needs_review, not a buy.
 Do not use illustrative user numbers 370/800/270. No generic automatic upside percentage.'''
+COMPILE += '''
+For operating-income-derived equity scenarios prefer assumptions.operating_eps_bridge
+{operating_income,annual_growth,years,tax_rate,after_tax_nonoperating_cost,diluted_shares}.
+EPS=(operating_income*(1+annual_growth)^years*(1-tax_rate)-after_tax_nonoperating_cost)/diluted_shares.
+Use consistent income/share scales, explicit source anchors and labelled future assumptions.
+Never also supply eps_bridge or compound an already-forecast EPS a second time.
+Every initial-entry take-profit must exceed entry.high and stop must be below entry.low.
+A NO-BUY decision is valid research: research_intent=no_buy, low/high/stop.price=null,
+take_profit=[], with explicit source-backed reasoning and preserved genuine conditions.
+If valuation cannot be established, use valuation_basis.kind=insufficient_valuation,
+targets=[], and explain the exact evidence gaps; do not fabricate EPS, a target or buy band.
+No-buy research never authorizes execution and does not certify a valuation.
+'''
 REVIEW = '''Independently review each target scenario, arithmetic, explicit assumptions,
 financial source periods/units, ADR conversion, downside, entry/stop/TP, thesis invalidation
 and 12-36 month horizon. Return {"accepted":false,"issues":[],"checks":{
@@ -261,6 +274,14 @@ execution_conditions:[the exact executable predicates]}. Attest price_only and
 all_text_conditions_covered=true ONLY if the single exact price_between predicate
 covers every text condition. Future fundamental conditions remain conditional research;
 do not presume a boolean conditions_parsed proves that they are satisfied.'''
+REVIEW += '''
+Explicit research_intent=no_buy is a decision to abstain. Require no_buy_reviewed:true
+only after independent source/condition review. It never authorizes execution.
+For valuation_basis.kind=insufficient_valuation with no entry/targets/stop/TP, review
+whether the historical facts and disclosed valuation gaps justify abstaining; do not
+force invented forecasts or claim that a point valuation has passed. Empty targets
+are allowed ONLY for this explicit non-executable, evidence-limited no-buy decision.
+'''
 EVENT_REVIEW = REVIEW + ''' For a risk event, also return assessment:{triggered:false,
 condition:null,evidence_refs:[],rationale:null}. Set triggered true ONLY when the new
 persisted raw evidence proves one EXACT existing plan.invalidation_conditions string.
@@ -574,7 +595,7 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
         if selected[0].get('conditions') not in entry['conditions']:
             issues.append('Exact source entry conditions must be retained; conditional support is not an unconditional buy')
     targets = plan.get('targets') or []
-    if len(targets) < 2:
+    if len(targets) < 2 and not evidence_limited_no_buy(plan):
         issues.append('Base/downside scenarios required')
     for target in targets:
         try:
@@ -631,6 +652,8 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
         if metadata.get(key) and plan.get(key) != metadata[key]:
             issues.append('Plan ' + key + ' differs from reviewed instrument identity')
     issues.extend(validate_research_plan(plan))
+    from .remediation import economic_consistency_errors
+    issues.extend(economic_consistency_errors(plan))
     return list(dict.fromkeys(issues))
 
 
@@ -1406,7 +1429,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 and previous.get('research_snapshot_id') == snapshot['id']
                 and previous.get('fundamental_evidence_id') == fid
                 and (previous.get('status') == 'active' or
-                     (previous.get('research_assessment') or {}).get('status') == 'approved_conditional')):
+                     (previous.get('research_assessment') or {}).get('status') in ('approved_conditional','approved_no_buy'))):
             from .decisions import _has_provenance
             if _has_provenance(store, previous):
                 plans.append(previous)
@@ -1428,7 +1451,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if committed:
             if (previous and previous.get('revision', 0) > committed['plan'].get('revision', 0)
                     and (previous.get('status') == 'active'
-                        or previous.get('research_assessment', {}).get('status') == 'approved_conditional')):
+                        or previous.get('research_assessment', {}).get('status') in ('approved_conditional','approved_no_buy'))):
                 plans.append(previous)
                 continue  # A stale rejected operation must not replace an accepted newer thesis.
             _, preview = _calculate_target_prices(committed['plan'])
@@ -1694,6 +1717,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             review_payload['review_context'] = context
             if plan.get('research_intent')=='no_buy':
                 review_payload['instruction'] += '\nThis explicitly declares no purchase (research_intent=no_buy). Review the valuation and the no-buy conclusion; do not demand invented entry, stop or take-profit prices for a purchase it does not propose. Return no_buy_reviewed:true only if the no-buy reasoning, sources and scenario math pass. Execution remains prohibited; no-buy approval is not permission to trade.\n'
+                if evidence_limited_no_buy(plan):
+                    review_payload['instruction'] += '\nvaluation_basis.kind=insufficient_valuation explicitly WITHDRAWS unvalidated price estimates. Review the evidence-backed decision to withhold a purchase because valuation is not established. Do not demand invented EPS/targets or treat the acknowledged evidence gap as a false valuation claim. Accept only if historical facts, disclosed gaps, condition resolutions and the no-buy decision are accurate. Approval confirms the decision to abstain, NOT that a valuation or entry price has been verified.\n'
             if checkpoint:
                 review_payload=checkpoint['payload'];plan=json.loads(json.dumps(review_payload['plan']));revision=plan['revision']
             else:
@@ -1734,7 +1759,6 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             if (context or {}).get('kind') == 'system-plan-remediation-v1':
                 from .remediation import resolution_errors, economic_consistency_errors
                 issues.extend(resolution_errors(plan, review, context, set(evidence_ids)))
-                issues.extend(economic_consistency_errors(plan))
             if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
                 issues.append('No individually verified source levels')
             execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
@@ -1788,7 +1812,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             if (calculation_seed and current and previous
                     and plan_fingerprint(current) != plan_fingerprint(previous)
                     and (current.get('status') == 'active'
-                         or current.get('research_assessment', {}).get('status') == 'approved_conditional')):
+                         or current.get('research_assessment', {}).get('status') in ('approved_conditional','approved_no_buy'))):
                 plans.append(current)
                 continue
             fallback=None

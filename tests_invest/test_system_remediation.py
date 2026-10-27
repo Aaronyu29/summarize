@@ -289,6 +289,11 @@ class RemediationTests(unittest.TestCase):
         filled=approved_plan('GOOG');filled['research_intent']='no_buy'
         self.assertIn('no-buy research cannot authorize execution',validate_plan(filled))
         self.assertIn('no-buy research cannot authorize execution',validate_research_plan(filled))
+        evidence_only=copy.deepcopy(p)
+        evidence_only.update(targets=[],valuation_basis={'kind':'insufficient_valuation','gaps':['No independently accepted per-share forecast']})
+        self.assertEqual(validate_research_plan(evidence_only),[])
+        self.assertIn('evidenced target scenarios required',validate_plan(evidence_only))
+        self.assertIn('no-buy research cannot authorize execution',validate_plan(evidence_only))
         review={'accepted':True,'checks':{'currency':True,'unit':True,'provenance':True},'issues':[]}
         data={'instrument_contract':{'quote_price_unit':'per_share'},'financial_report':{'fixture':True}}
         self.assertIn('Independent no-buy research review required',_assess_plan(p,review,['sealed:1'],data))

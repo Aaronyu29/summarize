@@ -194,6 +194,15 @@ def validate_plan(plan) -> list[str]:
     return errors
 
 
+def evidence_limited_no_buy(plan):
+    if not isinstance(plan,dict):return False
+    entry=plan.get('entry');basis=plan.get('valuation_basis');stop=plan.get('stop')
+    if not all(isinstance(value,dict) for value in (entry,basis,stop)):return False
+    return (plan.get('research_intent')=='no_buy' and basis.get('kind')=='insufficient_valuation'
+        and plan.get('targets')==[] and entry.get('low') is None and entry.get('high') is None
+        and plan.get('take_profit')==[] and stop.get('price') is None)
+
+
 def classify_plan_validation(plan) -> dict[str, list[str]]:
     """Separate a conditional valuation's entry gaps from research defects.
 
@@ -225,6 +234,8 @@ def classify_plan_validation(plan) -> dict[str, list[str]]:
             # it does not propose. Strict validate_plan still forbids execution.
             deferred.update({'take_profit schedule required','stop.price must be positive',
                              'no-buy research cannot authorize execution'})
+            if evidence_limited_no_buy(plan):
+                deferred.add('evidenced target scenarios required')
     return {"research_errors": [error for error in errors if error not in deferred],
             "execution_gaps": [error for error in errors if error in deferred]}
 

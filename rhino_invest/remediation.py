@@ -184,7 +184,7 @@ def accepted_fallback(store,context,candidate):
         return None
     if (baseline.get('fundamental_evidence_id')==candidate.get('fundamental_evidence_id')
             and baseline.get('research_snapshot_id')==candidate.get('research_snapshot_id')
-            and (baseline.get('status')=='active' or (baseline.get('research_assessment') or {}).get('status')=='approved_conditional')
+            and (baseline.get('status')=='active' or (baseline.get('research_assessment') or {}).get('status') in ('approved_conditional','approved_no_buy'))
             and _has_provenance(store,baseline)):
         return baseline
     return None
