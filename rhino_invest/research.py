@@ -577,6 +577,12 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                 raise ValueError('Unsupported target method')
             if abs(decimal_value(assumptions['eps']) * decimal_value(assumptions['multiple']) - decimal_value(target['price'])) > Decimal('.01'):
                 raise ValueError('Target arithmetic mismatch')
+            if assumptions.get('operating_eps_bridge') is not None:
+                if assumptions.get('eps_bridge') is not None:
+                    raise ValueError('Choose one EPS bridge; forecast growth cannot be applied twice')
+                eps, _ = _operating_eps(assumptions['operating_eps_bridge'])
+                if abs(eps-decimal_value(assumptions['eps'])) > Decimal('.000001'):
+                    raise ValueError('Operating income/tax/share bridge does not reproduce EPS')
             if assumptions.get('eps_bridge') is not None:
                 bridge = assumptions['eps_bridge']
                 with localcontext() as precision:
@@ -1048,6 +1054,23 @@ def _validate_etf_target(target, plan, fundamentals, known):
 CALCULATION_CONTRACT = 'scenario-price-decimal-v1'
 
 
+def _operating_eps(bridge):
+    """Reproduce authored fiscal inputs without selecting financial assumptions."""
+    keys=('operating_income','annual_growth','years','tax_rate','after_tax_nonoperating_cost','diluted_shares')
+    values={key:decimal_value(bridge[key]) for key in keys}
+    income,growth,years,tax,cost,shares=(values[key] for key in keys)
+    if income<=0 or growth<=-1 or not 0<=years<=10 or not 0<=tax<1 or cost<0 or shares<=0:
+        raise ValueError('Operating EPS bridge inputs outside supported calculation domain')
+    with localcontext() as precision:
+        precision.prec=40
+        grown=income*(1+growth)**years
+        after_tax=grown*(1-tax)
+        net=after_tax-cost
+        if net<=0:raise ValueError('Nonpositive operating EPS cannot support this positive-PE method')
+        return net/shares,{'grown_operating_income':str(grown),'after_tax_operating_income':str(after_tax),
+                           'after_tax_net_proxy':str(net),'diluted_shares':str(shares)}
+
+
 def _calculate_target_prices(proposal):
     """Calculate disclosed formulas only; never select or repair assumptions."""
     plan = json.loads(json.dumps(proposal))
@@ -1062,6 +1085,14 @@ def _calculate_target_prices(proposal):
                 intermediates, eps_bridge = {}, None
                 if target.get('method') == 'eps_multiple':
                     bridge = assumptions.get('eps_bridge') if isinstance(assumptions, dict) else None
+                    operating_bridge=assumptions.get('operating_eps_bridge')
+                    if operating_bridge is not None:
+                        if bridge is not None:continue
+                        derived,details=_operating_eps(operating_bridge)
+                        eps_bridge={'inputs':dict(operating_bridge),'original_eps':assumptions.get('eps'),
+                            'derived_eps_unrounded':str(derived),'intermediates':details,
+                            'formula':'(operating_income * (1 + annual_growth) ** years * (1 - tax_rate) - after_tax_nonoperating_cost) / diluted_shares'}
+                        assumptions['eps']=str(derived)
                     if bridge is not None:
                         anchor = decimal_value(bridge['anchor_eps'])
                         growth, years = decimal_value(bridge['annual_growth']), decimal_value(bridge['years'])
@@ -1510,6 +1541,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
             from .remediation import COMPILE_REPAIR
             payload['instruction'] = COMPILE + COMPILE_REPAIR
+            if context.get('repair_policy')=='system-economic-repair-v1':
+                from .remediation import ECONOMIC_REPAIR
+                payload['instruction'] += ECONOMIC_REPAIR
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
         etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
         holding_gaps = []

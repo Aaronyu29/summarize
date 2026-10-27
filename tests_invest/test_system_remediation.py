@@ -178,5 +178,49 @@ class RemediationTests(unittest.TestCase):
                 remediate_plans(store,None,{},NOW,('TSM','GOOG','CRCL'))
             self.assertEqual(calls,['TSM','GOOG','CRCL'])
 
+    def test_economic_replacement_is_bounded_and_preserves_original_conditions(self):
+        data,old=self.seed();contexts=[]
+        def invalid(store,source,levels,model,fundamentals,now,context):
+            contexts.append(copy.deepcopy(context))
+            revised=copy.deepcopy(old)
+            revised.update(revision=len(contexts)+10,entry={'low':'100','high':'110','conditions':['bad replacement']},
+                           take_profit=[{'price':'90'}],stop={'price':'80'})
+            store.put('plan',old['id'],revised)
+            store.put('plan_revision',stable_id(old['id'],revised['revision']),revised)
+            return [revised]
+        with patch('rhino_invest.remediation.compile_plan',side_effect=invalid):
+            remediate_plans(self.store,None,{'NVDA':data},NOW)
+            self.store.put('model_call','unresolved-parent',{'timestamp':NOW},immutable=True)
+            paused=remediate_plans(self.store,None,{'NVDA':data},NOW)
+            self.assertEqual(len(contexts),2)
+            self.assertEqual(paused['errors'][0]['error'],'UnknownModelOutcome')
+            self.store.put('model_receipt','unresolved-parent',{'completed':True},immutable=True)
+            for _ in range(4):remediate_plans(self.store,None,{'NVDA':data},NOW)
+        self.assertEqual(len(contexts),4)  # Two original + two numeric-policy proposals.
+        self.assertEqual(contexts[2]['prior_plan'],contexts[0]['prior_plan'])
+        self.assertEqual(contexts[2]['repair_policy'],'system-economic-repair-v1')
+        self.assertTrue(contexts[2]['calculation_feedback']['economic_errors'])
+        self.assertEqual(len(self.store.items('research_system_repair')),2)
+
+    def test_operating_bridge_computes_one_growth_tax_and_dilution_chain(self):
+        from rhino_invest.research import _calculate_target_prices,_operating_eps
+        bridge={'operating_income':'100','annual_growth':'.1','years':2,'tax_rate':'.2',
+                'after_tax_nonoperating_cost':'6.8','diluted_shares':'9'}
+        eps,details=_operating_eps(bridge)
+        self.assertEqual(eps,10)
+        self.assertEqual(details['after_tax_net_proxy'],'90.000')
+        target={'method':'eps_multiple','price':'90','assumptions':{'eps':'999','multiple':20,'operating_eps_bridge':bridge}}
+        p,book=_calculate_target_prices({'targets':[target],'entry':{'low':70,'high':80},'stop':{'price':60}})
+        self.assertEqual(p['targets'][0]['price'],'200.00')
+        self.assertEqual(p['targets'][0]['assumptions']['eps'],'10.000')
+        self.assertEqual(p['entry'],{'low':70,'high':80})
+        self.assertEqual(p['stop'],{'price':60})
+        self.assertFalse(book['inputs_selected_by_calculator'])
+        target['assumptions']['eps_bridge']={'anchor_eps':10,'annual_growth':'.1','years':2}
+        _,book=_calculate_target_prices({'targets':[target]})
+        self.assertEqual(book['targets'],[])  # Never silently apply both growth bridges.
+        for bad in ({'diluted_shares':0},{'tax_rate':1},{'after_tax_nonoperating_cost':1000}):
+            with self.assertRaises(ValueError):_operating_eps(dict(bridge,**bad))
+
 
 if __name__=='__main__':unittest.main()

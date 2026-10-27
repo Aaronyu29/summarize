@@ -5,6 +5,7 @@ from .research import compile_plan, _research_fundamental, _stable_fundamentals,
 
 CONTRACT = 'system-plan-remediation-v1'
 MAX_ROUNDS = 2
+ECONOMIC_REPAIR_CONTRACT = 'system-economic-repair-v1'
 
 COMPILE_REPAIR = '''
 SYSTEM_PLAN_REMEDIATION_V1. Repair the supplied original proposal; the system owns
@@ -37,6 +38,37 @@ Replacing an authored constraint must be expressly justified as a NEW proposal, 
 source support and independent review, never claim an unfulfilled event has occurred.
 Return the full original plan JSON template; put condition_resolution INSIDE its
 plan object, never at the outer response envelope.'''
+
+ECONOMIC_REPAIR = '''
+ECONOMIC_REPAIR_V1: The earlier completed proposal has a mechanically verified
+entry/stop/profit contradiction. Author a coherent replacement, not cosmetic prose.
+Use calculation_feedback as arithmetic evidence, not authority for its old assumptions.
+Do not copy the old entry band when its base target is inside/below that band. An
+initial buy must have a justified lower entry and upside exits; if no purchase is
+supported, explicitly return research-only with missing entry/targets, not a fake buy.
+Every take-profit step must be ABOVE entry.high; a bear target is a risk scenario.
+For equities derive operating EPS from actual income, taxes, non-operating costs
+and diluted shares. Do not compound an EPS that ALREADY contains forecast growth.
+Use assumptions.operating_eps_bridge with numeric {operating_income,annual_growth,
+years,tax_rate,after_tax_nonoperating_cost,diluted_shares} when that method is used.
+Formula: (operating_income*(1+annual_growth)^years*(1-tax_rate)
+-after_tax_nonoperating_cost)/diluted_shares. All monetary and share inputs must use
+consistent scales (e.g. both billions), years is elapsed fiscal growth years, not
+necessarily the investment holding period. The cost is an AFTER-tax net cost proxy.
+Do not also set eps_bridge. The calculator computes exact EPS and target from those
+chosen inputs. Explain assumptions and historical anchors so a reviewer can reproduce.
+Do not claim a 40% stablecoin circulation CAGR is 40% EPS growth. For Circle model
+reserve return, distribution costs, operating costs, tax and dilution explicitly, or
+use a transparently conservative reported operating-income run-rate scenario with
+sensitivities; do not sum quarterly EPS with different share weights as an annual EPS.
+For ETF use the aligned historical NAV/PE pair only; do not mix latest NAV with an
+older PE. A future split does not make a pre-split proposal unusable BEFORE the split:
+state a genuine pre-split deadline, then invalidate/recalculate. A requirement to use
+post-split data before a pre-split deadline is impossible. Propose a documented
+replacement to that authored constraint; never claim the split already occurred.
+Preserve actual future earnings-confirmation conditions. Replacing an authored gate
+is allowed only with explicit new-proposal justification and independent review.
+'''
 
 REVIEW_REPAIR = '''
 SYSTEM_PLAN_REMEDIATION_V1 independent review. Review prior objections as hypotheses,
@@ -188,12 +220,21 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
         generation=stable_id('fundamentals',_stable_fundamentals(fundamental))
         key=stable_id(CONTRACT,symbol,source['id'],generation)
         job=store.get('research_system_repair',key)
+        parent_key=key
         if job and job.get('terminal'):
-            continue
+            # A distinct, fixed policy addresses proven economics defects only.
+            # Never reset the completed rounds, create timestamped identities, or
+            # spend on an already accepted conditional baseline.
+            if not economic_consistency_errors(current) or (current.get('research_assessment') or {}).get('status')=='approved_conditional':
+                continue
+            key=stable_id(ECONOMIC_REPAIR_CONTRACT,parent_key)
+            job=store.get('research_system_repair',key)
+            if job and job.get('terminal'):continue
         if not job:
-            job={'id':key,'contract':CONTRACT,'symbol':symbol,'source_id':source['id'],
+            job={'id':key,'contract':ECONOMIC_REPAIR_CONTRACT if key!=parent_key else CONTRACT,'symbol':symbol,'source_id':source['id'],
                  'generation':generation,'round':0,'max_rounds':MAX_ROUNDS,'timestamp':now,
                  'status':'queued','terminal':False}
+            if key!=parent_key:job['parent_job_id']=parent_key
             store.put('research_system_repair',key,job)
         store.put('research_system_repair_current',current['id'],job)
         for round_index in range(job['round'],MAX_ROUNDS):
@@ -210,9 +251,16 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
                 latest=(store.get('plan_revision',stable_id(current['id'],job.get('plan_revision')))
                         if job.get('plan_revision') else None) or store.get('plan',current['id']) or current
                 first=store.get('research_system_repair_input',stable_id(key,'round',0))
+                if not first and job.get('parent_job_id'):
+                    first=store.get('research_system_repair_input',stable_id(job['parent_job_id'],'round',0))
                 original=(first or {}).get('prior_plan') or latest
                 context={'event_id':phase_id,'kind':CONTRACT,'round':round_index,
                          'prior_plan':original,'latest_failed_plan':latest,'system_owned':True}
+                if job.get('contract')==ECONOMIC_REPAIR_CONTRACT:
+                    from .research import _calculate_target_prices
+                    context.update(repair_policy=ECONOMIC_REPAIR_CONTRACT,
+                        calculation_feedback={'economic_errors':economic_consistency_errors(latest),
+                            'calculation_book':_calculate_target_prices(latest)[1]})
                 store.put('research_system_repair_input',phase_id,context,immutable=True)
             levels=[level for _,level in store.items('research_level') if level.get('symbol')==symbol
                     and source['id'] in level.get('evidence_refs',[])]
