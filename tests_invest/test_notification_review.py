@@ -125,7 +125,7 @@ class NotificationReviewTests(unittest.TestCase):
             self.assertEqual(len(attention), 1)
             for symbol in ('GOOGL', 'CRCL', 'TSM', 'NVDA', 'META', 'AAPL'):
                 self.assertIn(symbol+'｜', attention[0])
-            self.assertIn('不生成操作建议', attention[0])
+            self.assertIn('本次更新没有可直接执行的买入建议', attention[0])
             major = [report for _, report in store.items("report") if report.get("kind") == "重大变化"]
             self.assertEqual(len(major), 6)
             for report in major:

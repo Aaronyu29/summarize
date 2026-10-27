@@ -51,6 +51,9 @@ def attention_items(plans, store=None):
             if binding.get('accepted') is True and binding.get('plan_hash') == plan_fingerprint(plan):
                 if entry.get('low') is not None and entry.get('high') is not None:
                     item['buy_observation'] = {key:entry.get(key) for key in ('low','high','amount_usd')}
+                    item['buy_observation']['source'] = {
+                        'independent_valuation': '系统估算', 'source_level': '视频中的价位'
+                    }.get(entry.get('basis'), '来源尚未标明')
                     if plan.get('price_basis_valid_until'):
                         item['buy_observation']['basis_valid_until'] = plan['price_basis_valid_until']
         items.append(item)
@@ -60,32 +63,51 @@ def attention_items(plans, store=None):
 def attention_text(items, when):
     lines = ['【犀牛投资·研究审核结果】' + when]
     if not items:
-        lines.append('此前提示的研究审核阻塞已解除。是否可操作仍以当前执行条件为准。')
+        lines += ['此前提示的问题已解除。', '这不代表现在可以买入；买入建议会另行说明股票、价格、金额和条件。']
     else:
-        rejected = sum(not item['conditional'] and not item.get('research_ready') for item in items)
-        conditional = sum(item['conditional'] for item in items)
-        lines.append(f'需处理：{rejected} 份未通过或待补证据；{conditional} 份估值已审核、入场条件待满足。')
-        for item in items:
-            lines.append(item['symbol']+'｜'+item['status']+'：'+'；'.join(item['reasons']))
+        ready = [item for item in items if item.get('research_ready')]
+        conditional = [item for item in items if item['conditional']]
+        rejected = [item for item in items if not item['conditional'] and not item.get('research_ready')]
+        lines.append('结论：本次更新没有可直接执行的买入建议。' if not ready
+                     else '结论：有研究通过，但买入前仍需检查最新报价和账户资金。')
+        lines.append('你无需补财报；这条通知不要求你下单。')
+        if ready or conditional:
+            lines += ['', '可以继续关注：']
+        for item in ready + conditional:
+            lines.append(item['symbol']+'｜'+('研究已通过，等买入前检查。' if item.get('research_ready')
+                                             else '暂不买：买入条件还没全部核实。'))
             observation = item.get('buy_observation')
             if observation:
-                lines.append(f"条件买入观察：{observation['low']}–{observation['high']} USD；首笔规划 {observation['amount_usd']} USD；执行前仍需核实条件、行情及账户资金。")
+                lines.append(f"  观察价 {observation['low']}–{observation['high']} 美元／股（{observation['source']}）。")
+                if observation.get('amount_usd'):
+                    lines.append(f"  条件满足后首笔预算 {observation['amount_usd']} 美元；目前不据此下单。")
+                lines.append('  等待多久无法预测，也可能一直不到价；到价后仍需复核。')
                 if observation.get('basis_valid_until'):
                     from datetime import timezone,timedelta
                     from .common import parse_time
                     deadline=parse_time(observation['basis_valid_until']).astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
-                    lines.append('价格口径有效截止：'+deadline+'（北京时间）；截止后须重新核验拆股等公司行动并重审价格，旧区间失效。')
-        lines.append('系统负责：草稿计算、盈利口径和规则矛盾进入有界修订及独立复核；公开资料由系统查证，你无需补财报或估值规则。真正需要账户资料时须另列具体项目。')
-        lines.append('入场条件未核实前不生成操作建议。详细意见见飞书“投资计划”。')
-        lines.append('同一股票、问题及审核状态不变时不重复提醒；问题变化或解除时再通知。')
-    lines.append('非投资建议。')
+                    lines.append('  旧价位在'+deadline+'（北京时间）失效，届时须重新计算。')
+        if rejected:
+            lines += ['', '这些计划暂时不能用：']
+            explanations = {
+                '止盈或止损规则缺失、存在冲突': '买入后何时卖出的规则没写完整或相互矛盾',
+                '估值情景或计算依据未通过核验': '估价计算或计算依据还没核对通过',
+                '每股盈利口径或估算假设待核实': '估算未来利润的依据还不够可靠',
+                '增长假设或预测期限待核实': '增长速度或预测年份还没核对清楚',
+                '入场规则或价格单位待核实': '买入规则或拆股前后价格还没核对清楚',
+            }
+            for item in rejected:
+                reasons=[explanations[r] for r in item['reasons'] if r in explanations]
+                lines.append(item['symbol']+'｜'+('；'.join(reasons[:2]) if reasons else '资料或分析还没核实完成')+'。')
+        lines += ['', '后续：公开资料和计划错误由系统处理，你不用替系统补材料。',
+                  '有买入建议或确需账户信息时，会单独写清。详细记录见飞书“投资计划”。']
     return '\n'.join(lines)
 
 
 def notify_attention(store, feishu, plans, *, now, when, enabled, execute):
     """Persist before delivery; never turn an unknown send into a fresh identity."""
     items = attention_items(plans,store)
-    signature = stable_id('research-attention-v2-system-ownership', items)
+    signature = stable_id('research-attention-v3-plain-language', items)
     previous = store.get('research_attention_state', 'current')
     if not enabled or not execute:
         return {'status': 'disabled' if not enabled else 'dry_run', 'items': items}
