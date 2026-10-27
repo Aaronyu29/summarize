@@ -6,6 +6,7 @@ from rhino_invest.budget import authorized_auto_limits,load_limits,write_limits,
 
 class AutoBudgetTests(unittest.TestCase):
     def test_only_open_goog_followup_expands_with_hard_cap_and_no_usage_reset(self):
+        Path('research-data').mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir='research-data') as tmp,Store(':memory:') as store:
             budget=(Path(tmp)/'budget.json').resolve();policy=(Path(tmp)/'policy.json').resolve()
             write_limits(str(budget),{'max_calls_per_day':90,'max_cost_usd_per_day':'9'})
