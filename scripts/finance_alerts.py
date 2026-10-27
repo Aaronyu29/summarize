@@ -7,9 +7,14 @@ import re
 import time
 
 from finance_feishu import signature
+from finance_recovery import ReviewRejected
 
 
 def reason(error):
+    if isinstance(error, ReviewRejected):
+        issues = [' '.join(re.sub(r'https?://\S+', '[来源已归档]', str(item)).split())[:160]
+                  for item in error.issues[:3]]
+        return '自动修订后证据审核仍未通过：' + '；'.join(issues)
     text = str(error)
     rules = [('Join this channel to get access', '当前账号无权读取会员专享视频'),
              ('members-only content', '当前账号无权读取会员专享视频'),
@@ -24,6 +29,11 @@ def reason(error):
              ('Overview exceeds', '摘要超过长度上限，需精简后重新核验'),
              ('balanced emphasis', '正文重点标记不完整，需修正后重新核验'),
              ('Analysis does not meet coverage', '报告重点数或配图覆盖不足，需补齐后重新核验'),
+             ('Video model-call ceiling', '本期自动分析请求数已达到上限，已保留全部材料并停止新增付费请求'),
+             ('replacement is exhausted', '本期自动替代请求次数已用尽，旧回执仍不明，已停止重复付费请求'),
+             ('allowance is exhausted', '本期自动替代请求次数已用尽，已停止重复付费请求'),
+             ('older unknown model request', '存在无法自动关联的旧未决请求，已保留回执并停止新增付费请求'),
+             ('Video metadata temporarily', '暂时无法取得视频元数据，系统已安排后续检查'),
              ('publication', '无法确认视频的真实发布时间'),
              ('cookies', 'YouTube 登录凭据缺失或权限不符合要求'),
              ('8 GiB', '剩余磁盘不足 8 GiB，已停止新下载以保留档案'),
@@ -110,20 +120,45 @@ def flush(root, env, session=None):
     return counts
 
 
+def recover_interruption(root, env, result):
+    from finance_jobs import Jobs
+    from finance_recovery import policy, retry_delay
+    if result in {'success', 'exit-code'}:
+        return
+    root = pathlib.Path(root)
+    rules = policy(env)
+    jobs = Jobs(root / 'jobs.sqlite')
+    interrupted = [jobs.get(row[0]) for row in jobs.db.execute("SELECT video_id FROM jobs WHERE status='processing'")]
+    for job in interrupted:
+        exhausted = job['attempts'] >= rules['max_attempts']
+        if rules['enabled'] and not exhausted:
+            jobs.save(job['video_id'], status='retry', auto_recovery_v2=True,
+                      next_retry_at=time.time()+retry_delay(job['attempts']), recovery_error='ServiceInterrupted')
+        else:
+            if exhausted:
+                jobs.save(job['video_id'], status='needs_review', recovery_exhausted=True)
+            enqueue(root, job['source'], job['checkpoint'].get('stage', '处理视频'),
+                    RuntimeError('Service interrupted'), '进程异常中断；自动恢复次数已用尽，需核查' if exhausted else '下次扫描从检查点恢复')
+    jobs.db.close()
+    if not interrupted:
+        if rules['enabled']:
+            path = root / 'scan-retry.json'
+            previous = json.loads(path.read_text()) if path.exists() else {}
+            attempts = previous.get('attempts', 0) + 1
+            terminal = attempts >= rules['max_attempts']
+            save(path, {'attempts': attempts, 'terminal': terminal,
+                        'next_retry_at': time.time()+retry_delay(attempts), 'error_type': 'ServiceInterrupted'})
+            if not terminal:
+                return
+        enqueue(root, {}, '服务运行', RuntimeError('Service interrupted'), '服务连续异常中断，需检查服务器')
+
+
 if __name__ == '__main__':
     import argparse
     import os
-    from finance_jobs import Jobs
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', required=True, type=pathlib.Path)
     args = parser.parse_args()
     result = os.environ.get('SERVICE_RESULT', 'success')
-    if result not in {'success', 'exit-code'}:
-        jobs = Jobs(args.data / 'jobs.sqlite')
-        interrupted = [jobs.get(row[0]) for row in jobs.db.execute("SELECT video_id FROM jobs WHERE status='processing'")]
-        for job in interrupted:
-            enqueue(args.data, job['source'], job['checkpoint'].get('stage', '处理视频'),
-                    RuntimeError('Service interrupted'), '进程异常中断（超时、信号或资源限制），下次扫描从检查点恢复')
-        if not interrupted:
-            enqueue(args.data, {}, '服务运行', RuntimeError('Service interrupted'), '服务异常中断，需检查服务器；下次定时扫描重试')
+    recover_interruption(args.data, os.environ, result)
     print(json.dumps(flush(args.data, os.environ)))

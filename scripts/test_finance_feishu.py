@@ -202,6 +202,27 @@ class FeishuTests(unittest.TestCase):
             self.publisher(session).run()
         self.assertEqual(len(session.calls), before)
 
+    def test_exact_image_creation_is_reconciled_by_readback_without_new_post(self):
+        publisher=self.publisher(FakeSession())
+        marker='FINANCE_IMAGE_0000'
+        publisher.state.update(pending_write='create_image:'+marker,doc_token='doc',
+            images={marker:{'parent':'doc','marker_block':'marker-id'}})
+        publisher.block=lambda doc,identity: ({'children':['marker-id','created-image']} if identity=='doc'
+            else {'block_type':27,'block_id':identity})
+        publisher.reconcile_pending()
+        self.assertEqual(publisher.state['images'][marker]['block_id'],'created-image')
+        self.assertNotIn('pending_write',publisher.state)
+        self.assertEqual(publisher.session.calls,[])
+
+    def test_absent_image_target_stays_unknown_and_never_recreated(self):
+        publisher=self.publisher(FakeSession());marker='FINANCE_IMAGE_0000'
+        publisher.state.update(pending_write='create_image:'+marker,doc_token='doc',
+            images={marker:{'parent':'doc','marker_block':'marker-id'}})
+        publisher.block=lambda *args:{'children':['marker-id']}
+        with self.assertRaisesRegex(RuntimeError,'target not found'):publisher.reconcile_pending()
+        self.assertIn('pending_write',publisher.state)
+        self.assertEqual(publisher.session.calls,[])
+
     def test_definitive_permission_rejection_can_resume_after_permission_is_fixed(self):
         publisher = self.publisher(FakeSession())
 

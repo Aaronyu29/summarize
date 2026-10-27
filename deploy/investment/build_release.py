@@ -27,6 +27,12 @@ def main():
     for pattern in ('finance_*.py', 'test_finance*.py'):
         for path in sorted((source / 'scripts').glob(pattern)):
             shutil.copyfile(path, finance / path.name)
+    units = root / 'finance' / 'systemd'
+    units.mkdir(parents=True, exist_ok=True)
+    for stem in ('rhino-video-digest', 'rhino-video-recovery'):
+        for suffix in ('service', 'timer'):
+            name = stem + '.' + suffix
+            shutil.copyfile(source / 'deploy' / 'finance' / name, units / name)
     files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
              for p in sorted(root.rglob('*')) if p.is_file() and p.name != 'manifest.json'}
     manifest = {'revision': args.revision, 'python': '3.12', 'platform': 'linux-x86_64',

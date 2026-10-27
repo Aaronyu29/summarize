@@ -36,10 +36,16 @@ class Jobs:
         value['checkpoint'] = json.loads(value['checkpoint'])
         return value
 
-    def pending(self, limit=3):
-        return [r[0] for r in self.db.execute('''SELECT video_id FROM jobs
-            WHERE status IN ('queued','retry','processing') AND attempts < 5
-            ORDER BY updated LIMIT ?''', (limit,))]
+    def pending(self, limit=3, *, max_attempts=5, now=None):
+        now = time.time() if now is None else now
+        result = []
+        for vid, checkpoint in self.db.execute('''SELECT video_id,checkpoint FROM jobs
+                WHERE status IN ('queued','retry','processing') AND attempts < ? ORDER BY updated''', (max_attempts,)):
+            if json.loads(checkpoint).get('next_retry_at', 0) <= now:
+                result.append(vid)
+            if len(result) >= limit:
+                break
+        return result
 
     def save(self, vid, status=None, error=None, **checkpoint):
         value = self.get(vid)

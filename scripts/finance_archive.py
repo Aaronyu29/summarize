@@ -221,7 +221,7 @@ def render_markdown(analysis, records):
     return "\n".join(lines)
 
 
-def publish(analysis_path: pathlib.Path, database: pathlib.Path):
+def publish(analysis_path: pathlib.Path, database: pathlib.Path, *, register=True):
     capture = analysis_path.parent
     analysis = load(analysis_path)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", str(analysis.get("revision", ""))):
@@ -232,8 +232,21 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
     sealed = capture / f"analysis-v{revision}.json"
     if sealed.exists() and sha(sealed) != fingerprint:
         raise ValueError("Analysis revision is immutable; use a new revision")
-    sealed.write_bytes(analysis_path.read_bytes())
     report = capture / f"brief-v{revision}.html"
+    manifest_path = capture / f"manifest-v{revision}.json"
+    if sealed.exists() and manifest_path.exists() and report.exists() and (capture / f'brief-v{revision}.md').exists():
+        existing_manifest = load(manifest_path)
+        if existing_manifest.get('analysis_sha256') != fingerprint:
+            raise ValueError('Existing manifest does not seal this analysis')
+        artifacts = {item['path']: item['sha256'] for item in existing_manifest['artifacts']}
+        for suffix in ('md', 'html'):
+            name = f'brief-v{revision}.{suffix}'
+            if artifacts.get(name) != sha(capture / name):
+                raise ValueError('Existing archived report changed; inspect before replay')
+        if register:
+            register_archive(analysis_path, database)
+        return report
+    sealed.write_bytes(analysis_path.read_bytes())
     report.write_text(render(analysis, records), encoding="utf-8")
     (capture / f"brief-v{revision}.md").write_text(render_markdown(analysis, records), encoding="utf-8")
     artifacts = []
@@ -244,6 +257,22 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
     manifest = {"schema_version": 1, "analysis_sha256": fingerprint,
                 "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "artifacts": artifacts}
     (capture / f"manifest-v{revision}.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if register:
+        register_archive(analysis_path, database)
+    return report
+
+
+def register_archive(analysis_path: pathlib.Path, database: pathlib.Path):
+    """Expose the revision only after reports and manifest are finalized."""
+    capture = analysis_path.parent
+    analysis = load(analysis_path)
+    records = validate(analysis, capture)
+    revision = str(analysis['revision'])
+    fingerprint = sha(analysis_path)
+    if sha(capture / f'analysis-v{revision}.json') != fingerprint:
+        raise ValueError('Sealed analysis changed before registration')
+    if load(capture / f'manifest-v{revision}.json')['analysis_sha256'] != fingerprint:
+        raise ValueError('Manifest does not seal analysis before registration')
     database.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE IF NOT EXISTS analyses (video_id TEXT, revision TEXT, source TEXT, "
@@ -263,7 +292,6 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
             transcript = " ".join(s["text"] for s in record["transcript"]["segments"])
             connection.execute("INSERT INTO research_fts VALUES (?,?,?)", (vid, revision,
                                record["info"]["title"] + "\n" + payload + "\n" + transcript))
-    return report
 
 
 def main():

@@ -18,6 +18,7 @@ import re
 import time
 import urllib.parse
 from collections import Counter
+from finance_recovery import advisory_lock
 
 BASES = {"feishu": "https://open.feishu.cn/open-apis", "lark": "https://open.larksuite.com/open-apis"}
 IMAGE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
@@ -156,13 +157,19 @@ class Publisher:
 
     def call(self, method, path, *, json_body=None, data=None, files=None, auth=True):
         headers = {"Authorization": f"Bearer {self.token}"} if auth else {}
-        self.sleep(0.4)
-        try:
-            response = self.session.request(method, self.base + path, headers=headers,
-                                            json=json_body, data=data, files=files,
-                                            timeout=(10, 30), allow_redirects=False)
-        except Exception:
-            raise RuntimeError("API transport failed; inspect saved receipt before retrying a write") from None
+        for attempt in range(3 if method == 'GET' else 1):
+            self.sleep(0.4 if not attempt else 2**attempt)
+            try:
+                response = self.session.request(method, self.base + path, headers=headers,
+                                                json=json_body, data=data, files=files,
+                                                timeout=(10, 30), allow_redirects=False)
+            except Exception:
+                if method == 'GET' and attempt < 2:
+                    continue
+                raise RuntimeError("API transport failed; inspect saved receipt before retrying a write") from None
+            if method == 'GET' and response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                continue
+            break
         if response.status_code != 200:
             try:
                 detail = response.json()
@@ -186,6 +193,7 @@ class Publisher:
 
     def mutate(self, label, function, save_result):
         self.state["pending_write"] = label
+        self.state['pending_since_epoch'] = time.time()
         self.save()
         try:
             result = function()
@@ -199,6 +207,40 @@ class Publisher:
         self.state.pop("pending_write", None)
         self.save()
         return result
+
+    def reconcile_pending(self):
+        """Resolve exact provider targets by GET; never recreate or resend blindly."""
+        label = self.state.get('pending_write')
+        if not label:
+            return
+        if label == 'create_import' and self.state.get('ticket'):
+            pass  # The stored provider ticket proves this import request returned.
+        elif str(label).startswith('create_image:') and self.state.get('doc_token'):
+            marker = label.removeprefix('create_image:')
+            receipt = self.state.get('images', {}).get(marker) or {}
+            if not receipt.get('parent') or not receipt.get('marker_block'):
+                raise RuntimeError('Unreconciled image creation lacks its exact marker target')
+            parent = self.block(self.state['doc_token'], receipt['parent'])
+            children = parent.get('children', [])
+            if receipt['marker_block'] not in children:
+                raise RuntimeError('Unreconciled image creation marker is missing')
+            index = children.index(receipt['marker_block']) + 1
+            if index >= len(children):
+                raise RuntimeError('Unreconciled image creation; provider target not found yet')
+            identity = children[index]
+            block = self.block(self.state['doc_token'], identity)
+            used = {item.get('block_id') for key, item in self.state['images'].items() if key != marker}
+            if block.get('block_type') != 27 or identity in used:
+                raise RuntimeError('Unreconciled image creation has no unique adjacent image')
+            receipt['block_id'] = identity
+            self.state['images'][marker] = receipt
+        elif label == 'send_webhook' and self.state.get('webhook_sent'):
+            pass
+        else:
+            raise RuntimeError('Unreconciled write: no exact receipt; do not blindly resend')
+        self.state.setdefault('reconciled_writes', []).append({'step': label, 'at_epoch': time.time()})
+        self.state.pop('pending_write', None)
+        self.save()
 
     def upload(self, path, parent_type, parent_node=None):
         path = pathlib.Path(path)
@@ -268,17 +310,25 @@ class Publisher:
 
     def run(self, *, notify=True):
         lock = self.state_path.with_suffix(".lock")
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        guard = advisory_lock(lock)
+        guard.__enter__()
         try:
-            os.close(descriptor)
             self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else self.state
             if self.state.get("pending_write"):
-                raise RuntimeError(f"Unreconciled write: {self.state['pending_write']}; do not blindly resend")
+                label = self.state['pending_write']
+                reconcilable = (str(label).startswith('create_image:') or
+                    (label == 'create_import' and self.state.get('ticket')) or
+                    (label == 'send_webhook' and self.state.get('webhook_sent')))
+                if not reconcilable:
+                    raise RuntimeError(f"Unreconciled write: {label}; do not blindly resend")
+                if label == 'send_webhook' and self.state.get('webhook_sent'):
+                    self.reconcile_pending()
             if self.state.get("webhook_sent"):
                 return {"status": "already_delivered", "url": self.state["url"]}
             auth = self.call("POST", "/auth/v3/tenant_access_token/internal", auth=False,
                              json_body={"app_id": self.env["FEISHU_APP_ID"], "app_secret": self.env["FEISHU_APP_SECRET"]})
             self.token = auth["tenant_access_token"]
+            self.reconcile_pending()
             staged = self.markdown_path.parent / f".feishu-import-{self.identity[:16]}.md"
             if not self.state.get("ticket") and not self.state.get("doc_token"):
                 staged.write_text(self.content, encoding="utf-8")
@@ -373,7 +423,7 @@ class Publisher:
             self.mutate("send_webhook", notify, lambda _: self.state.update(webhook_sent=True))
             return {"status": "delivered", "url": self.state["url"], "image_count": len(self.images)}
         finally:
-            lock.unlink(missing_ok=True)
+            guard.__exit__(None, None, None)
 
 
 def main():

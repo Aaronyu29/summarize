@@ -9,6 +9,7 @@ on:
       - "scripts/finance_*.py"
       - "scripts/test_finance*.py"
       - "deploy/investment/**"
+      - "deploy/finance/**"
       - "pyproject.toml"
       - ".github/workflows/investment.yml"
   push:

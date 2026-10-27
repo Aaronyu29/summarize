@@ -70,11 +70,11 @@ class OutputRecoveryTests(unittest.TestCase):
         parent.write_text(json.dumps(self.response('length','').json()))
         (self.directory/'verification-reviewed-000.pending.json').write_text('{}')
         with patch('requests.post') as post:
-            with self.assertRaisesRegex(RuntimeError,'pending marker'):self.run_model()
+            with self.assertRaisesRegex(RuntimeError,'pending request'):self.run_model()
             post.assert_not_called()
         with patch('requests.post',return_value=self.response('stop','{bad json')) as post:
-            with self.assertRaises(json.JSONDecodeError):self.run_model('analysis')
-            self.assertEqual(post.call_count,1)
+            with self.assertRaisesRegex(ValueError,'Incomplete model output'):self.run_model('analysis')
+            self.assertEqual(post.call_count,2)
 
     def test_alert_names_output_limit(self):
         description=reason(ValueError('Incomplete model output; cached response requires review'))

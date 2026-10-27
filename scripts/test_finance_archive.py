@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from finance_archive import publish, validate, render, render_markdown, rich_text, validate_readability
+from finance_archive import publish, register_archive, validate, render, render_markdown, rich_text, validate_readability
 from finance_collect import parse_feed
 
 
@@ -84,7 +84,9 @@ class EvidenceTests(unittest.TestCase):
         db = self.capture / "library.sqlite"
         self.write(analysis_path, self.analysis)
         report = publish(analysis_path, db)
+        sealed_manifest = (self.capture/'manifest-v1.json').read_bytes()
         publish(analysis_path, db)
+        self.assertEqual((self.capture/'manifest-v1.json').read_bytes(), sealed_manifest)
         with contextlib.closing(sqlite3.connect(db)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM analyses").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT count(*) FROM research_fts").fetchone()[0], 1)
@@ -93,6 +95,21 @@ class EvidenceTests(unittest.TestCase):
         self.write(analysis_path, self.analysis)
         with self.assertRaisesRegex(ValueError, "immutable"):
             publish(analysis_path, db)
+
+    def test_archive_is_registered_only_after_report_finalization(self):
+        path=self.capture/'analysis.json';db=self.capture/'library.sqlite'
+        self.write(path,self.analysis)
+        publish(path,db,register=False)
+        self.assertFalse(db.exists())
+        register_archive(path,db)
+        with contextlib.closing(sqlite3.connect(db)) as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM analyses').fetchone()[0],1)
+
+    def test_modified_report_cannot_be_silently_resealed_on_retry(self):
+        path=self.capture/'analysis.json';db=self.capture/'library.sqlite'
+        self.write(path,self.analysis);report=publish(path,db)
+        report.write_text('unexpected change')
+        with self.assertRaisesRegex(ValueError,'report changed'):publish(path,db)
 
     def test_feed_uses_published_order_instead_of_updated(self):
         raw = b'''<feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">

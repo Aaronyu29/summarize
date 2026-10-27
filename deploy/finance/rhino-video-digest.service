@@ -15,7 +15,14 @@ Environment=OMP_NUM_THREADS=1
 Environment=HF_HUB_DISABLE_XET=1
 Environment=HF_HOME=/opt/rhino-video-digest/models/hf
 Environment=XDG_CACHE_HOME=/opt/rhino-video-digest/models/cache
-ExecStart=/usr/bin/flock -n /opt/rhino-video-digest/data/worker.lock /opt/rhino-video-digest/venv/bin/python scripts/finance_cloud.py --data /opt/rhino-video-digest/data
+Environment=FINANCE_AUTO_RECOVERY=1
+Environment=FINANCE_MAX_CALLS_PER_VIDEO=32
+Environment=FINANCE_SEMANTIC_REPAIRS=3
+Environment=FINANCE_MAX_TASK_ATTEMPTS=8
+Environment=FINANCE_UNKNOWN_GRACE_SECONDS=1800
+Environment=FINANCE_UNKNOWN_REPLACEMENTS=1
+SuccessExitStatus=75
+ExecStart=/usr/bin/flock -n -E 75 /opt/rhino-video-digest/data/worker.lock /opt/rhino-video-digest/venv/bin/python scripts/finance_cloud.py --data /opt/rhino-video-digest/data
 ExecStopPost=/opt/rhino-video-digest/venv/bin/python scripts/finance_alerts.py --data /opt/rhino-video-digest/data
 TimeoutStartSec=6h
 CPUQuota=100%

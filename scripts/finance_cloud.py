@@ -16,14 +16,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.request
 
-from finance_archive import publish, sha, validate, validate_readability, REPORT_STYLE_VERSION
+from finance_archive import publish, register_archive, sha, validate, validate_readability, REPORT_STYLE_VERSION
 from finance_collect import CHANNEL_ID, parse_feed
 from finance_feishu import Publisher
 from finance_jobs import Jobs
 from finance_alerts import enqueue as failure_notice, flush as flush_notices
 from finance_costs import update as update_costs
+from finance_recovery import (policy, admit_request, pending_marker, replacement, pending_started, owner_alive,
+                              RecoveryDeferred, RecoveryExhausted, ReviewRejected, retry_delay)
 
 
 def write(path, value):
@@ -160,14 +163,32 @@ def tools(script, capture_dir, *arguments):
                     *arguments], check=True, timeout=14400)
 
 
-def model_json(directory, name, instruction, payload, frames, env, *, _output_recovery=False):
+def model_json(directory, name, instruction, payload, frames, env, *, _output_recovery=False,
+               _transport_recovery=False):
     """A persisted pending marker fences ambiguous paid requests; never blind retry."""
     cache, pending = directory / f'{name}.response.json', directory / f'{name}.pending.json'
+    input_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    instruction_hash = hashlib.sha256(instruction.encode()).hexdigest()
+    frame_hashes = [{'second': second, 'sha256': sha(path)} for second, path in frames]
+    request_path = directory / (name + '.request.json')
+    identity = {'input_sha256': input_hash, 'instruction_sha256': instruction_hash, 'frames': frame_hashes}
+    if request_path.exists() and read(request_path) != identity:
+        raise RecoveryExhausted('Cached model request differs from frozen evidence; reconcile before replay')
     if cache.exists():
         response = read(cache)
+        if pending.exists():
+            marker = read(pending)
+            if marker.get('input_sha256') != input_hash:
+                raise RecoveryExhausted('Cached response cannot reconcile a different pending request')
+            write(directory / (name + '.receipt-reconciled.json'), {
+                'response_sha256': sha(cache), 'pending_sha256': sha(pending), 'input_sha256': input_hash})
+            pending.unlink()  # A complete, atomically persisted receipt resolves this exact request.
     else:
         if pending.exists():
-            raise RuntimeError('Unresolved model request; manual reconciliation required')
+            child = replacement(directory, name, read(pending), env, input_hash,
+                                is_replacement=_transport_recovery)
+            return model_json(directory, child, instruction, payload, frames, env,
+                              _output_recovery=_output_recovery, _transport_recovery=True)
         import requests
         base = env['LLM_BASE_URL'].rstrip('/')
         if base != 'https://api.deepseek.com/v1':
@@ -190,39 +211,67 @@ def model_json(directory, name, instruction, payload, frames, env, *, _output_re
             body.update(thinking={'type': 'disabled'}, reasoning_effort='none', max_tokens=12000)
         if len(json.dumps(body).encode()) > 45 * 1024 * 1024:
             raise ValueError('Request too large; refusing to truncate video evidence')
-        write(pending, {'started_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
-                        'input_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()})
+        admit_request(directory, env, name)
+        write(request_path, identity)
+        marker = pending_marker(input_hash, instruction_hash, frame_hashes)
+        write(pending, marker)
         try:
             result = requests.post(base + '/chat/completions', json=body,
                 headers={'Authorization': 'Bearer ' + env['LLM_API_KEY']}, timeout=(20, 1200))
         except requests.RequestException:
+            marker['request_ended_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            write(pending, marker)
+            if policy(env)['enabled']:
+                raise RecoveryDeferred('Model outcome unknown; waiting before bounded replacement',
+                                       pending_started(marker) + policy(env)['unknown_grace']) from None
             raise RuntimeError('Model request outcome unknown; pending marker retained') from None
         if result.status_code != 200:
             if result.status_code in {400, 401, 403, 404, 422, 429}:
                 pending.unlink()
+            elif policy(env)['enabled']:
+                marker['request_ended_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+                write(pending, marker)
+                raise RecoveryDeferred('Model HTTP outcome unknown; waiting before bounded replacement',
+                                       pending_started(marker) + policy(env)['unknown_grace'])
             raise RuntimeError(f'Model HTTP {result.status_code}; response body suppressed')
-        response = result.json()
+        try:
+            response = result.json()
+        except ValueError:
+            marker['request_ended_utc'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            write(pending, marker)
+            if policy(env)['enabled']:
+                raise RecoveryDeferred('Model response unreadable; receipt outcome unknown',
+                                       pending_started(marker) + policy(env)['unknown_grace']) from None
+            raise RuntimeError('Model response outcome unknown; pending marker retained') from None
         write(cache, response)
         pending.unlink()
     update_costs(directory.parent)
     choice = response['choices'][0]
-    if choice.get('finish_reason') == 'length' and not _output_recovery:
+    try:
+        output = json.loads(choice['message']['content']) if choice.get('finish_reason') == 'stop' else None
+        invalid_json = not isinstance(output, dict) if choice.get('finish_reason') == 'stop' else False
+    except (ValueError, TypeError, KeyError):
+        invalid_json = True
+        output = None
+    if (choice.get('finish_reason') == 'length' or invalid_json) and not _output_recovery:
         if pending.exists():
             raise RuntimeError('Unresolved model request; reconcile pending marker before recovery')
         child = name + '-output-recovery-001'
         write(directory / (child + '.audit.json'), {
             'parent_response_file': cache.name, 'parent_response_sha256': sha(cache),
-            'payload_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
-            'instruction_sha256': hashlib.sha256(instruction.encode()).hexdigest(),
-            'frames': [{'second': second, 'sha256': sha(path)} for second, path in frames],
-            'attempt': 1, 'reason': 'completed_response_output_limit',
+            'payload_sha256': input_hash, 'instruction_sha256': instruction_hash,
+            'frames': frame_hashes,
+            'attempt': 1, 'reason': 'completed_response_invalid_json' if invalid_json else 'completed_response_output_limit',
             'thinking': 'disabled', 'reasoning_effort': 'none', 'max_tokens': 12000})
         # Same source, images and review instruction. The fixed child cache and
         # pending marker keep this bounded across scans, restarts and days.
-        return model_json(directory, child, instruction, payload, frames, env, _output_recovery=True)
+        return model_json(directory, child, instruction, payload, frames, env, _output_recovery=True,
+                          _transport_recovery=_transport_recovery)
     if choice.get('finish_reason') != 'stop':
         raise ValueError('Incomplete model output; cached response requires review')
-    return json.loads(choice['message']['content'])
+    if invalid_json:
+        raise ValueError('Incomplete model output; bounded JSON recovery is exhausted')
+    return output
 
 
 INSTRUCTION = '''你是中文财经视频研究员。完整阅读本视频全部转写和所有关键帧，输出JSON。
@@ -311,6 +360,82 @@ def delivery_title(info, analysis):
     return f"RhinoFinance 中文简报｜视频发布：{published}（北京时间）｜{info['title']}"
 
 
+def effective_response_file(directory, name):
+    """Reference the actual completed child receipt, never a truncated parent."""
+    for _ in range(5):
+        path = directory / (name + '.response.json')
+        if path.exists():
+            response = read(path)
+            try:
+                choice = response['choices'][0]
+                if choice.get('finish_reason') == 'stop' and isinstance(json.loads(choice['message']['content']), dict):
+                    return path.name
+            except (ValueError, KeyError, TypeError, IndexError):
+                pass
+            name += '-output-recovery-001'
+        else:
+            name += '-transport-recovery-001'
+    raise RecoveryExhausted('No complete effective model receipt was found')
+
+
+def review_candidate(directory, video, payload, frames, env):
+    """Claims see their original images; global prose is checked separately."""
+    issues, files = [], []
+    for batch_index, indices in enumerate(batches(list(range(len(video['claims']))))):
+        claims = copy.deepcopy([video['claims'][i] for i in indices])
+        for claim in claims:
+            claim['evidence_segment_ids'] = [f'S{ref:06d}' for ref in claim['evidence_segment_ids']]
+        signature = hashlib.sha256(json.dumps({'claims': claims, 'indices': indices}, sort_keys=True).encode()).hexdigest()[:16]
+        name = f'verification-v2-{signature}-claims-{batch_index:03}'
+        instruction = VERIFY + ('\n本批只审global_claim_indices所列claims及标题、条件、引用与强调。'
+            'overview和review_questions由独立全局审核检查，本批不因未提供它们或其他批的原图而拒绝。'
+            '只指出确切证据冲突或影响含义的问题，意见须给原文段号或画面时刻；不要用常识替代原图。'
+            'checked_claim_indices必须逐一覆盖global_claim_indices。')
+        selected = {claim.get('frame_seconds') for claim in claims}
+        review = model_json(directory, name, instruction,
+            {**payload, 'candidate': {'claims': claims}, 'global_claim_indices': indices},
+            [(second, path) for second, path in frames if second in selected], env)
+        checked = review.get('checked_claim_indices')
+        accepted = (review.get('accepted') is True and review.get('issues') == [] and
+                    isinstance(checked, list) and all(type(i) is int for i in checked) and
+                    len(checked) == len(indices) and set(checked) == set(indices))
+        files.append(effective_response_file(directory, name))
+        if not accepted:
+            reasons = review.get('issues')
+            if isinstance(reasons, list) and reasons:
+                issues.extend(str(item)[:800] for item in reasons)
+            else:
+                issues.append(f'Reviewer did not approve every claim in batch {batch_index}')
+        log('verification_batch_complete', video_id=payload['video_id'], batch=batch_index+1,
+            claims=len(indices), accepted=accepted)
+    if issues:
+        return issues, files
+    candidate = copy.deepcopy(video)
+    for claim in candidate['claims']:
+        claim['evidence_segment_ids'] = [f'S{ref:06d}' for ref in claim['evidence_segment_ids']]
+    signature = hashlib.sha256(json.dumps(candidate, sort_keys=True).encode()).hexdigest()[:16]
+    name = f'verification-v2-{signature}-global'
+    selected = [item for item in frames if item[0] in {c.get('frame_seconds') for c in candidate['claims']}]
+    if len(selected) > 8:
+        selected = [selected[round(i*(len(selected)-1)/7)] for i in range(8)]
+    instruction = VERIFY + ('\n本批专门检查overview和review_questions与已逐条审核通过的claims是否一致。'
+        '全部claims已分批对原图审核，本批不得因为某张已审原图未再次附上而推翻它；完整转写与视觉观察可辅助核查。'
+        '摘要不能引入已审claims之外的新事实，复盘假设须有若/待核限定，不能误读为已发生事件。'
+        '只指出确切证据冲突、重要遗漏或强调缺口，不为措辞偏好编造问题。'
+        '输出JSON：{"accepted":true或false,"overview_checked":true,"review_questions_checked":true,"issues":[具体问题]}。')
+    review = model_json(directory, name, instruction,
+        {**payload, 'candidate': candidate, 'claims_independently_reviewed': True}, selected, env)
+    files.append(effective_response_file(directory, name))
+    if not (review.get('accepted') is True and review.get('issues') == [] and
+            review.get('overview_checked') is True and review.get('review_questions_checked') is True):
+        reasons = review.get('issues')
+        if isinstance(reasons, list) and reasons:
+            issues.extend(str(item)[:800] for item in reasons)
+        else:
+            issues.append('Global overview and follow-up review is incomplete')
+    return issues, files
+
+
 def analyze(capture_dir, info, env):
     vid = info['id']
     directory = capture_dir / vid
@@ -336,7 +461,8 @@ def analyze(capture_dir, info, env):
         '\n画面已先分批读取。visual_observations 是每张原图的带时间戳视觉观察；结合完整转写使用，未知数字不要补猜。',
         payload, [], env)
     published = publication_time(info, read(capture_dir / 'discovery.json')['entries'])
-    def build(candidate, evidence_repair=False, semantic_repair=False):
+    candidate_name = 'analysis'
+    def build(candidate, evidence_repair=False, semantic_repair=False, response_name=None):
         canonical = canonicalize_evidence(candidate, transcript['segments'])
         video = {**canonical, 'video_id': vid, 'published_shanghai': published}
         validate_readability(video)
@@ -347,8 +473,7 @@ def analyze(capture_dir, info, env):
                  'review_provenance': {'mode': 'deepseek_full_transcript_and_frames_with_second_pass',
                     'model': env['LLM_MODEL'], 'symbolic_evidence_protocol': True,
                     'candidate_repair_used': evidence_repair, 'semantic_repair_used': semantic_repair,
-                    'candidate_response_file': ('analysis-review-repair-001.response.json' if semantic_repair
-                        else 'analysis-repair-001.response.json' if evidence_repair else 'analysis.response.json'),
+                    'candidate_response_file': effective_response_file(directory, response_name or candidate_name),
                     'analysis_instruction_sha256': hashlib.sha256(INSTRUCTION.encode()).hexdigest()}}
         if not 8 <= len(video['claims']) <= 14 or sum(c.get('frame_seconds') is not None for c in video['claims']) < 5:
             raise ValueError('Analysis does not meet coverage/image requirements')
@@ -367,46 +492,40 @@ def analyze(capture_dir, info, env):
                 '\n按validation_error修订证据引用、时间对齐或全文样式。保留有依据的内容，删掉无依据内容，不添加片外信息。'
                 '给每个重点复制真实S前缀segment_id，严禁把秒数填入证据编号。输出完整同结构JSON。',
                 {**payload, 'candidate_needing_repair': result, 'validation_error': str(error)}, [], env)
+            candidate_name = 'analysis-repair-001'
             repaired = True
             log('candidate_evidence_repair_completed', video_id=vid)
-    for semantic_attempt in range(2):
-        issues, verification_files = [], []
-        for batch_index, indices in enumerate(batches(list(range(len(video['claims']))))):
-            claims = [video['claims'][i] for i in indices]
-            selected = {c.get('frame_seconds') for c in claims}
-            review_claims = copy.deepcopy(claims)
-            for claim in review_claims:
-                claim['evidence_segment_ids'] = [f'S{ref:06d}' for ref in claim['evidence_segment_ids']]
-            prefix = 'reviewed-' if semantic_attempt else 'repaired-' if repaired else ''
-            review_name = f'verification-{prefix}{batch_index:03}'
-            review = model_json(directory, review_name, VERIFY +
-                '\n检查本批candidate.claims以及overview和review_questions的可读性与强调；'
-                'checked_claim_indices 必须使用 global_claim_indices 给定的原报告索引。',
-                {**payload, 'candidate': {**video, 'claims': review_claims}, 'global_claim_indices': indices},
-                [(s,p) for s,p in frames if s in selected], env)
-            accepted = (review.get('accepted') is True and not review.get('issues') and
-                        set(review.get('checked_claim_indices', [])) == set(indices))
-            if not accepted:
-                reasons = review.get('issues')
-                issues.extend(reasons if isinstance(reasons, list) and reasons else
-                              [f'Reviewer did not approve every claim in batch {batch_index}'])
-            verification_files.append(review_name + '.response.json')
-            log('verification_batch_complete', video_id=vid, batch=batch_index+1,
-                claims=len(indices), accepted=accepted)
+    repairs = policy(env)['semantic_repairs']
+    for semantic_attempt in range(repairs + 1):
+        issues, verification_files = review_candidate(directory, video, payload, frames, env)
+        write(capture_dir / 'analysis-review-state.json', {'round': semantic_attempt,
+            'max_repairs': repairs, 'candidate_file': effective_response_file(directory, candidate_name),
+            'verification_files': verification_files, 'issues': issues, 'accepted': not issues})
         if not issues:
             analysis['review_provenance']['verification_files'] = verification_files
+            analysis['review_provenance']['semantic_repair_count'] = semantic_attempt
+            analysis['review_provenance']['separate_global_review'] = True
             break
-        if semantic_attempt:
-            raise ValueError('Second-pass review rejected the bounded revision; human review required')
-        result = model_json(directory, 'analysis-review-repair-001', INSTRUCTION +
+        if semantic_attempt == repairs:
+            raise ReviewRejected(issues)
+        candidate_name = f'analysis-review-v2-repair-{semantic_attempt+1:03}'
+        result = model_json(directory, candidate_name, INSTRUCTION +
             '\n按审核意见修订候选，保留有依据的重点，删除无依据断言。严格区分画面、口述、转写识别和本报告推断；'
-            '估值中位不是技术支撑。不得为迎合审核虚构事实。使用给定S前缀证据编号，输出完整JSON。',
+            '估值中位不是技术支撑。审核意见也是待核意见，须对照原文原图，不得为迎合意见改变原意或虚构事实。'
+            '所有博主判断保留主体和条件，标题也不能把预测或观点写成已核实事实。使用给定S前缀证据编号，输出完整JSON。',
             {**payload, 'candidate_needing_repair': result, 'review_issues': issues}, [], env)
-        analysis = build(result, repaired, True)
+        try:
+            analysis = build(result, repaired, True, candidate_name)
+        except ValueError as error:
+            candidate_name = f'analysis-review-v2-validation-{semantic_attempt+1:03}'
+            result = model_json(directory, candidate_name, INSTRUCTION + '\n只修正validation_error，保留有依据的事实与条件。',
+                {**payload, 'candidate_needing_repair': result, 'validation_error': str(error)}, [], env)
+            analysis = build(result, repaired, True, candidate_name)
         video = analysis['videos'][0]
         log('candidate_semantic_revision_completed', video_id=vid)
     write(capture_dir / 'analysis.json', analysis)
-    publish(capture_dir / 'analysis.json', capture_dir.parent.parent / 'library.sqlite')
+    database = capture_dir.parent.parent / 'library.sqlite'
+    publish(capture_dir / 'analysis.json', database, register=False)
     # Make the delivery copy accurately describe automated review and a single video.
     report = capture_dir / 'brief-v1.md'
     text = report.read_text(encoding='utf-8').replace('## 三期速读', '## 本期速读').replace('## 跨期观察', '## 分析补充')
@@ -418,13 +537,15 @@ def analyze(capture_dir, info, env):
     html_text = html_text.replace('关键画面由分析者核对', '关键画面由视觉模型核对并进行第二遍自动审阅；未经人工逐条复核')
     html_report.write_text(html_text, encoding='utf-8')
     # Reseal manifest after adapting the report copy.
+    update_costs(capture_dir)
     manifest = read(capture_dir / 'manifest-v1.json')
     for artifact in manifest.get('artifacts', []):
-        if artifact.get('path') in {'brief-v1.md', 'brief-v1.html'}:
+        if artifact.get('path') in {'brief-v1.md', 'brief-v1.html', 'cost-summary.json'}:
             artifact_path = capture_dir / artifact['path']
             artifact['sha256'] = sha(artifact_path)
             artifact['bytes'] = artifact_path.stat().st_size
     write(capture_dir / 'manifest-v1.json', manifest)
+    register_archive(capture_dir / 'analysis.json', database)
     return report
 
 
@@ -459,17 +580,96 @@ def process(jobs, vid, root, env):
     log('video_complete', video_id=vid, url=receipt['url'])
 
 
+def pending_retry_at(capture_dir, env):
+    rules = policy(env)
+    if not rules['enabled']:
+        return None
+    due = []
+    for path in capture_dir.rglob('*.pending.json'):
+        base = path.name.removesuffix('.pending.json')
+        if path.with_name(base + '.response.json').exists():
+            continue
+        audit = path.with_name(base + '-transport-recovery-001.transport-recovery.audit.json')
+        if audit.exists():
+            child = read(audit).get('replacement_name')
+            if child and path.with_name(child + '.response.json').exists():
+                continue  # The old billing outcome stays unknown, but the replacement completed.
+        marker = read(path)
+        retry_at = pending_started(marker) + rules['unknown_grace']
+        if owner_alive(marker):
+            retry_at = max(retry_at, time.time() + 300)
+        if retry_at > time.time():
+            due.append(retry_at)
+    return max(due) if due else None
+
+
+def handle_failure(jobs, vid, root, env, error):
+    """Return true only when operator attention is actually required."""
+    rules = policy(env)
+    job = jobs.get(vid)
+    capture_dir = root / 'videos' / vid
+    if (capture_dir / vid).is_dir():
+        update_costs(capture_dir)
+    if not rules['enabled']:
+        held = any(capture_dir.rglob('*.pending.json')) or (
+            isinstance(error, ValueError) and any(capture_dir.rglob('*.response.json')))
+    else:
+        held = isinstance(error, (RecoveryExhausted, ReviewRejected, ValueError))
+        held = held or any(token in str(error) for token in ('Missing configuration', 'Model HTTP 400',
+            'Model HTTP 401', 'Model HTTP 403', 'Model HTTP 404', 'Model HTTP 422'))
+    for path in capture_dir.glob('.feishu-state-*.json'):
+        state = read(path)
+        pending = state.get('pending_write')
+        if pending:
+            # These have an exact target/ticket that a GET can reconcile.
+            reconcilable = str(pending).startswith('create_image:') or (pending == 'create_import' and state.get('ticket'))
+            held = held or not (rules['enabled'] and reconcilable)
+    exhausted = job['attempts'] >= rules['max_attempts']
+    terminal = held or exhausted
+    if isinstance(error, RecoveryDeferred) and rules['enabled'] and not exhausted:
+        terminal = False
+    if not terminal:
+        retry_at = error.retry_at if isinstance(error, RecoveryDeferred) else time.time() + retry_delay(job['attempts'])
+        jobs.save(vid, status='retry', error=type(error).__name__, auto_recovery_v2=True,
+                  next_retry_at=retry_at, recovery_error=type(error).__name__)
+        log('video_recovery_scheduled', video_id=vid, attempt=job['attempts'], retry_at=retry_at,
+            error_type=type(error).__name__)
+        return False
+    jobs.save(vid, status='needs_review', error=type(error).__name__, auto_recovery_v2=True,
+              recovery_exhausted=True, review_issues=getattr(error, 'issues', [])[:6])
+    action = ('自动恢复次数已用尽，保留证据与回执，需核查后恢复' if exhausted else
+              '自动修订或回执核实仍未通过，已保留证据并停止重复请求')
+    failure_notice(root, job['source'], job['checkpoint'].get('stage', '处理视频'), error, action)
+    log('video_failed', video_id=vid, error_type=type(error).__name__, needs_review=True)
+    return True
+
+
+def schedule_scan_retry(root, env, error, *, reset=False):
+    path = root / 'scan-retry.json'
+    previous = read(path) if path.exists() and not reset else {}
+    attempt = previous.get('attempts', 0) + 1
+    rules = policy(env)
+    terminal = attempt >= rules['max_attempts']
+    write(path, {'attempts': attempt, 'next_retry_at': time.time()+retry_delay(attempt),
+                 'terminal': terminal, 'error_type': type(error).__name__})
+    if terminal or not rules['enabled']:
+        failure_notice(root, {}, '频道扫描或元数据', error, '扫描多次失败，保留队列；下一次常规扫描继续检查')
+    return terminal or not rules['enabled']
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=pathlib.Path, required=True)
     parser.add_argument('--channel-id', default=CHANNEL_ID)
     parser.add_argument('--scan-only', action='store_true')
+    parser.add_argument('--retry-only', action='store_true', help='Resume due work; scan only after a recorded discovery failure')
     parser.add_argument('--status', action='store_true')
     parser.add_argument('--since', default='2026-10-23T00:00:00+08:00')
     parser.add_argument('--video', help='Process one previously discovered video ID')
     parser.add_argument('--allow-baseline', action='store_true', help='Explicitly request a historic video')
     args = parser.parse_args()
     root = args.data.resolve()
+    rules = policy(os.environ)
     if not args.status:
         log('failure_notice_delivery', **flush_notices(root, os.environ))
     jobs = Jobs(root / 'jobs.sqlite')
@@ -485,14 +685,26 @@ def main():
             return
         if job['status'] == 'baseline' and not args.allow_baseline:
             parser.error('Historic video needs explicit --allow-baseline')
-        if job['status'] == 'needs_review' or job['attempts'] >= 5:
+        if job['status'] == 'needs_review' or job['attempts'] >= rules['max_attempts']:
             parser.error('Held/exhausted job needs reconciliation, not automatic replay')
     for key in ['LLM_BASE_URL', 'LLM_API_KEY', 'LLM_MODEL', 'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'LARK_WEBHOOK_URL']:
         if not os.environ.get(key):
             raise ValueError('Missing configuration: ' + key)
     if args.video:
         jobs.request_historic(args.video)
-    entries = [] if args.video else discover(root, args.channel_id)
+    scan_retry = root / 'scan-retry.json'
+    prior_scan = read(scan_retry) if scan_retry.exists() else {}
+    retry_scan_due = bool(prior_scan and not prior_scan.get('terminal') and prior_scan.get('next_retry_at', 0) <= time.time())
+    should_scan = not args.video and (not args.retry_only or retry_scan_due)
+    discovery_failed, failed, deferred = False, False, 0
+    entries = []
+    if should_scan:
+        try:
+            entries = discover(root, args.channel_id)
+        except Exception as error:
+            discovery_failed = True
+            failed = schedule_scan_retry(root, os.environ, error, reset=not args.retry_only)
+            deferred += not failed
     cutoff = dt.datetime.fromisoformat(args.since)
     metadata_failures = 0
     for entry in unseen_entries(entries, jobs):
@@ -508,7 +720,8 @@ def main():
                     skip_nonpublic(root, jobs, entry)
                     continue
                 log('metadata_unavailable', video_id=entry['video_id'], error_type=type(error).__name__)
-                failure_notice(root, entry, '获取视频元数据', error, '下次扫描重试；发布日期暂未取得')
+                if not rules['enabled']:
+                    failure_notice(root, entry, '获取视频元数据', error, '下次扫描重试；发布日期暂未取得')
                 metadata_failures += 1
                 continue
             if metadata.get('availability') != 'public':
@@ -516,8 +729,9 @@ def main():
                     skip_nonpublic(root, jobs, entry)
                     continue
                 # Unknown availability is not proof of an access restriction.
-                failure_notice(root, entry, '获取视频元数据', ValueError('Unknown video availability'),
-                               '下次扫描重试；公开视频权限尚未确认')
+                if not rules['enabled']:
+                    failure_notice(root, entry, '获取视频元数据', ValueError('Unknown video availability'),
+                                   '下次扫描重试；公开视频权限尚未确认')
                 metadata_failures += 1
                 continue
             timestamp = metadata.get('release_timestamp') or metadata.get('timestamp')
@@ -535,33 +749,38 @@ def main():
             jobs.save(entry['video_id'], status='baseline' if published < cutoff else 'queued')
         if added:
             log('video_discovered', video_id=entry['video_id'], published=entry['published_utc'])
-    failed = metadata_failures > 0
+    if metadata_failures:
+        failed = schedule_scan_retry(root, os.environ, ValueError('Video metadata temporarily unavailable'),
+                                     reset=not args.retry_only) or failed
+        deferred += not failed
+    elif should_scan and not discovery_failed:
+        scan_retry.unlink(missing_ok=True)
+    work_seen = False
     if not args.scan_only:
-        for vid in ([args.video] if args.video else jobs.pending()):
+        for vid in ([args.video] if args.video else jobs.pending(max_attempts=rules['max_attempts'])):
+            work_seen = True
             try:
+                retry_at = pending_retry_at(root / 'videos' / vid, os.environ)
+                if retry_at is not None:
+                    jobs.save(vid, status='retry', next_retry_at=retry_at, auto_recovery_v2=True)
+                    deferred += 1
+                    continue
                 process(jobs, vid, root, os.environ)
             except Exception as error:
                 if members_only_error(error):
                     skip_nonpublic(root, jobs, jobs.get(vid)['source'])
                     continue
-                # Never log exceptions containing credentials or signed download URLs.
-                capture_dir = root / 'videos' / vid
-                if (capture_dir / vid).is_dir():
-                    update_costs(capture_dir)
-                held = any(capture_dir.rglob('*.pending.json')) or (
-                    isinstance(error, ValueError) and any(capture_dir.rglob('*.response.json')))
-                for receipt_path in capture_dir.glob('.feishu-state-*.json'):
-                    held = held or bool(read(receipt_path).get('pending_write'))
-                jobs.save(vid, status='needs_review' if held else 'retry', error=type(error).__name__)
-                job = jobs.get(vid)
-                action = ('已暂停，需核实后恢复' if held else
-                          '重试次数已用尽，需检查后恢复' if job['attempts'] >= 5 else '保留检查点，下次扫描重试')
-                failure_notice(root, job['source'], job['checkpoint'].get('stage', '处理视频'), error, action)
-                log('video_failed', video_id=vid, error_type=type(error).__name__, needs_review=held)
-                failed = True
+                terminal = handle_failure(jobs, vid, root, os.environ, error)
+                failed = failed or terminal
+                deferred += not terminal
+    failed = failed or bool(jobs.counts().get('needs_review'))
+    if args.retry_only and not should_scan and not work_seen and not deferred and not failed:
+        log('recovery_idle', counts=jobs.counts())
+        return
     write(root / 'last-run.json', {'finished_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
                                  'counts': jobs.counts(), 'failed': failed,
-                                 'metadata_failures': metadata_failures})
+                                 'metadata_failures': metadata_failures, 'recovering': deferred,
+                                 'auto_recovery_enabled': rules['enabled']})
     log('scan_complete', counts=jobs.counts(), failed=failed)
     log('failure_notice_delivery', **flush_notices(root, os.environ))
     if failed:

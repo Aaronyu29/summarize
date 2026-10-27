@@ -27,6 +27,12 @@ class UnifiedReleaseTests(unittest.TestCase):
                 self.assertEqual(manifest['files'][path], hashlib.sha256((project / 'scripts' / name).read_bytes()).hexdigest())
                 self.assertEqual((release / path).read_bytes(), (project / 'scripts' / name).read_bytes())
             self.assertIn('finance/scripts/test_finance_feishu.py', manifest['files'])
+            self.assertIn('finance/scripts/finance_recovery.py', manifest['files'])
+            for stem in ('rhino-video-digest', 'rhino-video-recovery'):
+                for suffix in ('service', 'timer'):
+                    name = stem + '.' + suffix
+                    self.assertEqual(manifest['files']['finance/systemd/'+name],
+                        hashlib.sha256((project/'deploy/finance'/name).read_bytes()).hexdigest())
             self.assertIn('wheels/rhino_invest-0.1.0-py3-none-any.whl', manifest['files'])
             self.assertFalse(any('research-data' in path or '.env' in path for path in manifest['files']))
 
