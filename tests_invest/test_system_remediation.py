@@ -222,5 +222,28 @@ class RemediationTests(unittest.TestCase):
         for bad in ({'diluted_shares':0},{'tax_rate':1},{'after_tax_nonoperating_cost':1000}):
             with self.assertRaises(ValueError):_operating_eps(dict(bridge,**bad))
 
+    def test_condition_ids_expand_only_explicit_originals_before_independent_review(self):
+        from rhino_invest.remediation import condition_catalog,expand_condition_ids
+        context={'prior_plan':{'entry':{'conditions':['Await next issuer financial release','Require a fresh official quote']}}}
+        catalog=condition_catalog(context)
+        proposal={'entry':{'low':90,'high':100,'conditions':['Price between 90 and 100'],
+                          'retained_condition_ids':[catalog[0]['condition_id']]},
+                  'condition_resolution':[{'condition_id':catalog[0]['condition_id'],'disposition':'retained','reason':'Future report remains required'},
+                    {'condition_id':catalog[1]['condition_id'],'disposition':'execution_gate','reason':'Engine quote check'}]}
+        before=copy.deepcopy(proposal)
+        expanded=expand_condition_ids(proposal,context)
+        self.assertEqual(proposal,before)
+        self.assertIn('Await next issuer financial release',expanded['entry']['conditions'])
+        self.assertEqual(expanded['entry']['low'],90)
+        self.assertEqual(resolution_errors(expanded,{'condition_resolution_reviewed':True},context,set()),[])
+        self.assertTrue(resolution_errors(expanded,{},context,set()))
+        for bad in ('unknown','duplicate','missing_retained','conflicting_text'):
+            changed=copy.deepcopy(proposal)
+            if bad=='unknown':changed['condition_resolution'][0]['condition_id']='invented'
+            elif bad=='duplicate':changed['condition_resolution'][1]=changed['condition_resolution'][0]
+            elif bad=='missing_retained':changed['entry']['retained_condition_ids']=[]
+            else:changed['condition_resolution'][0]['previous_condition']='A different fundamental gate'
+            with self.assertRaises(ValueError):expand_condition_ids(changed,context)
+
 
 if __name__=='__main__':unittest.main()

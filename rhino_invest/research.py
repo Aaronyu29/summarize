@@ -1541,9 +1541,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
             from .remediation import COMPILE_REPAIR
             payload['instruction'] = COMPILE + COMPILE_REPAIR
-            if context.get('repair_policy')=='system-economic-repair-v1':
+            if context.get('repair_policy') in ('system-economic-repair-v1','system-condition-ids-v1'):
                 from .remediation import ECONOMIC_REPAIR
                 payload['instruction'] += ECONOMIC_REPAIR
+            if context.get('repair_policy')=='system-condition-ids-v1':
+                from .remediation import CONDITION_IDS
+                payload['instruction'] += CONDITION_IDS
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
         etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
         holding_gaps = []
@@ -1589,6 +1592,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 if critique:
                     store.put('research_critique_draft', operation_key, {'proposal': proposed,
                         'proposal_hash': stable_id(proposed)}, immutable=True)
+        if (context or {}).get('repair_policy')=='system-condition-ids-v1' and not context.get('review_only_candidate'):
+            from .remediation import expand_condition_ids
+            raw_hash=stable_id(proposed)
+            proposed=expand_condition_ids(proposed,context)
+            store.put('research_condition_expansion',operation_key,{'raw_proposal_hash':raw_hash,
+                'expanded_proposal_hash':stable_id(proposed),'catalog':context['original_condition_catalog']},immutable=True)
         if critique:
             schema_errors = _critique_schema_errors(proposed)
             if schema_errors:

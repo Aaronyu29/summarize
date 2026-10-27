@@ -6,6 +6,7 @@ from .research import compile_plan, _research_fundamental, _stable_fundamentals,
 CONTRACT = 'system-plan-remediation-v1'
 MAX_ROUNDS = 2
 ECONOMIC_REPAIR_CONTRACT = 'system-economic-repair-v1'
+CONDITION_REPAIR_CONTRACT = 'system-condition-ids-v1'
 
 COMPILE_REPAIR = '''
 SYSTEM_PLAN_REMEDIATION_V1. Repair the supplied original proposal; the system owns
@@ -69,6 +70,54 @@ replacement to that authored constraint; never claim the split already occurred.
 Preserve actual future earnings-confirmation conditions. Replacing an authored gate
 is allowed only with explicit new-proposal justification and independent review.
 '''
+
+CONDITION_IDS = '''
+CONDITION_IDS_V1. Correct the condition mapping using ONLY original_condition_catalog.
+Ignore condition-resolution rows from intermediate failed drafts. Return exactly one
+condition_resolution row per catalog condition_id, with condition_id, disposition,
+reason and evidence_refs. OMIT previous_condition: the system expands the ID to the
+immutable original text BEFORE independent review. Never invent an ID.
+For disposition=retained, also list the condition_id in entry.retained_condition_ids;
+the system expands these to full entry.conditions before review. Keep actual future
+fundamental gates and price_and_fundamental when they remain. Do not call a retained
+gate satisfied or move it to invalidation merely to get price_only. A condition can
+instead be satisfied_by_evidence only with actual supplied source support.
+Preserve sound economic inputs from latest_failed_plan. Correct actual math defects,
+but do not invent a higher fair value just to make today's quote look buyable.
+Research-only/no-buy is a valid conclusion when the source-supported value is too low.
+'''
+
+
+def condition_catalog(context):
+    return [{'condition_id':stable_id('research-entry-condition-v1',text),'text':text}
+            for text in ((context.get('prior_plan') or {}).get('entry') or {}).get('conditions',[])]
+
+
+def expand_condition_ids(proposal,context):
+    """Expand explicit IDs only; never infer semantic matches from similar prose."""
+    import copy
+    result=copy.deepcopy(proposal)
+    catalog={row['condition_id']:row['text'] for row in condition_catalog(context)}
+    rows=result.get('condition_resolution')
+    if not isinstance(rows,list) or any(not isinstance(row,dict) for row in rows):
+        raise ValueError('Condition ID rows required')
+    ids=[row.get('condition_id') for row in rows]
+    if len(ids)!=len(catalog) or set(ids)!=set(catalog):
+        raise ValueError('Condition IDs must cover the original conditions exactly once')
+    for row in rows:
+        text=catalog[row['condition_id']]
+        if row.get('previous_condition') not in (None,text):
+            raise ValueError('Condition ID conflicts with original condition text')
+        row['previous_condition']=text
+    entry=result.setdefault('entry',{})
+    retained=entry.pop('retained_condition_ids',[])
+    expected={row['condition_id'] for row in rows if row.get('disposition')=='retained'}
+    if not isinstance(retained,list) or len(retained)!=len(expected) or set(retained)!=expected:
+        raise ValueError('Retained condition IDs must match the declared dispositions')
+    conditions=entry.setdefault('conditions',[])
+    for identity in retained:
+        if catalog[identity] not in conditions:conditions.append(catalog[identity])
+    return result
 
 REVIEW_REPAIR = '''
 SYSTEM_PLAN_REMEDIATION_V1 independent review. Review prior objections as hypotheses,
@@ -221,23 +270,32 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
         key=stable_id(CONTRACT,symbol,source['id'],generation)
         job=store.get('research_system_repair',key)
         parent_key=key
+        replacement_contract=CONTRACT
         if job and job.get('terminal'):
             # A distinct, fixed policy addresses proven economics defects only.
             # Never reset the completed rounds, create timestamped identities, or
             # spend on an already accepted conditional baseline.
-            if not economic_consistency_errors(current) or (current.get('research_assessment') or {}).get('status')=='approved_conditional':
+            mapping_error=any('Condition resolution' in str(issue) or 'Retained entry condition' in str(issue)
+                              for issue in current.get('review_issues',[]))
+            if (not economic_consistency_errors(current) and not mapping_error) or (current.get('research_assessment') or {}).get('status')=='approved_conditional':
                 continue
             key=stable_id(ECONOMIC_REPAIR_CONTRACT,parent_key)
             job=store.get('research_system_repair',key)
-            if job and job.get('terminal'):continue
+            replacement_contract=ECONOMIC_REPAIR_CONTRACT
+            if job and job.get('terminal'):
+                if not mapping_error:continue
+                key=stable_id(CONDITION_REPAIR_CONTRACT,parent_key)
+                job=store.get('research_system_repair',key)
+                replacement_contract=CONDITION_REPAIR_CONTRACT
+                if job and job.get('terminal'):continue
         if not job:
-            job={'id':key,'contract':ECONOMIC_REPAIR_CONTRACT if key!=parent_key else CONTRACT,'symbol':symbol,'source_id':source['id'],
-                 'generation':generation,'round':0,'max_rounds':MAX_ROUNDS,'timestamp':now,
+            job={'id':key,'contract':replacement_contract,'symbol':symbol,'source_id':source['id'],
+                 'generation':generation,'round':0,'max_rounds':1 if replacement_contract==CONDITION_REPAIR_CONTRACT else MAX_ROUNDS,'timestamp':now,
                  'status':'queued','terminal':False}
             if key!=parent_key:job['parent_job_id']=parent_key
             store.put('research_system_repair',key,job)
         store.put('research_system_repair_current',current['id'],job)
-        for round_index in range(job['round'],MAX_ROUNDS):
+        for round_index in range(job['round'],job['max_rounds']):
             # Any unresolved paid request prevents a new operation identity bypass.
             unresolved=[call_id for call_id,_ in store.items('model_call')
                 if not store.get('model_receipt',call_id) and not store.get('model_rejection',call_id)]
@@ -256,11 +314,13 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
                 original=(first or {}).get('prior_plan') or latest
                 context={'event_id':phase_id,'kind':CONTRACT,'round':round_index,
                          'prior_plan':original,'latest_failed_plan':latest,'system_owned':True}
-                if job.get('contract')==ECONOMIC_REPAIR_CONTRACT:
+                if job.get('contract') in (ECONOMIC_REPAIR_CONTRACT,CONDITION_REPAIR_CONTRACT):
                     from .research import _calculate_target_prices
-                    context.update(repair_policy=ECONOMIC_REPAIR_CONTRACT,
+                    context.update(repair_policy=job['contract'],
                         calculation_feedback={'economic_errors':economic_consistency_errors(latest),
                             'calculation_book':_calculate_target_prices(latest)[1]})
+                    if job['contract']==CONDITION_REPAIR_CONTRACT:
+                        context['original_condition_catalog']=condition_catalog(context)
                 store.put('research_system_repair_input',phase_id,context,immutable=True)
             levels=[level for _,level in store.items('research_level') if level.get('symbol')==symbol
                     and source['id'] in level.get('evidence_refs',[])]
@@ -280,10 +340,11 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
             revised=next((p for p in candidates if p.get('symbol')==symbol),None)
             if not revised:
                 job.update(status='risk_or_source_deferred',terminal=True);store.put('research_system_repair',key,job);break
+            accepted=revised.get('status')=='active' or (revised.get('research_assessment') or {}).get('status')=='approved_conditional'
             job.update(round=round_index+1,plan_revision=revised['revision'],
-                       status='completed' if revised.get('status')=='active' else 'needs_system_review')
+                       status='completed' if accepted else 'needs_system_review')
             summary['processed']+=1
-            if revised.get('status')=='active' or round_index+1==MAX_ROUNDS:
+            if accepted or round_index+1==job['max_rounds']:
                 job['terminal']=True
             store.put('research_system_repair',key,job)
             store.put('research_system_repair_current',current['id'],job)
