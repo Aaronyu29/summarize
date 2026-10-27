@@ -683,7 +683,7 @@ class Runner:
                 for error in ingestion.get("errors", []):
                     item = {"stage": "archive_ingestion", "error": _safe_error(error.get("error"))}
                     summary["deferred" if item["error"] == "ModelBudgetExceeded" else "errors"].append(item)
-            if self.config.system_remediation_enabled and not self._stop.is_set():
+            if getattr(self.config, 'system_remediation_enabled', False) and not self._stop.is_set():
                 from .remediation import remediate_plans
                 repair = remediate_plans(self.store, model, fundamentals, self.clock())
                 summary['system_remediation'] = repair
