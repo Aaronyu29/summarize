@@ -5,7 +5,7 @@ from unittest.mock import patch
 from rhino_invest.common import stable_id
 from rhino_invest.config import Config
 from rhino_invest.model import ModelBudgetExceeded
-from rhino_invest.remediation import remediate_plans, resolution_errors, economic_consistency_errors
+from rhino_invest.remediation import remediate_plans, adjudicate_research, accepted_fallback, resolution_errors, economic_consistency_errors
 from rhino_invest.research import ingest_archives
 from tests_invest import test_research_evidence_contract as evidence_tests
 from tests_invest.test_research import NOW
@@ -111,6 +111,56 @@ class RemediationTests(unittest.TestCase):
         self.assertFalse(Config().system_remediation_enabled)
         self.assertTrue(Config.load(environ={'INVEST_SYSTEM_REMEDIATION_ENABLED':'true'}).system_remediation_enabled)
         with self.assertRaises(ValueError):Config(system_remediation_enabled='maybe')
+
+    def conditional_baseline(self):
+        from rhino_invest.research import seal_plan_review, _persist_plan
+        data,_=self.primary();data['company_profile']={'company_name':'Fixture issuer'}
+        original=ingest_archives(self.store,self.db,model=evidence_tests.IndependentModel(),fundamentals={'NVDA':data},now=NOW)['plans'][0]
+        baseline=copy.deepcopy(original);baseline['revision']+=1
+        baseline['status']='needs_review';baseline['entry'].update(condition_mode='price_and_fundamental',conditions=['Await next issuer report'],execution_conditions=[])
+        baseline['conditions_parsed']=False;baseline['research_assessment']['status']='approved_conditional'
+        old_review=self.store.get('research_plan_review',original['review_evidence_id'])['review']
+        seal_plan_review(self.store,baseline,old_review)
+        _persist_plan(self.store,baseline)
+        return data,baseline
+
+    def test_failed_replacement_keeps_accepted_baseline_and_review_only_phase_never_buys_draft(self):
+        data,baseline=self.conditional_baseline();model=RepairModel(reject=True)
+        remediate_plans(self.store,model,{'NVDA':data},NOW)
+        self.assertEqual(self.store.get('plan',baseline['id']),baseline)
+        revisions=[p['revision'] for k,p in self.store.items('plan_revision') if p['id']==baseline['id']]
+        self.assertEqual(len(set(revisions)),len(revisions));self.assertGreater(max(revisions),baseline['revision'])
+        before=len(model.calls)
+        result=adjudicate_research(self.store,model,{'NVDA':data},NOW)
+        self.assertEqual(result['processed'],1)
+        self.assertEqual(model.calls[before:],['review_plan'])
+        adjudicate_research(self.store,model,{'NVDA':data},NOW)
+        self.assertEqual(len(model.calls),before+1)
+        self.assertEqual(self.store.get('plan',baseline['id']),baseline)
+
+    def test_legacy_rejected_publication_restores_baseline_before_budget_deferral(self):
+        data,baseline=self.conditional_baseline()
+        remediate_plans(self.store,RepairModel(reject=True),{'NVDA':data},NOW)
+        job=self.store.items('research_system_repair')[0][1]
+        failed=self.store.get('plan_revision',stable_id(baseline['id'],job['plan_revision']))
+        self.store.put('plan',baseline['id'],failed)
+        with patch('rhino_invest.remediation.compile_plan',side_effect=ModelBudgetExceeded('budget')):
+            result=adjudicate_research(self.store,RepairModel(),{'NVDA':data},NOW)
+        self.assertTrue(result['deferred'])
+        self.assertEqual(self.store.get('plan',baseline['id']),baseline)
+        self.store.put('plan',baseline['id'],failed)
+        self.store.put('research_system_repair',job['id'],dict(job,terminal=False,status='budget_deferred'))
+        with patch('rhino_invest.remediation.compile_plan') as call:
+            adjudicate_research(self.store,RepairModel(),{'NVDA':data},NOW)
+        call.assert_not_called()
+        self.assertEqual(self.store.get('plan',baseline['id']),baseline)
+
+    def test_fallback_never_restores_over_changed_facts_or_verified_risk(self):
+        data,baseline=self.conditional_baseline();context={'prior_plan':baseline}
+        self.assertEqual(accepted_fallback(self.store,context,baseline),baseline)
+        self.assertIsNone(accepted_fallback(self.store,context,dict(baseline,fundamental_evidence_id='changed')))
+        self.store.put('risk_evidence','risk',{'verified':True,'plan_id':baseline['id']})
+        self.assertIsNone(accepted_fallback(self.store,context,baseline))
 
     def test_budget_work_order_follows_configured_watchlist(self):
         from rhino_invest.store import Store

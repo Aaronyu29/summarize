@@ -48,7 +48,84 @@ Trade-time official quotes and reconciled cash are enforced separately by the en
 Do not accept removing an unresolved genuine fundamental/corporate-action condition
 to force a price-only entry. Judge changed authored assumptions as a new proposal.
 Also return condition_resolution_reviewed:true ONLY after checking every disposition.
+accepted refers to RESEARCH acceptance, not immediate execution readiness. A genuine
+future fundamental/date/entry condition may remain and yield conditional research;
+put execution-only gaps in notes/execution_issues, NOT blocking research issues.
+Do not reject sound valuation solely because execution_conditions are not parsed.
 Research approval never asserts that cash is verified or that a purchase has occurred.'''
+
+
+def same_published_seed(current,context):
+    from .research import plan_fingerprint
+    allowed=[context.get('prior_plan'),context.get('latest_failed_plan')]
+    return any(seed and plan_fingerprint(current)==plan_fingerprint(seed) for seed in allowed)
+
+
+def accepted_fallback(store,context,candidate):
+    from .decisions import _has_provenance
+    baseline=(context or {}).get('prior_plan') or {}
+    if any(v.get('verified') is True and v.get('plan_id')==baseline.get('id') for _,v in store.items('risk_evidence')):
+        return None
+    if (baseline.get('fundamental_evidence_id')==candidate.get('fundamental_evidence_id')
+            and baseline.get('research_snapshot_id')==candidate.get('research_snapshot_id')
+            and (baseline.get('status')=='active' or (baseline.get('research_assessment') or {}).get('status')=='approved_conditional')
+            and _has_provenance(store,baseline)):
+        return baseline
+    return None
+
+
+def adjudicate_research(store,model,fundamentals,now,priority_symbols=()):
+    """One review-only contract correction per evidence root; no draft regeneration."""
+    from .research import plan_fingerprint
+    result={'processed':0,'errors':[],'deferred':[]}
+    order={symbol:i for i,symbol in enumerate(priority_symbols)}
+    jobs=[j for _,j in store.items('research_system_repair') if j.get('plan_revision') and j.get('status')!='completed']
+    for job in sorted(jobs,key=lambda j:(order.get(j['symbol'],len(order)),j['symbol'])):
+        key=stable_id('research-execution-separation-review-v1',job['id'])
+        previous=store.get('research_reaudit',key)
+        if previous and previous.get('terminal'):continue
+        plan_id=stable_id('investment-plan',job['symbol'])
+        candidate=store.get('plan_revision',stable_id(plan_id,job.get('plan_revision'))) or store.get('plan',plan_id)
+        first=store.get('research_system_repair_input',stable_id(job['id'],'round',0))
+        if not candidate or not first:continue
+        fallback=accepted_fallback(store,first,candidate)
+        current=store.get('plan',plan_id)
+        if fallback and current and plan_fingerprint(current)==plan_fingerprint(candidate):
+            store.put('plan',plan_id,fallback)
+            store.put('research_published_fallback',key,{'failed_revision':candidate['revision'],
+                'published_revision':fallback['revision'],'reason':'new_repair_rejected_same_source_evidence','timestamp':now})
+        if not job.get('terminal'):
+            continue  # Restore the published baseline even while the next repair waits for budget.
+        errors=economic_consistency_errors(candidate)
+        if errors:
+            store.put('research_reaudit',key,{'terminal':True,'status':'system_draft_invalid','issues':errors,'symbol':job['symbol']})
+            continue
+        source=store.get('research_evidence',job['source_id'])
+        if not source or _unresolved_thesis_defer(store,current,source,fundamentals,now):continue
+        data,_=_research_fundamental(store,job['symbol'],(fundamentals or {}).get(job['symbol']))
+        if stable_id('fundamentals',_stable_fundamentals(data))!=job['generation']:continue
+        if any(not store.get('model_receipt',k) and not store.get('model_rejection',k) for k,_ in store.items('model_call')):
+            result['errors'].append({'symbol':job['symbol'],'error':'UnknownModelOutcome'});break
+        context=store.get('research_reaudit_input',key)
+        if not context:
+            context={'event_id':key,'kind':CONTRACT,'prior_plan':first['prior_plan'],
+                'latest_failed_plan':candidate,'review_only_candidate':candidate,'system_owned':True,
+                'candidate_hash':plan_fingerprint(candidate)}
+            store.put('research_reaudit_input',key,context,immutable=True)
+        levels=[v for _,v in store.items('research_level') if v.get('symbol')==job['symbol'] and source['id'] in v.get('evidence_refs',[])]
+        try:
+            plans=compile_plan(store,source,levels,model,{job['symbol']:data},job['timestamp'],context=context)
+        except Exception as error:
+            deferred=isinstance(error,ModelBudgetExceeded)
+            store.put('research_reaudit',key,{'terminal':not isinstance(error,(ModelBudgetExceeded,UnknownModelOutcome)),
+                'status':'budget_deferred' if deferred else 'review_error','error':type(error).__name__,'symbol':job['symbol']})
+            result['deferred' if deferred else 'errors'].append({'symbol':job['symbol'],'error':type(error).__name__})
+            continue
+        chosen=next((p for p in plans if p['symbol']==job['symbol']),None)
+        store.put('research_reaudit',key,{'terminal':True,'status':(chosen or {}).get('research_assessment',{}).get('status','deferred'),
+            'symbol':job['symbol'],'revision':(chosen or {}).get('revision'),'timestamp':now})
+        result['processed']+=1
+    return result
 
 
 def resolution_errors(plan, review, context, known):
@@ -130,7 +207,8 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
             phase_id=stable_id(key,'round',round_index)
             context=store.get('research_system_repair_input',phase_id)
             if not context:
-                latest=store.get('plan',current['id']) or current
+                latest=(store.get('plan_revision',stable_id(current['id'],job.get('plan_revision')))
+                        if job.get('plan_revision') else None) or store.get('plan',current['id']) or current
                 first=store.get('research_system_repair_input',stable_id(key,'round',0))
                 original=(first or {}).get('prior_plan') or latest
                 context={'event_id':phase_id,'kind':CONTRACT,'round':round_index,

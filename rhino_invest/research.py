@@ -1342,8 +1342,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan_id = stable_id('investment-plan', symbol)
         previous = store.get('plan', plan_id)
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
-            seed = context.get('latest_failed_plan') or context.get('prior_plan')
-            if previous and seed and plan_fingerprint(previous) != plan_fingerprint(seed):
+            from .remediation import same_published_seed
+            if previous and not same_published_seed(previous,context):
                 plans.append(previous)
                 continue  # A stale repair cannot overwrite a newer or already committed revision.
         risk_defer = _unresolved_thesis_defer(store, previous, snapshot, fundamentals, moment)
@@ -1533,6 +1533,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 proposed['entry'].update(basis='independent_valuation', conditions=['Required issuer evidence and independent research review must be completed'])
                 unit = fundamental['instrument_contract'].get('quote_price_unit')
                 proposed['is_adr'] = True if unit == 'per_adr' else False if unit == 'per_share' else None
+        elif (context or {}).get('kind') == 'system-plan-remediation-v1' and context.get('review_only_candidate'):
+            candidate=context['review_only_candidate']
+            if plan_fingerprint(candidate)!=context.get('candidate_hash'):
+                raise ValueError('Frozen review-only candidate changed')
+            proposed={key:candidate[key] for key in COMPILE_TEMPLATE['plan'] if key in candidate}
+            if 'condition_resolution' in candidate:proposed['condition_resolution']=candidate['condition_resolution']
         elif calculation_seed is not None:
             # Reuse economic inputs, never old reviewer state/verification.
             proposed = {key: calculation_seed[key] for key in COMPILE_TEMPLATE['plan'] if key in calculation_seed}
@@ -1574,7 +1580,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         # Another source can commit while this attempt is waiting for usable
         # output. Keep economic input/as_of frozen, but let the independent
         # reviewer see the actual final revision before sealing any new plan.
-        checkpoint = store.get('research_critique_review_input', operation_key) if critique else None
+        system_repair=(context or {}).get('kind') == 'system-plan-remediation-v1'
+        checkpoint_kind='research_system_review_input' if system_repair else 'research_critique_review_input'
+        checkpoint = store.get(checkpoint_kind, operation_key) if critique or system_repair else None
         if checkpoint:
             if (stable_id(checkpoint['payload']) != checkpoint['payload_hash']
                     or checkpoint['payload']['evidence_bundle']['hash'] != bundle['hash']):
@@ -1585,7 +1593,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                     or assigned['revision'] != revision or assigned['analysis_as_of'] != plan_moment):
                 raise ValueError('Frozen independent review revision assignment missing or changed')
         else:
-            current_revision = (store.get('plan', plan_id) or {}).get('revision', 0)
+            current_revision = max([(store.get('plan', plan_id) or {}).get('revision', 0)]+
+                [p.get('revision',0) for _,p in store.items('plan_revision') if p.get('id')==plan_id])
             revision = max(attempt['revision'], current_revision + 1)
             assignment_key = stable_id('plan-revision-assignment', operation_key, revision)
             store.put('plan_revision_assignment', assignment_key, {'operation_id': operation_key, 'plan_id': plan_id,
@@ -1619,6 +1628,10 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             from .remediation import REVIEW_REPAIR
             review_payload['instruction'] = REVIEW + REVIEW_REPAIR
             review_payload['review_context'] = context
+            if checkpoint:
+                review_payload=checkpoint['payload'];plan=json.loads(json.dumps(review_payload['plan']));revision=plan['revision']
+            else:
+                store.put(checkpoint_kind,operation_key,{'payload':review_payload,'payload_hash':stable_id(review_payload)},immutable=True)
         if critique:
             review_payload['instruction'] = critique['review_instruction']
             review_payload['critique_context'] = {'id': critique['id'], 'prior_issues_are_opinions': True,
@@ -1700,8 +1713,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 plans.append(current)
                 continue
             if (context or {}).get('kind') == 'system-plan-remediation-v1':
-                seed = context.get('latest_failed_plan') or context.get('prior_plan')
-                if current and seed and plan_fingerprint(current) != plan_fingerprint(seed):
+                from .remediation import same_published_seed
+                if current and not same_published_seed(current,context):
                     plans.append(current)
                     continue
             if (calculation_seed and current and previous
@@ -1710,7 +1723,17 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                          or current.get('research_assessment', {}).get('status') == 'approved_conditional')):
                 plans.append(current)
                 continue
-            _persist_plan(store, plan)
+            fallback=None
+            if issues and system_repair:
+                from .remediation import accepted_fallback
+                fallback=accepted_fallback(store,context,plan)
+            if fallback:
+                store.put('plan_revision',stable_id(plan['id'],plan['revision']),plan,immutable=True)
+                store.put('plan',plan_id,fallback)
+                store.put('research_published_fallback',operation_key,{'failed_revision':plan['revision'],
+                    'published_revision':fallback['revision'],'timestamp':moment,'reason':'new_repair_rejected_same_source_evidence'})
+            else:
+                _persist_plan(store, plan)
             store.put('plan_operation', operation_key, {'plan': plan}, immutable=True)
             if critique:
                 store.put('research_critique_result', operation_key, {'status': plan['status'],
