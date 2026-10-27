@@ -23,9 +23,11 @@ ReadOnlyPaths=/opt/rhino-video-digest
 Environment=OPENBLAS_NUM_THREADS=1
 Environment=OMP_NUM_THREADS=1
 CPUQuota=50%
-MemoryHigh=640M
-MemoryMax=768M
-MemorySwapMax=128M
+# The evidence/receipt archive outgrew 640M: sustained memory.high reclaim stalled shutdown.
+# Keep a hard ceiling while allowing source extraction and serialized Feishu sync to finish.
+MemoryHigh=896M
+MemoryMax=1152M
+MemorySwapMax=256M
 TasksMax=64
 Nice=10
 TimeoutStopSec=700
