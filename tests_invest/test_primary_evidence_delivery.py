@@ -208,8 +208,8 @@ class PrimaryEvidenceTests(unittest.TestCase):
         self.assertEqual(quarter['value'], '9.11')
         self.assertIn('not normalized or recurring', data['primary_financials']['non_operating_items'][0]['warning'])
         self.assertNotIn('forecast', data['primary_financials'])
-        self.assertFalse(any(g['blocking'] for g in data['primary_gaps']))
-        self.assertEqual(len(transport.calls), 3)
+        self.assertTrue(any(g['blocking'] and g.get('field')=='GOOGL_class_filing' for g in data['primary_gaps']))
+        self.assertEqual(len(transport.calls), 5)
 
     def test_goog_uses_shared_group_filing_but_preserves_native_ticker_quote_and_class_scope(self):
         native = {'symbol': 'GOOG', 'identity': [{'symbol': 'GOOG.US', 'currency': 'USD'}],

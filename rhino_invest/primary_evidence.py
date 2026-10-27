@@ -11,6 +11,7 @@ import copy
 import csv
 import hashlib
 import io
+import json
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,8 @@ VERSION = "official-primary-v1"
 MAX_BYTES = 8 * 1024 * 1024
 TSM_PAGE = "https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
 GOOGLE_PDF = "https://s206.q4cdn.com/479360582/files/doc_financials/{year}/q{quarter}/{year}q{quarter}-alphabet-earnings-release.pdf"
+GOOGLE_10Q_2026Q2 = 'https://d18rn0p25nwr6d.cloudfront.net/CIK-0001652044/513183d2-787c-48f5-8da7-8a897b1649e0.html'
+GOOGLE_SUBMISSIONS='https://data.sec.gov/submissions/CIK0001652044.json'
 SOXX_PAGE = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf"
 SOXX_HOLDINGS = "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf/latest-holdings.csv"
 CIRCLE_IR = "https://investor.circle.com/overview/default.aspx"
@@ -103,6 +106,9 @@ def _allowed(url):
     if p.scheme != "https" or p.username or p.password or p.port not in (None, 443):
         return False
     return ((p.hostname == "investor.tsmc.com" and p.path.startswith("/english/")) or
+            (url == GOOGLE_10Q_2026Q2) or
+            (url == GOOGLE_SUBMISSIONS) or
+            (p.hostname=='www.sec.gov' and p.path.startswith('/Archives/edgar/data/1652044/') and p.path.endswith(('.htm','.html'))) or
             (p.hostname == "s206.q4cdn.com" and p.path.startswith("/479360582/files/doc_financials/")) or
             (p.hostname == "s206.q4cdn.com" and p.path.startswith("/265218871/files/")) or
             (p.hostname == "investor.circle.com" and p.path == "/overview/default.aspx") or
@@ -385,6 +391,75 @@ def _google(store, out, now, transport):
     out["primary_financials"]["class_eps_reconciliation"] = {"status": "not_verified",
         "requested_symbol": out["symbol"], "share_class": "Class C" if out["symbol"] == "GOOG" else "Class A",
         "reason": "Shared group earnings release does not separately resolve class-specific diluted EPS."}
+    try:_google_class_filing(store,out,now,transport)
+    except Exception as exc:
+        _gap(out['primary_gaps'],str(exc) if isinstance(exc,EvidenceError) else 'CLASS_FILING_UNAVAILABLE',
+             out['symbol']+'_class_filing',GOOGLE_10Q_2026Q2)
+
+
+def _google_class_filing(store,out,now,transport):
+    source=None;published=None;period='2026-06-30';year=2026;q=2
+    try:
+        listing=_fetch(store,GOOGLE_SUBMISSIONS,now,transport)
+        recent=json.loads(listing['content'])['filings']['recent']
+        for i,form in enumerate(recent['form']):
+            if form!='10-Q':continue
+            candidate_period=recent['reportDate'][i]
+            candidate_pub=(recent.get('acceptanceDateTime') or [])[i] if recent.get('acceptanceDateTime') else _published(recent['filingDate'][i])
+            if candidate_period>str(parse_time(now).date()) or parse_time(candidate_pub)>parse_time(now):continue
+            accession=recent['accessionNumber'][i].replace('-','');document=recent['primaryDocument'][i]
+            if not re.fullmatch(r'\d{18}',accession) or not re.fullmatch(r'[A-Za-z0-9_.-]+\.html?',document):raise EvidenceError('FILING_INDEX_INVALID')
+            url=f'https://www.sec.gov/Archives/edgar/data/1652044/{accession}/{document}'
+            source=_fetch(store,url,now,transport);period=candidate_period;published=candidate_pub
+            year=int(period[:4]);q=int(period[5:7])//3
+            break
+    except Exception:
+        out.setdefault('primary_collection',{}).update(retry_required=True,class_filing_discovery='retry_latest_SEC_index')
+    if source is None:source=_fetch(store,GOOGLE_10Q_2026Q2,now,transport)
+    text=source['content']
+    month={1:'March',2:'June',3:'September'}.get(q)
+    if not month:raise EvidenceError('SOURCE_PERIOD_MISMATCH')
+    if not ('Alphabet Inc.' in text and '0001652044' in text and 'FORM 10-Q' in text
+            and f'For the quarterly period ended {month} {int(period[-2:])}, {year}' in text):
+        raise EvidenceError('CLASS_FILING_ISSUER_PERIOD_MISMATCH')
+    if published is None:published=_published(_line(text,r'Form:\s*10-Q,\s*Received:\s*(\d{2}/\d{2}/\d{4})').group(1))
+    if parse_time(published)>parse_time(now):raise EvidenceError('SOURCE_NOT_AVAILABLE_AS_OF')
+    start=text.index('Note 11. Stockholders');end=text.index('Note 13.',start)
+    excerpt=text[start:end]
+    quarter=excerpt.split('Note 12.',1)[1]
+    quarter=re.split(r'(?:Six|Nine) Months Ended',quarter,maxsplit=1)[0]
+    if not re.search(r'Three Months Ended '+month+r' '+period[-2:]+r',\s*'+str(year-1)+r'\s*'+str(year),quarter):raise EvidenceError('SOURCE_PERIOD_MISMATCH')
+    if 'Class AClass BClass CConsolidatedClass AClass BClass CConsolidated' not in quarter.replace(' ','').replace('\n',''):
+        # Whitespace-insensitive comparison, without guessing a reordered table.
+        expected='ClassAClassBClassCConsolidatedClassAClassBClassCConsolidated'
+        if expected not in re.sub(r'\s+','',quarter):raise EvidenceError('CLASS_FILING_COLUMN_ORDER_CHANGED')
+    diluted=quarter.split('Diluted net income per common share:',1)[1]
+    eps,eps_span=_circle_row(diluted,r'Diluted net income per common share\b',8)
+    shares,shares_span=_circle_row(diluted,r'Number of shares used in per share computation',8)
+    numerator,num_span=_circle_row(diluted,r'(?m)^Net income\b',8)
+    index=6 if out['symbol']=='GOOG' else 4;share_class='Class C' if index==6 else 'Class A'
+    if abs(numerator[index]/shares[index]-eps[index])>Decimal('.01'):raise EvidenceError('CLASS_FILING_EPS_RECONCILIATION_FAILED')
+    if 'pursuant to the if-converted method' not in excerpt or 'Preferred dividends are added back' not in excerpt:
+        raise EvidenceError('CLASS_FILING_PREFERRED_METHOD_MISSING')
+    selected=copy.deepcopy(source);selected.update(content=excerpt,sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
+        parser=VERSION+':alphabet-notes-11-12')
+    ev=_evidence(store,selected,published_at=published,period_end=period);out['primary_evidence'].append(ev)
+    pf=out['primary_financials']
+    for metric,value,span,unit in [('class_diluted_eps',eps[index],eps_span,'per_share'),
+                                  ('class_diluted_shares',shares[index]*10**6,shares_span,None),
+                                  ('class_diluted_numerator',numerator[index]*10**6,num_span,None)]:
+        fact=_fact(metric,value,ev,span,year=year,quarter=q,price_unit=unit,locator='10-Q Note 12; current quarterly class-specific columns; USD millions except EPS')
+        fact.update(eps_scope=share_class,symbol=out['symbol']);pf['facts'].append(fact)
+    pf['class_eps_reconciliation']={'status':'verified','requested_symbol':out['symbol'],'share_class':share_class,
+        'period_end':period,'diluted_eps':str(eps[index]),'diluted_shares':str(shares[index]*10**6),
+        'group_diluted_shares':str(shares[7]*10**6),'evidence_refs':[ev['id']],
+        'source_excerpt':eps_span+'\n'+shares_span+'\n'+num_span,
+        'limitation':'Historical class-specific data only; future class EPS still requires an explicit scenario and allocation assumptions.'}
+    pf['financing_reconciliation']={'status':'verified_historical_method','evidence_refs':[ev['id']],
+        'source_excerpt':excerpt,'preferred_method':'if-converted: add back preferred dividends when including assumed converted shares; never deduct dividends a second time',
+        'warning':'Separate actual current shares, weighted-average diluted shares, future scenario dilution and capped-call offsets. Do not extrapolate stub-quarter preferred dividends as a full coupon.'}
+    if all(value in excerpt for value in ('May 15, 2029','2.2740','2.8420')):
+        pf['financing_reconciliation'].update(conversion_date='2029-05-15',series_b_class_c_conversion_range=['2.2740','2.8420'])
 
 
 def _circle_row(text, label, count=4):

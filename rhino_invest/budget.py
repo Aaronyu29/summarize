@@ -94,6 +94,50 @@ def utc_day(timestamp):
     return parse_time(timestamp).astimezone(timezone.utc).date()
 
 
+def authorized_auto_limits(store,config,limits,*,now,calls_used,reserved_used,ceiling,purpose,symbol):
+    """User-authorized bounded expansion at the existing serialized call gate."""
+    path=config.get('auto_budget_policy_file')
+    if not path:return limits
+    try:
+        raw=_path(path).read_bytes()
+        if len(raw)>4096:raise ValueError()
+        policy=json.loads(raw.decode('utf-8'),object_pairs_hook=_unique_object)
+        if set(policy)!={'enabled','symbols','step_calls','step_cost_usd','max_calls','max_cost_usd','valid_until','baseline'}:
+            raise ValueError()
+        cap=validate_limits({'max_calls_per_day':policy['max_calls'],'max_cost_usd_per_day':policy['max_cost_usd']})
+        baseline=validate_limits(policy['baseline'])
+        if (not isinstance(policy['enabled'],bool) or not isinstance(policy['symbols'],list)
+                or any(s!='GOOG' for s in policy['symbols']) or not policy['symbols']
+                or isinstance(policy['step_calls'],bool) or not isinstance(policy['step_calls'],int)
+                or not 0<policy['step_calls']<=30 or not 0<decimal_value(policy['step_cost_usd'])<=3
+                or cap['max_calls_per_day']>180 or decimal_value(cap['max_cost_usd_per_day'])>18):raise ValueError()
+        expiry=parse_time(policy['valid_until'])
+    except (OSError,ValueError,KeyError,TypeError):
+        raise ModelBudgetConfigError('Automatic budget policy invalid; no expansion authorized') from None
+    if policy['enabled'] is False:return limits
+    day=str(utc_day(now));state=store.get('model_auto_budget','current') or {}
+    if (state.get('utc_date') and state['utc_date']!=day and state.get('limits')==limits
+            and calls_used<baseline['max_calls_per_day'] and reserved_used+ceiling<=decimal_value(baseline['max_cost_usd_per_day'])):
+        limits=write_limits(config['budget_file'],baseline)
+        store.put('model_budget_adjustment',stable_id('auto-budget-reset',day),
+            {'utc_date':day,'limits':limits,'reason':'new_utc_day','usage_reset':False},immutable=True)
+    if state.get('utc_date')!=day:
+        state={'utc_date':day,'limits':limits};store.put('model_auto_budget','current',state)
+    followup=store.get('research_followup',symbol) or {}
+    if (purpose not in {'compile_plan','review_plan'} or symbol not in policy['symbols']
+            or followup.get('status')!='researching' or parse_time(now)>=expiry):return limits
+    if calls_used<limits['max_calls_per_day'] and reserved_used+ceiling<=decimal_value(limits['max_cost_usd_per_day']):return limits
+    if limits['max_calls_per_day']>=cap['max_calls_per_day'] or decimal_value(limits['max_cost_usd_per_day'])>=decimal_value(cap['max_cost_usd_per_day']):return limits
+    next_limits={'max_calls_per_day':min(cap['max_calls_per_day'],limits['max_calls_per_day']+policy['step_calls']),
+        'max_cost_usd_per_day':str(min(decimal_value(cap['max_cost_usd_per_day']),decimal_value(limits['max_cost_usd_per_day'])+decimal_value(policy['step_cost_usd'])))}
+    limits=write_limits(config['budget_file'],next_limits)
+    store.put('model_auto_budget','current',{'utc_date':day,'limits':limits})
+    store.put('model_budget_adjustment',stable_id('auto-budget-expand',day,limits),
+        {'utc_date':day,'limits':limits,'reason':'authorized_GOOG_followup','calls_used':calls_used,
+         'reserved_used_usd':str(reserved_used),'usage_reset':False},immutable=True)
+    return limits
+
+
 def budget_status(store, config, *, now=None):
     day = utc_day(now or utc_now())
     calls = [value for _, value in store.items('model_call') if utc_day(value['timestamp']) == day]

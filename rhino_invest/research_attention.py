@@ -10,6 +10,9 @@ def attention_items(plans, store=None):
             continue
         assessment = plan.get('research_assessment') or {}
         ready = plan.get('status') == 'active' and assessment.get('status') == 'approved'
+        if ready:
+            from .common import validate_plan
+            ready=not validate_plan(plan)
         if plan.get('status') == 'active' and not ready:
             continue
         conditional = assessment.get('status') == 'approved_conditional'
@@ -50,11 +53,13 @@ def attention_items(plans, store=None):
         if no_buy:item['no_buy']=True
         if ready:
             item['research_ready'] = True
+            item['risk_rules']={'stop':plan.get('stop'),'take_profit':plan.get('take_profit')}
         if store is not None and (ready or conditional):
             from .research import plan_fingerprint
             binding = store.get('research_plan_review',plan.get('review_evidence_id','')) or {}
+            from .decisions import _has_provenance
             entry = plan.get('entry') or {}
-            if binding.get('accepted') is True and binding.get('plan_hash') == plan_fingerprint(plan):
+            if binding.get('accepted') is True and binding.get('plan_hash') == plan_fingerprint(plan) and _has_provenance(store,plan):
                 if entry.get('low') is not None and entry.get('high') is not None:
                     item['buy_observation'] = {key:entry.get(key) for key in ('low','high','amount_usd')}
                     item['buy_observation']['source'] = {
@@ -114,41 +119,60 @@ def attention_text(items, when):
     return '\n'.join(lines)
 
 
+def _material_buy(item):
+    from decimal import Decimal
+    def normalize(value):
+        if isinstance(value,dict):return {k:normalize(v) for k,v in value.items()}
+        if isinstance(value,list):return [normalize(v) for v in value]
+        try:return str(Decimal(str(value)).normalize())
+        except Exception:return value
+    return stable_id('qualified-buy-material-v1',normalize({k:item.get(k) for k in ('symbol','buy_observation','risk_rules')}))
+
+
+def _commit_buy_states(store,record):
+    for symbol,value in record.get('buy_state_updates',{}).items():
+        previous=store.get('research_attention_buy_state',symbol) or {}
+        if value['sequence']>=previous.get('sequence',0):store.put('research_attention_buy_state',symbol,value)
+
+
 def notify_attention(store, feishu, plans, *, now, when, enabled, execute):
-    """Persist before delivery; never turn an unknown send into a fresh identity."""
-    items = attention_items(plans,store)
-    signature = stable_id('research-attention-v3-plain-language', items)
-    previous = store.get('research_attention_state', 'current')
+    """Notify qualified buy changes only; unknown sends keep their original identity."""
+    from .common import parse_time
+    items=attention_items(plans,store)
+    previous=store.get('research_attention_state','current')
     if not enabled or not execute:
-        return {'status': 'disabled' if not enabled else 'dry_run', 'items': items}
-    if previous and previous.get('status') in {'sending', 'unknown'}:
-        operations = [v for _, v in store.items('feishu_outbox')
-                      if v.get('identity') == 'notice:'+previous['id']]
-        confirmed = next((v for v in operations if v.get('status') in {'delivered', 'acknowledged'}), None)
-        if confirmed:
-            previous = dict(previous, status='sent', receipt=confirmed.get('result', {}))
-            store.put('research_attention_state', 'current', previous)
-            store.put('research_attention_notice', previous['id'], previous)
-        else:
-            raise UnknownOutcome('Research outcome notice is unresolved; preserve the original send identity')
-    if previous and previous.get('signature') == signature and previous.get('status') == 'sent':
-        return {'status': 'unchanged', 'items': items}
-    if not previous and not items:
-        return {'status': 'idle', 'items': []}
-    sequence = (previous or {}).get('sequence', 0) + int(not previous or previous.get('signature') != signature)
-    identity = stable_id('research-attention-notice-v1', sequence, signature)
-    record = {'id': identity, 'sequence': sequence, 'signature': signature, 'status': 'sending',
-              'items': items, 'timestamp': now}
-    store.put('research_attention_state', 'current', record)
-    store.put('research_attention_notice', identity, record)
-    try:
-        receipt = feishu.notify(identity, attention_text(items, when))
+        return {'status':'disabled' if not enabled else 'dry_run','items':items}
+    if previous and previous.get('status') in {'sending','unknown'}:
+        confirmed=next((v for _,v in store.items('feishu_outbox') if v.get('identity')=='notice:'+previous['id']
+                        and v.get('status') in {'delivered','acknowledged'}),None)
+        if not confirmed:raise UnknownOutcome('Research outcome notice is unresolved; preserve the original send identity')
+        previous=dict(previous,status='sent',receipt=confirmed.get('result',{}))
+        store.put('research_attention_state','current',previous)
+        store.put('research_attention_notice',previous['id'],previous)
+        _commit_buy_states(store,previous)
+    changed=[];updates={}
+    for item in items:
+        observation=item.get('buy_observation')
+        if not item.get('research_ready') or not observation:continue
+        if observation.get('basis_valid_until') and parse_time(now)>=parse_time(observation['basis_valid_until']):continue
+        symbol=item['symbol'];signature=_material_buy(item)
+        before=store.get('research_attention_buy_state',symbol) or {}
+        if before.get('signature')==signature:continue
+        updates[symbol]={'signature':signature,'sequence':before.get('sequence',0)+1}
+        changed.append(item)
+    if not changed:
+        return {'status':'unchanged' if previous else 'idle','items':items,'reason':'no_new_qualified_buy'}
+    identity=stable_id('qualified-buy-notice-v1',updates)
+    record={'id':identity,'signature':stable_id(updates),'status':'sending','items':changed,
+            'buy_state_updates':updates,'timestamp':now}
+    store.put('research_attention_state','current',record)
+    store.put('research_attention_notice',identity,record)
+    try:receipt=feishu.notify(identity,attention_text(changed,when))
     except Exception:
-        record = dict(record, status='unknown')
-        store.put('research_attention_state', 'current', record)
-        store.put('research_attention_notice', identity, record)
+        record=dict(record,status='unknown')
+        store.put('research_attention_state','current',record);store.put('research_attention_notice',identity,record)
         raise
-    record = dict(record, status='disabled' if receipt.get('status') == 'disabled' else 'sent', receipt=receipt)
-    store.put('research_attention_state', 'current', record)
-    store.put('research_attention_notice', identity, record)
-    return {'status': record['status'], 'items': items}
+    record=dict(record,status='disabled' if receipt.get('status')=='disabled' else 'sent',receipt=receipt)
+    store.put('research_attention_state','current',record);store.put('research_attention_notice',identity,record)
+    if record['status']=='sent':_commit_buy_states(store,record)
+    return {'status':record['status'],'items':changed}

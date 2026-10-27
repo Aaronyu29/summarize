@@ -28,99 +28,83 @@ class Endpoint:
 
 class AttentionTests(unittest.TestCase):
     def setUp(self):
-        self.store=Store(':memory:');self.addCleanup(self.store.close)
-        self.endpoint=Endpoint()
+        self.store=Store(':memory:');self.addCleanup(self.store.close);self.endpoint=Endpoint()
+
+    def ready(self,symbol='GOOG'):
+        from tests_invest.test_acceptance_core import approved_plan
+        p=approved_plan(symbol);p['entry']['basis']='independent_valuation'
+        p['research_assessment']={'status':'approved'}
+        self.store.put('external_evidence','sealed:1',{'id':'sealed:1','content':'Official fixture source'},immutable=True)
+        return self.rebind(p)
+
+    def rebind(self,p):
+        from tests_invest.plan_fixtures import seal_fixture_review
+        p['review_issues']=[]
+        seal_fixture_review(self.store,p,{'accepted':True,'issues':[],'checks':{'currency':True,'unit':True,'provenance':True,'adr':True}})
+        return p
 
     def notify(self,plans,**kwargs):
-        return notify_attention(self.store,self.endpoint,plans,now=NOW,when='10月27日 14:30（北京时间）',
+        return notify_attention(self.store,self.endpoint,plans,now=NOW,when='fixture',
             enabled=kwargs.get('enabled',True),execute=kwargs.get('execute',True))
 
-    def test_consolidated_five_plans_distinguish_rejected_and_conditional(self):
-        plans=[plan(s) for s in ('CRCL','TSM','GOOG')]+[plan(s,True) for s in ('SOXX','GOOGL')]
-        before=copy.deepcopy(plans)
-        self.assertEqual(self.notify(plans)['status'],'sent')
-        self.assertEqual(len(self.endpoint.calls),1)
-        text=self.endpoint.calls[0][1]
-        self.assertIn('本次更新没有可直接执行的买入建议',text)
-        self.assertIn('TSM｜',text)
-        self.assertIn('SOXX｜暂不买：买入条件还没全部核实',text)
-        self.assertIn('估算未来利润',text);self.assertIn('何时卖出',text)
-        self.assertNotIn('THESIS_INCONSISTENT',text)
-        self.assertIn('你无需补财报',text)
-        self.assertEqual(plans,before)
+    def test_pending_conditional_and_no_buy_are_quiet_even_when_reasons_change(self):
+        plans=[plan('GOOG'),plan('SOXX',True),dict(plan('CRCL'),research_assessment={'status':'approved_no_buy'})]
+        for i in range(8):
+            plans[0]['review_issues']=['EPS' if i%2 else 'growth rate']
+            self.notify(plans)
+        self.assertEqual(self.endpoint.calls,[])
         self.assertEqual(self.store.items('model_call'),[])
 
-    def test_unchanged_is_quiet_across_revision_time_and_restart(self):
-        item=plan();self.notify([item])
-        for i in range(4):
-            item.update(revision=i+2,updated_at='later',created_at='later')
-            self.assertEqual(self.notify([item])['status'],'unchanged')
+    def test_qualified_buy_sends_once_across_revision_and_wording_changes(self):
+        p=self.ready();self.assertEqual(self.notify([p])['status'],'sent')
+        for i in range(8):
+            p.update(revision=i+3,thesis='wording '+str(i));self.rebind(p)
+            self.assertEqual(self.notify([p])['status'],'unchanged')
         self.assertEqual(len(self.endpoint.calls),1)
 
-    def test_changed_problem_and_resolution_each_get_one_transition_notice(self):
-        item=plan();self.notify([item])
-        item['review_issues']=['growth rate is not evidenced']
-        self.notify([item]);self.notify([item])
-        item['status']='active';self.notify([item]);self.notify([item])
-        self.assertEqual(len(self.endpoint.calls),3)
-        self.assertEqual(len({key for key,text in self.endpoint.calls}),3)
-        self.assertIn('问题已解除',self.endpoint.calls[-1][1])
-        item['status']='needs_review';self.notify([item]);item['status']='active';self.notify([item])
-        self.assertEqual(len(self.endpoint.calls),5)
+    def test_material_price_change_notifies_only_the_changed_stock(self):
+        a=self.ready('GOOG');b=self.ready('SOXX');self.notify([a,b])
+        a['entry']['low']='95';a['entry']['execution_conditions'][0]['low']='95'
+        a['entry_condition_review']['execution_conditions'][0]['low']='95';self.rebind(a)
+        self.notify([a,b]);self.notify([a,b])
+        self.assertEqual(len(self.endpoint.calls),2)
+        self.assertIn('GOOG',self.endpoint.calls[-1][1]);self.assertNotIn('SOXX',self.endpoint.calls[-1][1])
 
-    def test_no_pending_initial_state_or_disabled_notifications_do_not_send(self):
-        self.assertEqual(self.notify([])['status'],'idle')
-        self.notify([plan()],enabled=False);self.notify([plan()],execute=False)
-        self.assertEqual(self.endpoint.calls,[])
-        self.assertEqual(self.store.items('research_attention_notice'),[])
-        self.notify([plan()]);self.assertEqual(len(self.endpoint.calls),1)
+    def test_equivalent_numeric_format_and_new_source_receipt_do_not_resend(self):
+        p=self.ready();self.notify([p]);p['entry']['low']='90.0';self.rebind(p)
+        self.assertEqual(self.notify([p])['status'],'unchanged')
+        self.assertEqual(len(self.endpoint.calls),1)
 
-    def test_unconfigured_route_can_send_once_after_configuration(self):
-        self.endpoint.disabled=True
-        self.assertEqual(self.notify([plan()])['status'],'disabled')
-        self.endpoint.disabled=False
-        self.assertEqual(self.notify([plan()])['status'],'sent')
+    def test_unknown_notice_cannot_be_bypassed_even_by_silence_policy(self):
+        p=self.ready();self.endpoint.error=UnknownOutcome('lost')
+        with self.assertRaises(UnknownOutcome):self.notify([p])
+        self.endpoint.error=None
+        for candidate in ([],[plan()], [self.ready('NEW')]):
+            with self.assertRaises(UnknownOutcome):self.notify(candidate)
+        self.assertEqual(len(self.endpoint.calls),1)
+
+    def test_receipt_recovery_commits_per_stock_state_without_resend(self):
+        p=self.ready();self.endpoint.error=UnknownOutcome('lost')
+        with self.assertRaises(UnknownOutcome):self.notify([p])
+        current=self.store.get('research_attention_state','current')
+        self.store.put('feishu_outbox','receipt',{'identity':'notice:'+current['id'],'status':'acknowledged','result':{'status':'provider_ack'}})
+        self.endpoint.error=None
+        self.assertEqual(self.notify([p])['status'],'unchanged')
+        self.assertEqual(len(self.endpoint.calls),1)
+        self.assertIsNotNone(self.store.get('research_attention_buy_state','GOOG'))
+
+    def test_disabled_route_reuses_same_identity_after_configuration(self):
+        p=self.ready();self.endpoint.disabled=True;self.notify([p]);self.endpoint.disabled=False
+        self.notify([p]);self.notify([p]);self.assertEqual(len(self.endpoint.calls),2)
         self.assertEqual(self.endpoint.calls[0][0],self.endpoint.calls[1][0])
-        self.assertEqual(self.notify([plan()])['status'],'unchanged')
 
-    def test_unknown_send_cannot_be_bypassed_by_new_signature_or_restart(self):
-        self.endpoint.error=UnknownOutcome('unknown')
-        with self.assertRaises(UnknownOutcome):self.notify([plan()])
-        self.endpoint.error=None
-        for plans in ([plan()],[plan('NEW')],[]):
-            with self.assertRaises(UnknownOutcome):self.notify(plans)
-        self.assertEqual(len(self.endpoint.calls),1)
+    def test_expired_or_unbound_plan_cannot_emit_buy_message(self):
+        p=self.ready();p['price_basis_valid_until']='2026-10-26T00:00:00Z';self.rebind(p);self.notify([p])
+        p['price_basis_valid_until']='2026-11-05T00:00:00Z';self.notify([p])
+        self.assertEqual(self.endpoint.calls,[])
 
-    def test_provider_receipt_recovers_local_unknown_marker_without_resending(self):
-        self.endpoint.error=UnknownOutcome('connection lost')
-        with self.assertRaises(UnknownOutcome):self.notify([plan()])
-        state=self.store.get('research_attention_state','current')
-        self.store.put('feishu_outbox','receipt',{'identity':'notice:'+state['id'],'status':'acknowledged',
-            'result':{'status':'provider_ack','verification':'provider_ack_only'}})
-        self.endpoint.error=None
-        self.assertEqual(self.notify([plan()])['status'],'unchanged')
-        self.assertEqual(len(self.endpoint.calls),1)
-        self.assertEqual(self.store.get('research_attention_state','current')['receipt']['verification'],'provider_ack_only')
-
-    def test_projection_and_preflight_do_not_claim_unperformed_independent_review(self):
-        rejected=plan()
-        self.assertEqual(plan_row(rejected)['状态'],'已自动审核·未通过')
-        self.assertEqual(plan_row(rejected)['建议动作'],'等待补证据后复核')
-        preflight=dict(rejected,research_preflight=[{'detail':'primary evidence missing'}])
-        self.assertEqual(attention_items([preflight])[0]['status'],'资料校验未通过·待补证据')
-        self.assertEqual(attention_items([plan(conditional=True)])[0]['status'],'估值已审核·入场条件待满足')
-        self.assertEqual(attention_items([dict(rejected,status='invalidated')]),[])
-
-    def test_buy_observation_requires_exact_accepted_review_and_is_explicitly_conditional(self):
-        from rhino_invest.research import plan_fingerprint
-        p=plan('TEST',conditional=True)
-        p['entry']={'low':'90','high':'100','amount_usd':'1000','basis':'independent_valuation'}
-        self.notify([p])
-        self.assertNotIn('首笔预算',self.endpoint.calls[-1][1])
-        self.store.put('research_plan_review',p['review_evidence_id'],{'accepted':True,'plan_hash':plan_fingerprint(p)})
-        self.notify([p])
-        self.assertIn('90–100 美元／股（系统估算）',self.endpoint.calls[-1][1]);self.assertIn('首笔预算 1000 美元',self.endpoint.calls[-1][1])
-        self.assertIn('到价后仍需复核',self.endpoint.calls[-1][1]);self.assertIn('也可能一直不到价',self.endpoint.calls[-1][1])
+    def test_suppression_does_not_modify_plans(self):
+        p=plan();before=copy.deepcopy(p);self.notify([p]);self.assertEqual(p,before)
 
 
 if __name__=='__main__':unittest.main()

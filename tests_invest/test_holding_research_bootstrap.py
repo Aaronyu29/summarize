@@ -234,9 +234,9 @@ class HoldingResearchTests(unittest.TestCase):
             primary_enricher=enrich, feishu=Feishu(), calendar=Calendar(), execute=True, clock=lambda: NOW)
         runner.run_once()
         runner.run_once()
-        self.assertEqual(calls, ['CRCL'])
+        self.assertEqual(calls, ['CRCL','GOOG'])
         self.assertEqual(self.store.get('fundamental_cache', 'CRCL')['enrichment_revision'], 'issuer-evidence-v2')
-        self.assertEqual(self.store.get('fundamental_cache', 'GOOG')['enrichment_revision'], 'issuer-evidence-v1')
+        self.assertEqual(self.store.get('fundamental_cache', 'GOOG')['enrichment_revision'], 'issuer-evidence-v1-class-filing-v1')
 
     def test_prompts_authorize_labelled_scenarios_but_never_claim_future_fy_is_disclosed(self):
         self.assertIn('do not require further', COMPILE)

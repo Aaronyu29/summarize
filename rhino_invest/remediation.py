@@ -282,6 +282,23 @@ def review_authored_proposals(store,model,now):
     return result
 
 
+def update_research_followups(store,now):
+    """No-buy is an interim result; only a verified priced entry closes follow-up."""
+    from .common import validate_plan
+    from .decisions import _has_provenance
+    for symbol,followup in store.items('research_followup'):
+        if followup.get('status')!='researching':continue
+        plan=store.get('plan',stable_id('investment-plan',symbol))
+        if not plan:continue
+        ready=(plan.get('status')=='active' and (plan.get('research_assessment') or {}).get('status')=='approved'
+               and not validate_plan(plan) and _has_provenance(store,plan))
+        progress={'last_plan_revision':plan.get('revision'),'last_fundamental_evidence_id':plan.get('fundamental_evidence_id'),
+                  'last_assessment':(plan.get('research_assessment') or {}).get('status')}
+        if ready:progress.update(status='ready',completed_at=now)
+        if any(followup.get(key)!=value for key,value in progress.items()):
+            store.put('research_followup',symbol,dict(followup,**progress))
+
+
 def resolution_errors(plan, review, context, known):
     old = ((context or {}).get('prior_plan') or {}).get('entry') or {}
     conditions = old.get('conditions') or []

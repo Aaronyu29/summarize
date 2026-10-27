@@ -103,7 +103,7 @@ class NotificationReviewTests(unittest.TestCase):
                     client.notify("pending", "original")
                 self.assertEqual(store.get("feishu_outbox", "unknown")["status"], "unknown")
 
-    def test_six_pending_stocks_get_one_attention_notice_and_scheduled_summaries(self):
+    def test_pending_stocks_stay_quiet_and_scheduled_summaries_remain(self):
         from tests_invest.test_acceptance_core import approved_plan
         from tests_invest.test_runner_delivery import Calendar, Feishu as OfflineFeishu, Market
         with Store(":memory:") as store:
@@ -117,15 +117,12 @@ class NotificationReviewTests(unittest.TestCase):
                             calendar=Calendar(), execute=True, clock=lambda: "2026-10-23T20:10:00Z")
             first = runner.run_once()
             self.assertEqual(first["errors"], [])
-            self.assertEqual(len(sent), 5)  # Four account summaries plus one consolidated research notice.
+            self.assertEqual(len(sent), 4)  # Four account summaries; research drafts stay silent.
             for _ in range(3):
                 self.assertEqual(runner.run_once()["errors"], [])
-            self.assertEqual(len(sent), 5)
+            self.assertEqual(len(sent), 4)
             attention = [text for _, text in sent if text.startswith('【犀牛投资·研究审核结果】')]
-            self.assertEqual(len(attention), 1)
-            for symbol in ('GOOGL', 'CRCL', 'TSM', 'NVDA', 'META', 'AAPL'):
-                self.assertIn(symbol+'｜', attention[0])
-            self.assertIn('本次更新没有可直接执行的买入建议', attention[0])
+            self.assertEqual(attention, [])
             major = [report for _, report in store.items("report") if report.get("kind") == "重大变化"]
             self.assertEqual(len(major), 6)
             for report in major:

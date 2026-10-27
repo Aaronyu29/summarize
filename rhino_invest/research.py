@@ -568,6 +568,13 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
     if not refs or not set(refs).issubset(known):
         issues.append('Unknown plan evidence references')
     entry = plan.get('entry') or {}
+    primary=fundamentals.get('primary_financials') or {}
+    if plan.get('symbol')=='GOOG' and primary.get('class_eps_reconciliation') is not None and plan.get('research_intent')!='no_buy':
+        facts=primary.get('facts') or []
+        latest=max((f.get('period_end','') for f in facts if f.get('metric')=='eps_diluted' and f.get('period_type')=='quarterly'),default='')
+        verified=any(f.get('metric')=='class_diluted_eps' and f.get('eps_scope')=='Class C'
+            and f.get('period_end')==latest and f.get('source_verified') is True for f in facts)
+        if not verified:issues.append('GOOG current Class C EPS/allocation evidence is required before a buy proposal')
     if entry.get('basis') == 'source_level':
         selected = [level for level in levels if level.get('id') in (entry.get('source_level_ids') or [])]
         if len(selected) != 1 or len(entry.get('source_level_ids') or []) != 1:

@@ -235,7 +235,7 @@ class RunnerTests(unittest.TestCase):
     def test_operational_health_alerts_are_state_change_only_and_recovery_once(self):
         notices = []
         self.feishu.notify = lambda key, text: notices.append((key, text)) or {'status': 'provider_ack'}
-        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'ValueError'}]})
+        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'UnknownModelOutcome'}]})
         self.runner.run_once()
         operational = [n for n in notices if '运维通知' in n[1]]
         self.assertEqual(len(operational), 1)
@@ -269,14 +269,13 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(record))
         self.assertNotIn('private-id', json.dumps(self.store.get('ops_health', 'latest')))
 
-    def test_completed_bad_output_notice_does_not_claim_unknown_outcome(self):
-        notices = []
-        self.feishu.notify = lambda key,text: notices.append(text) or {'status':'provider_ack'}
+    def test_completed_bad_output_stays_internal_without_claiming_unknown_outcome(self):
+        notices=[]
+        self.feishu.notify=lambda key,text:notices.append(text) or {'status':'provider_ack'}
         self.store.put('research_worker','latest',{'status':'blocked','errors':[{'error':'ModelOutputInvalid'}]})
         self.runner._observe_health({'errors':[]},self.now)
-        self.assertIn('输出格式校验未通过',notices[0])
-        self.assertNotIn('重生成后仍失败',notices[0])
-        self.assertNotIn('请求结果不明',notices[0])
+        self.assertEqual(notices,[])
+        self.assertEqual(self.store.get('ops_health','latest')['issues'][0]['error'],'ModelOutputInvalid')
 
 
 if __name__ == '__main__':

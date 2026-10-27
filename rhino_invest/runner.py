@@ -298,6 +298,8 @@ class Runner:
                 if self.primary_enricher and self.execute else None)
             if self.config.system_remediation_enabled and symbol == 'SOXX' and enrichment_revision:
                 enrichment_revision += '-remediation-v1'  # Refresh the issuer's dated NAV/PE/holdings once.
+            if symbol=='GOOG' and enrichment_revision:
+                enrichment_revision+='-class-filing-v1'
             refresh_due = False
             if cached and (cached.get("data") or {}).get("primary_refresh_after"):
                 try:
@@ -703,6 +705,8 @@ class Runner:
                         review_plan(self.store, plan, model, event_id=key, evidence=trigger["evidence"], now=self.clock())
                         summary["reviewed_count"] += 1
                 self.store.put("review_trigger", key, dict(trigger, processed=True, processed_at=self.clock()))
+            from .remediation import update_research_followups
+            update_research_followups(self.store,self.clock())
             summary.update(timestamp=self.clock(), error_count=len(summary["errors"]), deferred_count=len(summary["deferred"]),
                            status="blocked" if summary["errors"] else "deferred" if summary["deferred"] else "completed")
             self.store.put("research_worker", "latest", summary)
@@ -742,8 +746,11 @@ class Runner:
                           "sealed_archive": "research_paused", "review": "research_paused",
                           "retained_thesis_risk": "research_paused"}
             impacts = {categories.get(stage, stage) for stage, _ in failures}
+            for _,code in failures:
+                if code in {'UnknownModelOutcome','UnknownOutcome','ModelBudgetConfigError'}:impacts.add(code)
             if deferred:
                 impacts.add("research_paused")
+            if unresolved_risk:impacts.add('verified_thesis_risk')
             signature = stable_id("operations-impact", sorted(impacts))
             previous = self.store.get("ops_health", "latest")
             if not self.execute:
@@ -772,6 +779,10 @@ class Runner:
             if previous is None and state == "healthy":
                 return
             key = stable_id("investment-operations", sequence, signature)
+            if impacts=={'research_paused'}:
+                self.store.put('ops_notice',key,{'id':key,'status':'suppressed','health':state,
+                    'timestamp':now,'reason':'internal_research_progress'})
+                return  # Research revisions/budget waiting are not user-facing incidents.
             if not self.config.notifications_enabled:
                 self.store.put("ops_notice", key, {"id": key, "status": "suppressed", "health": state,
                     "timestamp": now, "reason": "notifications_disabled"})

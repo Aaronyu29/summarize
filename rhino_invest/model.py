@@ -389,6 +389,11 @@ class ModelGateway:
             calls = [v for _, v in self.store.items('model_call')
                      if utc_day(v['timestamp']) == day]
             used = sum((decimal_value(v.get('reserved_cost_usd', '0')) for v in calls), Decimal(0))
+            from .budget import authorized_auto_limits
+            limits=authorized_auto_limits(self.store,self.config,limits,now=moment,calls_used=len(calls),
+                reserved_used=used,ceiling=ceiling,purpose=purpose,
+                symbol=payload.get('symbol') or (payload.get('plan') or {}).get('symbol'))
+            calls_limit=limits['max_calls_per_day'];day_limit=decimal_value(limits['max_cost_usd_per_day'])
             if len(calls) >= calls_limit or used + ceiling > day_limit:
                 raise ModelBudgetExceeded('Daily model budget exhausted')
             call['budget_limits'] = limits

@@ -127,7 +127,7 @@ class NotificationMuteTests(unittest.TestCase):
 
     def test_same_incident_muted_after_live_alert_resets_operations_baseline(self):
         self.config.notifications_enabled = True
-        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'ValueError'}]})
+        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'UnknownModelOutcome'}]})
         self.runner._observe_health({'errors': []}, NOW)
         self.assertEqual(len(self.sent), 1)
         self.config.notifications_enabled = False
@@ -142,19 +142,19 @@ class NotificationMuteTests(unittest.TestCase):
         self.config.notifications_enabled = True
         self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'ValueError'}]})
         self.runner._observe_health({'errors': []}, NOW)
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.sent), 0)
         self.store.put('research_worker', 'latest', {'status': 'completed', 'errors': []})
         self.runner._observe_health({'errors': [{'stage': 'archive_ingestion', 'error': 'ModelOutputInvalid'}]}, NOW)
         self.store.put('research_worker', 'latest', {'status': 'deferred', 'errors': []})
         self.runner._observe_health({'errors': []}, NOW)
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.sent), 0)
         self.assertEqual(self.store.get('ops_health', 'latest')['status'], 'deferred')
         self.store.put('research_worker', 'latest', {'status': 'needs_review', 'errors': []})
         self.runner._observe_health({'errors': []}, NOW)
-        self.assertEqual(len(self.sent), 2)  # One recovery from the previously delivered incident.
+        self.assertEqual(len(self.sent), 0)  # Internal research state changes stay quiet.
         for _ in range(3):
             self.runner._observe_health({'errors': []}, NOW)
-        self.assertEqual(len(self.sent), 2)  # needs_review itself is not a fault.
+        self.assertEqual(len(self.sent), 0)  # needs_review itself is not a fault.
 
 
 if __name__ == '__main__':

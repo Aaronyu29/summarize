@@ -342,5 +342,16 @@ class RemediationTests(unittest.TestCase):
         self.assertEqual(self.store.get('research_authored_review','once')['status'],'approved_no_buy')
         self.assertEqual(self.store.items('model_call'),[])
 
+    def test_no_buy_does_not_complete_followup_but_verified_priced_entry_does(self):
+        from rhino_invest.remediation import update_research_followups
+        data,old=self.seed()
+        self.store.put('research_followup','NVDA',{'status':'researching'})
+        self.store.put('plan',old['id'],dict(old,research_assessment={'status':'approved_no_buy'}))
+        update_research_followups(self.store,NOW)
+        self.assertEqual(self.store.get('research_followup','NVDA')['status'],'researching')
+        remediate_plans(self.store,RepairModel(),{'NVDA':data},NOW)
+        update_research_followups(self.store,NOW)
+        self.assertEqual(self.store.get('research_followup','NVDA')['status'],'ready')
+
 
 if __name__=='__main__':unittest.main()

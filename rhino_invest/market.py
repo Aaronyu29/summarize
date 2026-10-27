@@ -323,6 +323,7 @@ def _primary_verified(store, record):
         domains = ('tsmc.com', 'abc.xyz', 'sec.gov', 'ishares.com', 'blackrock.com')
         official = any(host == d or host.endswith('.' + d) for d in domains)
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/479360582/files/doc_financials/'))
+        official = official or (host=='d18rn0p25nwr6d.cloudfront.net' and parsed.path=='/CIK-0001652044/513183d2-787c-48f5-8da7-8a897b1649e0.html')
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/265218871/files/'))
         if parsed.scheme != 'https' or not official:
             return False

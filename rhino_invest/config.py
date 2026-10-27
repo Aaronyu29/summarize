@@ -111,6 +111,7 @@ class Config:
                           ("api_key_env", "INVEST_MODEL_API_KEY_ENV"),
                           ("max_calls_per_day", "INVEST_MODEL_MAX_CALLS_PER_DAY"),
                           ("budget_file", "INVEST_MODEL_BUDGET_FILE"),
+                          ("auto_budget_policy_file", "INVEST_MODEL_AUTO_BUDGET_POLICY_FILE"),
                           ("max_tokens", "INVEST_MODEL_MAX_TOKENS"),
                           ("thinking", "INVEST_MODEL_THINKING"),
                           ("reasoning_effort", "INVEST_MODEL_REASONING_EFFORT"),
