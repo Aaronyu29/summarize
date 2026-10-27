@@ -158,7 +158,7 @@ class HoldingResearchTests(unittest.TestCase):
         rows = [fields for table, fields in feishu.calls if table == '投资计划']
         self.assertEqual(len(rows), 1)
         self.assertIn('公司财报事实', rows[0]['理由'])
-        self.assertEqual(rows[0]['建议动作'], '等待审核')
+        self.assertEqual(rows[0]['建议动作'], '等待补证据后复核')
         self.assertEqual(self.store.items('model_call'), [])
 
     def test_budget_deferral_keeps_visible_plan_and_resumes_next_day_from_cached_compile(self):
