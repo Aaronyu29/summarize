@@ -160,7 +160,7 @@ def tools(script, capture_dir, *arguments):
                     *arguments], check=True, timeout=14400)
 
 
-def model_json(directory, name, instruction, payload, frames, env):
+def model_json(directory, name, instruction, payload, frames, env, *, _output_recovery=False):
     """A persisted pending marker fences ambiguous paid requests; never blind retry."""
     cache, pending = directory / f'{name}.response.json', directory / f'{name}.pending.json'
     if cache.exists():
@@ -182,6 +182,12 @@ def model_json(directory, name, instruction, payload, frames, env):
         body = {'model': env['LLM_MODEL'], 'messages': [{'role': 'system', 'content': instruction},
                 {'role': 'user', 'content': content}], 'response_format': {'type': 'json_object'},
                 'reasoning_effort': 'high', 'max_tokens': 24000, 'stream': False}
+        if name.startswith('verification-'):
+            body.update(thinking={'type': 'enabled'}, reasoning_effort='low')
+        if _output_recovery:
+            # Return the evidence decision, rather than spend the entire output
+            # allowance on hidden reasoning and leave no review JSON at all.
+            body.update(thinking={'type': 'disabled'}, reasoning_effort='none', max_tokens=12000)
         if len(json.dumps(body).encode()) > 45 * 1024 * 1024:
             raise ValueError('Request too large; refusing to truncate video evidence')
         write(pending, {'started_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -200,6 +206,20 @@ def model_json(directory, name, instruction, payload, frames, env):
         pending.unlink()
     update_costs(directory.parent)
     choice = response['choices'][0]
+    if choice.get('finish_reason') == 'length' and not _output_recovery:
+        if pending.exists():
+            raise RuntimeError('Unresolved model request; reconcile pending marker before recovery')
+        child = name + '-output-recovery-001'
+        write(directory / (child + '.audit.json'), {
+            'parent_response_file': cache.name, 'parent_response_sha256': sha(cache),
+            'payload_sha256': hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+            'instruction_sha256': hashlib.sha256(instruction.encode()).hexdigest(),
+            'frames': [{'second': second, 'sha256': sha(path)} for second, path in frames],
+            'attempt': 1, 'reason': 'completed_response_output_limit',
+            'thinking': 'disabled', 'reasoning_effort': 'none', 'max_tokens': 12000})
+        # Same source, images and review instruction. The fixed child cache and
+        # pending marker keep this bounded across scans, restarts and days.
+        return model_json(directory, child, instruction, payload, frames, env, _output_recovery=True)
     if choice.get('finish_reason') != 'stop':
         raise ValueError('Incomplete model output; cached response requires review')
     return json.loads(choice['message']['content'])
