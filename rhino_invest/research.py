@@ -423,7 +423,7 @@ def _model_plan(plan):
         'conditions_parsed', 'verification', 'review_issues', 'research_snapshot_id',
         'fundamental_evidence_id', 'source_published_at', 'thesis_valid_from', 'horizon_until',
         'risk_evidence_id', 'policy', 'research_gaps', 'take_profit_position_basis', 'price_basis_valid_until',
-        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin', 'entry_condition_review')
+        'research_assessment', 'execution_requirements', 'calculation_provenance', 'research_origin', 'entry_condition_review', 'condition_resolution')
     return {key: plan[key] for key in fields if key in plan}
 
 
@@ -1341,6 +1341,11 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
     for symbol in symbols:
         plan_id = stable_id('investment-plan', symbol)
         previous = store.get('plan', plan_id)
+        if (context or {}).get('kind') == 'system-plan-remediation-v1':
+            seed = context.get('prior_plan')
+            if previous and seed and plan_fingerprint(previous) != plan_fingerprint(seed):
+                plans.append(previous)
+                continue  # A stale repair cannot overwrite a newer or already committed revision.
         risk_defer = _unresolved_thesis_defer(store, previous, snapshot, fundamentals, moment)
         if risk_defer:
             if deferred is not None:
@@ -1493,6 +1498,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             payload['critique'] = {key: critique[key] for key in ('id', 'economic_proposal',
                 'blocking_review_issues', 'review_is_untrusted_opinion', 'calculation_book',
                 'source_plan_hash', 'source_review_hash')}
+        if (context or {}).get('kind') == 'system-plan-remediation-v1':
+            from .remediation import COMPILE_REPAIR
+            payload['instruction'] = COMPILE + COMPILE_REPAIR
         is_etf = fundamental['instrument_contract'].get('asset_type') == 'etf'
         etf_gaps = _etf_input_gaps(fundamental, plan_moment, set(evidence_ids), store) if is_etf else []
         holding_gaps = []
@@ -1598,6 +1606,10 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'policy': policy, 'current_position_basis': current_basis,
             'evidence_ids': evidence_ids, 'evidence_bundle': bundle, 'repair_feedback': repair_feedback,
             'review_event_id': (context or {}).get('event_id')}
+        if (context or {}).get('kind') == 'system-plan-remediation-v1':
+            from .remediation import REVIEW_REPAIR
+            review_payload['instruction'] = REVIEW + REVIEW_REPAIR
+            review_payload['review_context'] = context
         if critique:
             review_payload['instruction'] = critique['review_instruction']
             review_payload['critique_context'] = {'id': critique['id'], 'prior_issues_are_opinions': True,
@@ -1631,6 +1643,10 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             # These are deterministic schema/evidence checks on completed output.
             # Model calls (and their budget/unknown fences) remain outside this guard.
             issues = _assess_plan(plan, review, evidence_ids, fundamental, symbol_levels)
+            if (context or {}).get('kind') == 'system-plan-remediation-v1':
+                from .remediation import resolution_errors, economic_consistency_errors
+                issues.extend(resolution_errors(plan, review, context, set(evidence_ids)))
+                issues.extend(economic_consistency_errors(plan))
             if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
                 issues.append('No individually verified source levels')
             execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
@@ -1674,6 +1690,11 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             if _critique_superseded(store, operation_key, critique, current):
                 plans.append(current)
                 continue
+            if (context or {}).get('kind') == 'system-plan-remediation-v1':
+                seed = context.get('prior_plan')
+                if current and seed and plan_fingerprint(current) != plan_fingerprint(seed):
+                    plans.append(current)
+                    continue
             if (calculation_seed and current and previous
                     and plan_fingerprint(current) != plan_fingerprint(previous)
                     and (current.get('status') == 'active'

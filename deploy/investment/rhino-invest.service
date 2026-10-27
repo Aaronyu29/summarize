@@ -10,6 +10,7 @@ Group=ubuntu
 WorkingDirectory=/opt/rhino-invest/current
 EnvironmentFile=/etc/rhino-invest/investment.env
 Environment=PYTHONUNBUFFERED=1
+Environment=INVEST_SYSTEM_REMEDIATION_ENABLED=true
 ExecStart=/opt/rhino-invest/current/venv/bin/python -m rhino_invest serve --execute
 Restart=on-failure
 RestartSec=30

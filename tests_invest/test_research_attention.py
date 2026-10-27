@@ -46,7 +46,7 @@ class AttentionTests(unittest.TestCase):
         self.assertIn('SOXX｜估值已审核·入场条件待满足',text)
         self.assertIn('每股盈利',text);self.assertIn('止盈或止损',text)
         self.assertNotIn('THESIS_INCONSISTENT',text)
-        self.assertIn('证据更新后继续自动复核',text)
+        self.assertIn('你无需补财报或估值规则',text)
         self.assertEqual(plans,before)
         self.assertEqual(self.store.items('model_call'),[])
 
@@ -110,6 +110,17 @@ class AttentionTests(unittest.TestCase):
         self.assertEqual(attention_items([preflight])[0]['status'],'资料校验未通过·待补证据')
         self.assertEqual(attention_items([plan(conditional=True)])[0]['status'],'估值已审核·入场条件待满足')
         self.assertEqual(attention_items([dict(rejected,status='invalidated')]),[])
+
+    def test_buy_observation_requires_exact_accepted_review_and_is_explicitly_conditional(self):
+        from rhino_invest.research import plan_fingerprint
+        p=plan('TEST',conditional=True)
+        p['entry']={'low':'90','high':'100','amount_usd':'1000'}
+        self.notify([p])
+        self.assertNotIn('首笔规划',self.endpoint.calls[-1][1])
+        self.store.put('research_plan_review',p['review_evidence_id'],{'accepted':True,'plan_hash':plan_fingerprint(p)})
+        self.notify([p])
+        self.assertIn('90–100 USD；首笔规划 1000 USD',self.endpoint.calls[-1][1])
+        self.assertIn('执行前仍需核实条件、行情及账户资金',self.endpoint.calls[-1][1])
 
 
 if __name__=='__main__':unittest.main()

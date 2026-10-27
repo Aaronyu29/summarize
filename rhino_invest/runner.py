@@ -296,6 +296,8 @@ class Runner:
             cached = self.store.get("fundamental_cache", symbol)
             enrichment_revision = (("issuer-evidence-v2" if symbol in {"CRCL", "SOXX"} else "issuer-evidence-v1")
                 if self.primary_enricher and self.execute else None)
+            if self.config.system_remediation_enabled and symbol == 'SOXX' and enrichment_revision:
+                enrichment_revision += '-remediation-v1'  # Refresh the issuer's dated NAV/PE/holdings once.
             refresh_due = False
             if cached and (cached.get("data") or {}).get("primary_refresh_after"):
                 try:
@@ -681,6 +683,13 @@ class Runner:
                 for error in ingestion.get("errors", []):
                     item = {"stage": "archive_ingestion", "error": _safe_error(error.get("error"))}
                     summary["deferred" if item["error"] == "ModelBudgetExceeded" else "errors"].append(item)
+            if self.config.system_remediation_enabled and not self._stop.is_set():
+                from .remediation import remediate_plans
+                repair = remediate_plans(self.store, model, fundamentals, self.clock())
+                summary['system_remediation'] = repair
+                summary['errors'].extend({'stage':'system_remediation', 'error':_safe_error(item.get('error'))}
+                    for item in repair['errors'])
+                summary['deferred'].extend({'stage':'system_remediation', **item} for item in repair['deferred'])
             for key, trigger in self.store.items("review_trigger"):
                 if trigger.get("processed") or self._stop.is_set():
                     continue

@@ -20,6 +20,7 @@ class Config:
     symbols: tuple[str, ...] = ()
     interval_seconds: int = 60
     notifications_enabled: bool = True
+    system_remediation_enabled: bool = False
     feishu_app_id: str | None = field(default=None, repr=False)
     feishu_app_secret: str | None = field(default=None, repr=False)
     feishu_app_token: str | None = field(default=None, repr=False)
@@ -32,6 +33,13 @@ class Config:
     model: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
+        if isinstance(self.system_remediation_enabled, str):
+            value = self.system_remediation_enabled.strip().lower()
+            if value not in {'true','false','1','0','yes','no','on','off'}:
+                raise ValueError('INVEST_SYSTEM_REMEDIATION_ENABLED must be an explicit boolean')
+            self.system_remediation_enabled = value in {'true','1','yes','on'}
+        elif not isinstance(self.system_remediation_enabled, bool):
+            raise ValueError('system_remediation_enabled must be a boolean')
         if isinstance(self.notifications_enabled, str):
             value = self.notifications_enabled.strip().lower()
             if value not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
@@ -67,6 +75,7 @@ class Config:
             "research_since": "INVEST_RESEARCH_SINCE",
             "symbols": "INVEST_SYMBOLS", "interval_seconds": "INVEST_INTERVAL_SECONDS",
             "notifications_enabled": "INVEST_NOTIFICATIONS_ENABLED",
+            "system_remediation_enabled": "INVEST_SYSTEM_REMEDIATION_ENABLED",
             "feishu_app_id": "INVEST_FEISHU_APP_ID", "feishu_app_secret": "INVEST_FEISHU_APP_SECRET",
             "feishu_app_token": "INVEST_FEISHU_APP_TOKEN", "feishu_chat_id": "INVEST_FEISHU_CHAT_ID",
             "feishu_webhook_url": "INVEST_FEISHU_WEBHOOK_URL", "feishu_webhook_secret": "INVEST_FEISHU_WEBHOOK_SECRET",
