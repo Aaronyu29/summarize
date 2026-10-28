@@ -286,6 +286,8 @@ class ModelGateway:
         try:
             return self._run_once(purpose, payload, frames, now, instruction, call_scope)
         except ModelOutputInvalid as error:
+            if self.config.get('reuse_evidence_cycles') and purpose in {'compile_plan', 'review_plan'}:
+                raise
             if purpose not in {'review_plan', 'extract_levels', 'verify_levels'}:
                 raise
             parent_id = error.call_id
@@ -361,6 +363,10 @@ class ModelGateway:
         body = {'model': self.config['model'], 'messages': [
             {'role': 'system', 'content': SYSTEM + ('\nTrusted task:\n' + instruction if instruction else '')}, {'role': 'user', 'content': content}],
             'response_format': {'type': 'json_object'}, **generation}
+        if self.config.get('stable_evidence_transport') and purpose in {'compile_plan', 'review_plan'}:
+            from .evidence_transport import messages
+            body['messages'] = messages(SYSTEM, instruction, purpose, payload)
+            body['messages'][-1]['content'].extend(content[1:])
         if len(json.dumps(body).encode()) > self.config.get('max_request_bytes', 45 * 1024 * 1024):
             raise ValueError('Evidence exceeds request size; no silent truncation')
         if not self.transport:
@@ -373,6 +379,10 @@ class ModelGateway:
                 'analysis_as_of': analysis_as_of,
                 'call_scope': scope, 'request_controls': generation,
                 'budget_basis': 'estimated_reservation_not_provider_enforced_cap'}
+        call['request_text_chars'] = sum(len(json.dumps(message['content'], ensure_ascii=False))
+                                         for message in body['messages'])
+        call['transport'] = ('stable-lossless-evidence-v1' if self.config.get('stable_evidence_transport')
+                             and purpose in {'compile_plan', 'review_plan'} else 'original')
         if recovery:
             call.update(recovery_parent_id=recovery['parent_call_id'],
                         recovery_parent_receipt_hash=recovery['parent_receipt_hash'], recovery_attempt=1)

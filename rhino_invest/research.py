@@ -356,6 +356,8 @@ def _run(model, purpose, payload, frames=(), now=None, store=None):
     try:
         return model.run(purpose, payload, frames=frames, now=now, instruction=instruction, call_scope=scope)
     except ModelOutputInvalid as exc:
+        if getattr(model, 'config', {}).get('reuse_evidence_cycles') and purpose in {'compile_plan', 'review_plan'}:
+            raise  # Preserve the receipt; invalid formatting never authorizes another paid cycle.
         if (purpose != 'compile_plan' or not _completed_stop_receipt(
                 store or getattr(model, 'store', None), exc)):
             raise
@@ -1431,6 +1433,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if previous and published_at and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
             continue
         fundamental, identity = _research_fundamental(store, symbol, (fundamentals or {}).get(symbol))
+        if model is not None and getattr(model, 'config', {}).get('reuse_evidence_cycles'):
+            from .reuse import completed_evidence_plan
+            reused = completed_evidence_plan(store, snapshot, symbol, fundamental, context, moment)
+            if reused is not None:
+                plans.append(reused)
+                continue
         fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
         if (not context and previous and previous.get('condition_resolution') is not None
                 and previous.get('research_snapshot_id') == snapshot['id']

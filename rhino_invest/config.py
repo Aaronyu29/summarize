@@ -121,6 +121,8 @@ class Config:
             if env.get(name):
                 model[key] = env[name]
         model.setdefault("enabled", False)
+        model.setdefault("reuse_evidence_cycles", True)
+        model.setdefault("stable_evidence_transport", True)
         raw["model"] = model
         allowed = cls.__dataclass_fields__
         unexpected = set(raw) - set(allowed)
