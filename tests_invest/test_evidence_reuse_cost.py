@@ -78,6 +78,8 @@ class TransportTests(unittest.TestCase):
         a=messages('system','compile original','compile_plan',{'fundamentals':f,'symbol':'ABC'})
         b=messages('system','independently review','review_plan',{'fundamentals':f,'plan':{'entry':1},'review_context':{'prior_fundamentals':f}})
         self.assertEqual(a[:2],b[:2])
+        self.assertIn('ONLY the final user message',a[0]['content'])
+        self.assertEqual(json.loads(b[-1]['content'][0]['text'])['trusted_task'],'independently review')
         self.assertIn('$dossier_pointer',b[-1]['content'][0]['text'])
         self.assertNotIn('issuer original',b[-1]['content'][0]['text'])
 
