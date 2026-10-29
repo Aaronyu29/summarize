@@ -5,6 +5,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url, highlighted_elements
 
@@ -96,6 +97,28 @@ class FeishuTests(unittest.TestCase):
         publisher.list_blocks = lambda doc: [block]
         with self.assertRaisesRegex(RuntimeError, 'lost required emphasis'):
             publisher.emphasize_and_verify('doc')
+
+    def test_imported_negative_number_and_encoded_comparison_are_repaired_in_place(self):
+        publisher=self.publisher(FakeSession())
+        publisher.content='除AI**-0.32**；**59%是&gt;20%回撤占比，不是当前亏损比例**。'
+        block={'block_id':'focus','block_type':2,'text':{'elements':[{'text_run':{
+            'content':'除AI**-0.32**；59%是>20%回撤占比，不是当前亏损比例。'}}]}}
+        publisher.list_blocks=lambda doc:[block]
+        def call(method,path,*,json_body):
+            block['text']['elements']=json_body['update_text_elements']['elements']
+        publisher.call=call;publisher.block=lambda doc,block_id:block
+        publisher.emphasize_and_verify('doc')
+        self.assertTrue(publisher.state['highlight_verified'])
+        self.assertEqual(''.join(e['text_run']['content'] for e in block['text']['elements']),
+            '除AI-0.32；59%是>20%回撤占比，不是当前亏损比例。')
+
+    def test_emphasis_repair_cannot_replace_different_provider_text(self):
+        publisher=self.publisher(FakeSession());publisher.content='**条件A尚未触发**'
+        block={'block_id':'focus','block_type':2,'text':{'elements':[{'text_run':{'content':'条件B已触发'}}]}}
+        publisher.list_blocks=lambda doc:[block];publisher.call=Mock()
+        with self.assertRaisesRegex(RuntimeError,'lost required emphasis'):
+            publisher.emphasize_and_verify('doc')
+        publisher.call.assert_not_called()
 
     def test_server_splitting_styled_runs_is_accepted(self):
         publisher = self.publisher(FakeSession())

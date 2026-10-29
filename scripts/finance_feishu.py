@@ -11,6 +11,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import html
 import json
 import os
 import pathlib
@@ -272,14 +273,43 @@ class Publisher:
         return self.call("GET", f"/docx/v1/documents/{doc}/blocks/{block}")["data"]["block"]
 
     def emphasize_and_verify(self, doc):
-        normalize = lambda value: re.sub(r'\s+', '', value)
+        normalize = lambda value: re.sub(r'\s+', '', html.unescape(value))
         expected = Counter(normalize(value) for value in re.findall(r'\*\*([^*\n]+)\*\*', self.content))
         if not expected:
             return
         blocks = self.list_blocks(doc)
         actual = [normalize(bold_content(block)) for block in blocks]
         if any(sum(value.count(phrase) for value in actual) < count for phrase, count in expected.items()):
-            raise RuntimeError('Document lost required emphasis during import; webhook not sent')
+            # Some imports treat **-0.32** as literal punctuation and invert later
+            # styles. Restore only uniquely matching source paragraphs; never
+            # invent text or weaken the final readback gate.
+            paragraphs = {}
+            for paragraph in re.split(r'\n\s*\n', self.content):
+                if '**' not in paragraph or re.search(r'(?m)^#|\]\(', paragraph):continue
+                source = html.unescape(re.sub(r'(?m)^>\s?', '', paragraph))
+                plain = source.replace('**','')
+                paragraphs.setdefault(normalize(plain), []).append(source)
+            for block in blocks:
+                if block.get('block_type') not in {2,12,13,15}:continue
+                elements = text_payload(block).get('elements',[])
+                if not elements or any('text_run' not in element for element in elements):continue
+                observed = ''.join(e['text_run']['content'] for e in elements)
+                matches = paragraphs.get(normalize(observed.replace('**','')),[])
+                if len(matches)!=1:continue
+                required=Counter(normalize(v) for v in re.findall(r'\*\*([^*\n]+)\*\*',matches[0]))
+                current=normalize(bold_content(block))
+                if all(current.count(phrase)>=count for phrase,count in required.items()):continue
+                corrected = highlighted_elements(matches[0])
+                self.call('PATCH',f"/docx/v1/documents/{doc}/blocks/{block['block_id']}",
+                          json_body={'update_text_elements':{'elements':corrected}})
+                confirmed = self.block(doc,block['block_id'])
+                content = ''.join(e.get('text_run',{}).get('content','') for e in text_payload(confirmed).get('elements',[]))
+                if normalize(content)!=normalize(matches[0].replace('**','')):
+                    raise RuntimeError('Document emphasis repair changed text; webhook not sent')
+            blocks = self.list_blocks(doc)
+            actual = [normalize(bold_content(block)) for block in blocks]
+            if any(sum(value.count(phrase) for value in actual) < count for phrase, count in expected.items()):
+                raise RuntimeError('Document lost required emphasis during import; webhook not sent')
         for block in blocks:
             # Headings already have a visual hierarchy. Highlight inline emphasis in body/list/quote blocks.
             if block.get('block_type') not in {2, 12, 13, 15}:
