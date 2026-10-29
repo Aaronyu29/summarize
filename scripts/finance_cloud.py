@@ -523,6 +523,11 @@ def analyze(capture_dir, info, env):
             analysis = build(result, repaired, True, candidate_name)
         video = analysis['videos'][0]
         log('candidate_semantic_revision_completed', video_id=vid)
+    return finalize_analysis(capture_dir, info, analysis)
+
+
+def finalize_analysis(capture_dir, info, analysis):
+    """Seal only an independently accepted analysis; drafts use a separate route."""
     write(capture_dir / 'analysis.json', analysis)
     database = capture_dir.parent.parent / 'library.sqlite'
     publish(capture_dir / 'analysis.json', database, register=False)
@@ -637,6 +642,11 @@ def handle_failure(jobs, vid, root, env, error):
         return False
     jobs.save(vid, status='needs_review', error=type(error).__name__, auto_recovery_v2=True,
               recovery_exhausted=True, review_issues=getattr(error, 'issues', [])[:6])
+    from finance_manual_review import handoff
+    review_delivery = handoff(jobs, vid, root, env)
+    if review_delivery:
+        log('video_human_review_handoff', video_id=vid, status=review_delivery['status'])
+        return True
     action = ('自动恢复次数已用尽，保留证据与回执，需核查后恢复' if exhausted else
               '自动修订或回执核实仍未通过，已保留证据并停止重复请求')
     failure_notice(root, job['source'], job['checkpoint'].get('stage', '处理视频'), error, action)
@@ -676,6 +686,13 @@ def main():
     if args.status:
         print(json.dumps(jobs.counts()))
         return
+    if not args.video:
+        from finance_manual_review import handoff
+        held = jobs.db.execute("SELECT video_id FROM jobs WHERE status='needs_review' ORDER BY updated").fetchall()
+        for row in held:
+            result = handoff(jobs, row[0], root, os.environ)
+            if result and result.get('status') not in {'delivered','already_delivered'}:
+                log('human_review_document_pending', video_id=row[0], status=result.get('status'))
     if args.video:
         job = jobs.get(args.video)
         if job is None or args.scan_only:

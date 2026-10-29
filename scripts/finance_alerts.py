@@ -5,6 +5,7 @@ import json
 import pathlib
 import re
 import time
+import sqlite3
 
 from finance_feishu import signature
 from finance_recovery import ReviewRejected
@@ -66,9 +67,9 @@ def save(path, value):
     temporary.replace(path)
 
 
-def enqueue(root, source, stage, error, action):
+def enqueue(root, source, stage, error, action, *, identity_key=None):
     description = reason(error)
-    identity = hashlib.sha256(json.dumps([source.get('video_id'), stage, description, action],
+    identity = hashlib.sha256(json.dumps(identity_key or [source.get('video_id'), stage, description, action],
                                         ensure_ascii=False).encode()).hexdigest()[:20]
     path = pathlib.Path(root) / 'alerts' / (identity + '.json')
     if path.exists():
@@ -87,6 +88,24 @@ def enqueue(root, source, stage, error, action):
             f"\n处理状态：{action}\n告警编号：{identity}\n{link}")
     save(path, {'id': identity, 'text': text, 'status': 'queued', 'attempts': 0})
     return path
+
+
+def scan_missing_reports(root, *, now=None):
+    """Independent alert path; a busy video worker cannot hide a missing report."""
+    path=pathlib.Path(root)/'jobs.sqlite'
+    if not path.exists():return 0
+    moment=time.time() if now is None else now;queued=0
+    with sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True) as db:
+        rows=db.execute('SELECT video_id,source,status,checkpoint,updated FROM jobs').fetchall()
+    for vid,source,status,raw,updated in rows:
+        cp=json.loads(raw);delivery=cp.get('delivery') or {};draft=cp.get('human_review_delivery') or {}
+        if (delivery.get('status') in {'delivered','already_delivered'} or
+                draft.get('status') in {'delivered','already_delivered'}):continue
+        if status=='needs_review' or (status in {'queued','retry','processing'} and moment-updated>=5400):
+            enqueue(root,json.loads(source),'人工审核文档待交付',ReviewRejected(cp.get('review_issues') or ['处理超过90分钟或自动任务已暂停，尚未交付文档。']),
+                '目前没有已交付的正式文档或人工审核草稿；请核查原视频及发布状态。',
+                identity_key=['human-review-missing',vid]);queued+=1
+    return queued
 
 
 def flush(root, env, session=None):
@@ -161,4 +180,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     result = os.environ.get('SERVICE_RESULT', 'success')
     recover_interruption(args.data, os.environ, result)
+    scan_missing_reports(args.data)
     print(json.dumps(flush(args.data, os.environ)))

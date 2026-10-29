@@ -96,7 +96,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_review_and_attempt_exhaustion_are_terminal_with_reasons(self):
         self.jobs.start(self.vid)
-        with patch('finance_cloud.failure_notice') as notice:
+        with patch('finance_cloud.failure_notice') as notice, patch('finance_manual_review.handoff',return_value=None):
             self.assertTrue(handle_failure(self.jobs,self.vid,self.root,self.env,ReviewRejected(['source conflict'])))
         notice.assert_called_once()
         self.assertEqual(self.jobs.get(self.vid)['checkpoint']['review_issues'],['source conflict'])
@@ -108,7 +108,7 @@ class RecoveryTests(unittest.TestCase):
         for label,terminal in [('send_webhook',True),('create_image:marker',False),('create_import',True)]:
             atomic(path,{'pending_write':label})
             self.jobs.start(self.vid)
-            with patch('finance_cloud.failure_notice'):
+            with patch('finance_cloud.failure_notice'), patch('finance_manual_review.handoff',return_value=None):
                 self.assertEqual(handle_failure(self.jobs,self.vid,self.root,self.env,RuntimeError('unknown')),terminal)
 
     def test_process_interruption_queues_without_notifying_or_losing_attempts(self):
