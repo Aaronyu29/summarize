@@ -52,15 +52,24 @@ def load_correction(capture, vid):
     if frame['sha256'] != correction['frame_sha256'] or correction.get('requires_independent_review') is not True:
         raise ValueError('Correction cannot bypass independent review')
     candidate = receipt_candidate(source)
+    segments = {f"S{s['id']:06d}" for s in read(capture/vid/'transcript.asr.json')['segments']}
     seen = set()
     for change in correction['changes']:
         index, field = change['claim_index'], change['field']
         if (type(index) is not int or not 0 <= index < len(candidate['claims'])
-                or field not in {'headline', 'text', 'uncertainty'} or (index, field) in seen
-                or candidate['claims'][index].get('frame_seconds') != correction['frame_seconds']):
+                or field not in {'headline', 'text', 'uncertainty','evidence_segment_ids'} or (index, field) in seen):
             raise ValueError('Correction scope invalid')
+        second=change.get('frame_seconds',correction['frame_seconds'])
+        expected=change.get('frame_sha256',correction['frame_sha256'])
+        frame=frames[second];image=(capture/vid/frame['path']).resolve()
+        if (candidate['claims'][index].get('frame_seconds')!=second or frame['sha256']!=expected
+                or not image.is_relative_to((capture/vid).resolve()) or digest(image)!=expected):
+            raise ValueError('Correction claim frame mismatch')
         seen.add((index, field))
-        if candidate['claims'][index][field] != change['before'] or not isinstance(change['after'], str):
+        after=change['after']
+        valid=(isinstance(after,list) and bool(after) and all(isinstance(v,str) and v in segments for v in after)
+               and len(set(after))==len(after)) if field=='evidence_segment_ids' else isinstance(after,str) and bool(after.strip())
+        if candidate['claims'][index][field] != change['before'] or not valid:
             raise ValueError('Correction original text mismatch')
         candidate['claims'][index][field] = change['after']
     if not seen:
@@ -87,6 +96,13 @@ def create_review_document(capture, source, checkpoint):
         name = state['candidate_file']
         if pathlib.Path(name).name != name:raise ValueError('Unsafe saved candidate name')
         candidate = receipt_candidate(directory / name)
+    else:
+        # Structural validation may fail before a semantic-review state is written.
+        # Show the retained candidate as unverified, without inventing source references.
+        paths=sorted(directory.glob('analysis*.response.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+        for path in paths:
+            try:candidate=receipt_candidate(path);break
+            except (KeyError,TypeError,ValueError):continue
     publication = source.get('published_utc', '')
     if publication:
         publication = dt.datetime.fromisoformat(publication.replace('Z', '+00:00')).astimezone(

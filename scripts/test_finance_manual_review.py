@@ -107,5 +107,23 @@ class ManualReviewTests(unittest.TestCase):
                 repair(self.jobs,self.vid,self.root,{})
         review.assert_not_called();finalize.assert_not_called()
 
+    def test_saved_candidate_survives_failure_before_semantic_review(self):
+        (self.capture/'analysis-review-state.json').unlink()
+        self.receipt.rename(self.directory/'analysis-repair-001.response.json')
+        publisher=Mock();publisher.return_value.run.return_value={'status':'delivered','url':'https://example.test/draft'}
+        handoff(self.jobs,self.vid,self.root,{},publisher)
+        report=Path(self.jobs.get(self.vid)['checkpoint']['human_review_report']).read_text()
+        self.assertIn('原始观点',report);self.assertNotIn('尚无完整分析稿',report)
+
+    def test_citation_correction_rejects_nonexistent_segments(self):
+        correction=self.correction()
+        correction['changes']=[{'claim_index':0,'field':'evidence_segment_ids',
+            'before':['S000001'],'after':['S000001']}]
+        self.write(self.capture/'user-correction.json',correction)
+        load_correction(self.capture,self.vid)
+        correction['changes'][0]['after']=['S999999']
+        self.write(self.capture/'user-correction.json',correction)
+        with self.assertRaises(ValueError):load_correction(self.capture,self.vid)
+
 
 if __name__=='__main__':unittest.main()
