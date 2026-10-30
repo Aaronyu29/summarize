@@ -1045,6 +1045,7 @@ def _declared_effective_day(action):
 
 def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
     etf = fundamentals.get('etf_valuation') or {}
+    monthly=(fundamentals.get('symbol')=='QQQ' and etf.get('timing_contract')=='issuer_month_end_with_daily_risk_v1')
     gaps = []
     def gap(code, detail):
         gaps.append({'code': code, 'scope': 'etf_valuation', 'blocking': True, 'detail': detail,
@@ -1062,16 +1063,17 @@ def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
             for ref in item['evidence_refs']:
                 original = store.get('external_evidence', ref) or {}
                 host = urlparse(original.get('source_url', '')).hostname or ''
-                if (not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com'))
+                if (not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com','invesco.com'))
                         or not isinstance(original.get('content'), str)
                         or hashlib.sha256(original['content'].encode()).hexdigest() != original.get('sha256')):
                     gap('ETF_' + name.upper() + '_ISSUER_SOURCE_UNVERIFIED', name + ' raw issuer evidence cannot be validated')
         try:
             age = (parse_time(moment).date() - _date(item.get('as_of'))).days
-            if not 0 <= age <= 7:
+            limit=45 if monthly and name in {'nav','pe'} else 7
+            if not 0 <= age <= limit:
                 raise ValueError()
         except (ValueError, TypeError):
-            gap('ETF_' + name.upper() + '_DATE_INVALID', name + ' must have an explicit current issuer date within seven days')
+            gap('ETF_' + name.upper() + '_DATE_INVALID', name + ' issuer date exceeds its explicit daily/month-end age limit')
     nav, pe, holdings = etf.get('nav') or {}, etf.get('pe') or {}, etf.get('holdings') or {}
     try:
         if decimal_value(nav.get('value')) <= 0 or decimal_value(pe.get('value')) <= 0:
@@ -1080,8 +1082,23 @@ def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
         gap('ETF_BASELINE_VALUE_MISSING', 'Positive issuer NAV and comparable portfolio PE are required')
     if nav.get('currency') != 'USD' or nav.get('price_unit') != 'per_share':
         gap('ETF_NAV_UNIT_UNRESOLVED', 'NAV must explicitly be USD per ETF share')
-    if nav.get('as_of') != pe.get('as_of') or nav.get('as_of') != holdings.get('as_of'):
+    if nav.get('as_of') != pe.get('as_of') or (not monthly and nav.get('as_of') != holdings.get('as_of')):
         gap('ETF_BASELINE_DATES_UNALIGNED', 'Use same-date issuer NAV, portfolio PE and holdings; do not silently shift dates')
+    if monthly:
+        try:
+            day=_date(pe.get('as_of'))
+            latest=etf.get('latest_nav') or {}
+            if (day.day!=calendar.monthrange(day.year,day.month)[1] or holdings.get('as_of','')<pe.get('as_of','')
+                    or not 0<=(parse_time(moment).date()-_date(latest.get('as_of'))).days<=7
+                    or latest.get('currency')!='USD' or latest.get('price_unit')!='per_share'
+                    or decimal_value(latest.get('value'))<=0 or not latest.get('evidence_refs')
+                    or not set(latest['evidence_refs']).issubset(known_refs)):
+                raise ValueError()
+            if store is not None:
+                from .market import _primary_verified
+                if not _primary_verified(store,latest):raise ValueError()
+        except (ValueError,TypeError):
+            gap('ETF_MONTH_END_TIMING_INVALID','QQQ requires an issuer month-end NAV/PE pair, newer holdings and a separate fresh daily NAV; all dates remain explicit')
     if not holdings.get('rows') or holdings.get('coverage') is None or holdings.get('concentration') is None:
         gap('ETF_HOLDINGS_COVERAGE_MISSING', 'Holdings, coverage and concentration must be visible')
     fee = etf.get('expense_ratio') or etf.get('fee') or etf.get('fees') or {}
@@ -1097,7 +1114,7 @@ def _etf_input_gaps(fundamentals, moment, known_refs, store=None):
                 host = urlparse(original.get('source_url', '')).hostname or ''
                 if (not isinstance(original.get('content'), str)
                         or hashlib.sha256(original['content'].encode()).hexdigest() != original.get('sha256')
-                        or not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com'))):
+                        or not any(host == domain or host.endswith('.' + domain) for domain in ('ishares.com', 'blackrock.com','invesco.com'))):
                     raise ValueError()
     except (ValueError, TypeError):
         gap('ETF_FEES_UNRESOLVED', 'Issuer expense ratio and fee treatment are required')
@@ -1267,6 +1284,8 @@ def _price_basis_deadline(fundamentals, moment, refs, store=None):
     except (ValueError, TypeError):
         return None  # Invalid issuer dates are recorded by the typed ETF input gate.
     deadlines = []
+    if etf.get('timing_contract')=='issuer_month_end_with_daily_risk_v1':
+        deadlines.append(datetime(nav_day.year,nav_day.month,nav_day.day,tzinfo=timezone.utc)+timedelta(days=46))
     for action in etf.get('corporate_actions') or []:
         evidence = action.get('evidence_refs') or []
         if not evidence or not set(evidence).issubset(refs):
@@ -1283,7 +1302,10 @@ def _price_basis_deadline(fundamentals, moment, refs, store=None):
         if _declared_effective_day(action) != day:
             continue
         if day > nav_day:
-            deadlines.append(datetime(day.year, day.month, day.day, tzinfo=ZoneInfo('America/New_York')).astimezone(timezone.utc))
+            import exchange_calendars as xcals
+            cal=xcals.get_calendar('XNYS')
+            effective_session=cal.date_to_session(day, direction='next')
+            deadlines.append(cal.session_close(cal.previous_session(effective_session)).to_pydatetime())
     return min(deadlines).isoformat() if deadlines else None
 
 
@@ -1485,6 +1507,10 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
     for symbol in symbols:
         plan_id = stable_id('investment-plan', symbol)
         previous = store.get('plan', plan_id)
+        managed=symbol in getattr(model,'config',{}).get('primary_underwriting_symbols',())
+        if (managed or ((previous or {}).get('valuation_basis') or {}).get('underwriting_contract')=='primary-underwriting-v1') and not context:
+            if previous:plans.append(previous)
+            continue  # Public-source underwriting owns this symbol; no duplicate paid drafts.
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
             from .remediation import same_published_seed
             if previous and not same_published_seed(previous,context):
@@ -1629,6 +1655,8 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             chart_limit_note = 'All original chart frames remain archived; this independent valuation does not use the chart price levels. Explicit batch review is required before using them.'
             original_frames, symbol_levels = [], []
         next_review = (parse_time(plan_moment) + timedelta(days=90)).isoformat()
+        if (context or {}).get('kind')=='primary-underwriting-v1':
+            next_review=(parse_time(plan_moment)+timedelta(days=14)).isoformat()
         basis_deadline = _price_basis_deadline(fundamental, plan_moment, set(evidence_ids), store)
         if basis_deadline and parse_time(basis_deadline) < parse_time(next_review):
             next_review = basis_deadline
@@ -1725,7 +1753,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                     invalidation_conditions=['Reassess only after the missing dated issuer inputs are obtained and independently reviewed. No automatic purchase.'])
                 proposed['entry'].update(basis='independent_valuation',amount_usd='0',
                     conditions=['No purchase; obtain missing issuer valuation evidence before proposing any entry.'])
-        elif (context or {}).get('kind') == 'system-plan-remediation-v1' and context.get('review_only_candidate'):
+        elif (context or {}).get('kind') in {'system-plan-remediation-v1','primary-underwriting-v1'} and context.get('review_only_candidate'):
             candidate=context['review_only_candidate']
             if plan_fingerprint(candidate)!=context.get('candidate_hash'):
                 raise ValueError('Frozen review-only candidate changed')
@@ -1784,7 +1812,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         # Another source can commit while this attempt is waiting for usable
         # output. Keep economic input/as_of frozen, but let the independent
         # reviewer see the actual final revision before sealing any new plan.
-        system_repair=(context or {}).get('kind') == 'system-plan-remediation-v1'
+        system_repair=(context or {}).get('kind') in {'system-plan-remediation-v1','primary-underwriting-v1'}
         checkpoint_kind='research_system_review_input' if system_repair else 'research_critique_review_input'
         checkpoint = store.get(checkpoint_kind, operation_key) if critique or system_repair else None
         if checkpoint:
@@ -1830,6 +1858,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'policy': policy, 'current_position_basis': current_basis,
             'evidence_ids': evidence_ids, 'evidence_bundle': bundle, 'repair_feedback': repair_feedback,
             'review_event_id': (context or {}).get('event_id')}
+        if (context or {}).get('kind')=='primary-underwriting-v1':
+            review_payload['instruction'] += '\nThis is a NEW independent source-based underwriting proposal, not an assertion that prior authored entry gates were fulfilled. Audit reported anchors against original sources, authored conservative forward sensitivities, arithmetic, dates, fees, dilution and executable conditions. Never accept merely because code calculated the numbers. Creator technical levels are separate context, not valuation anchors. Return all normal checks and entry_condition_review. No automatic real trading.\n'
+            if checkpoint:
+                review_payload=checkpoint['payload'];plan=json.loads(json.dumps(review_payload['plan']));revision=plan['revision']
+            else:
+                store.put(checkpoint_kind,operation_key,{'payload':review_payload,'payload_hash':stable_id(review_payload)},immutable=True)
         if (context or {}).get('kind') == 'system-plan-remediation-v1':
             from .remediation import REVIEW_REPAIR
             review_payload['instruction'] = REVIEW + REVIEW_REPAIR

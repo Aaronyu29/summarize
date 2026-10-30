@@ -35,6 +35,7 @@ SOXX_HOLDINGS = "https://www.ishares.com/us/products/239705/ishares-semiconducto
 CIRCLE_IR = "https://investor.circle.com/overview/default.aspx"
 SEC_ISSUERS = {"AMZN": "0001018724", "INTC": "0000050863", "MSFT": "0000789019"}
 QQQ_PAGE = 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html'
+QQQ_API = 'https://dng-api.invesco.com/cache/v1/accounts/en_US/shareclasses/46090E103'
 INTEL_RESULTS = 'https://www.intc.com/financial-info/financial-results'
 CIRCLE_Q2_2026 = "https://s206.q4cdn.com/265218871/files/doc_news/2026/Aug/05/CIRCLE_Q2-2026.pdf"
 CIRCLE_FY2025 = "https://s206.q4cdn.com/265218871/files/doc_earnings/2025/q4/earnings-result/4Q25-Earnings-Release.pdf"
@@ -110,6 +111,11 @@ def _allowed(url):
         return False
     return ((p.hostname == "investor.tsmc.com" and p.path.startswith("/english/")) or
             (url == QQQ_PAGE) or
+            (p.hostname=='dng-api.invesco.com' and p.path in {
+                '/cache/v1/accounts/en_US/shareclasses/46090E103',
+                '/cache/v1/accounts/en_US/shareclasses/46090E103/navs',
+                '/cache/v1/accounts/en_US/shareclasses/46090E103/prices',
+                '/cache/v1/accounts/en_US/shareclasses/46090E103/holdings/fund'}) or
             (p.hostname=='www.intc.com' and (url==INTEL_RESULTS or p.path.startswith('/news-events/press-releases/detail/'))) or
             (p.hostname == "data.sec.gov" and any(p.path in {
                 f"/submissions/CIK{cik}.json", f"/api/xbrl/companyfacts/CIK{cik}.json"}
@@ -865,9 +871,86 @@ def _qqq(store, out, now, transport):
     out['primary_financials']['instrument'] = dict(asset_type='etf', stock_eps_valuation_applicable=False,
         evidence_refs=[ev['id']], source_excerpt=title, unit_source_excerpt=share_text,
         source_locator='Official Invesco QQQ issuer page and ETF shares disclosure')
-    # Server-rendered HTML currently omits the dated fund data. Do not turn a
-    # navigation heading, trust-account EPS or guessed endpoint into NAV/PE.
-    _gap(out['primary_gaps'], 'QQQ_DATED_NAV_HOLDINGS_INDEX_EARNINGS_UNAVAILABLE', 'etf_valuation', QQQ_PAGE)
+    _qqq_data(store,out,source,now,transport)
+
+
+def _json_evidence(store,source,value,*,period_end=None,published_at=None):
+    content=json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+    selected=dict(source,content=content,sha256=hashlib.sha256(content.encode()).hexdigest(),
+        parser=VERSION+':selected-json-v1')
+    return _evidence(store,selected,period_end=period_end,published_at=published_at),content
+
+
+def _qqq_data(store,out,page,now,transport):
+    """Issuer-published month-end valuation and separately dated daily risk data.
+
+    The endpoints/CUSIP/locale are declared by the issuer page itself. Historical
+    NAV is paired with the P/E date; newer holdings are risk context, not a
+    fabricated same-day historical portfolio or a new company EPS estimate.
+    """
+    paths={'pe':'?expand=nav&idType=cusip&variationType=fundCharacteristics&productType=ETF',
+        'navs':'/navs?idType=cusip&productType=ETF',
+        'prices':'/prices?idType=cusip&variationType=priceListing&productType=ETF',
+        'holdings':'/holdings/fund?idType=cusip&productType=ETF'}
+    sources={k:_fetch(store,QQQ_API+path,now,transport) for k,path in paths.items()}
+    values={k:json.loads(v['content']) for k,v in sources.items()}
+    if any(v.get('cusip')!='46090E103' for v in values.values()):raise EvidenceError('QQQ_CUSIP_MISMATCH')
+    if values['pe'].get('currencyCode')!='USD' or values['navs'].get('currency')!='USD' or values['prices'].get('currency')!='USD':
+        raise EvidenceError('QQQ_CURRENCY_MISMATCH')
+    pe_day=_date(values['pe']['effectiveDate'])
+    if not _available_day(pe_day,now):raise EvidenceError('SOURCE_NOT_AVAILABLE_AS_OF')
+    nav_rows=next(v['data'] for v in values['navs']['lineChartData'] if v.get('type')=='NAV')
+    dated=[(_date(v['date']),v) for v in nav_rows if _available_day(_date(v['date']),now)]
+    baseline=next(v for day,v in dated if day==pe_day)
+    latest_day,latest=max(dated,key=lambda v:v[0])
+    price_day=_date(values['prices']['effectiveDate']);holding_day=_date(values['holdings']['effectiveDate'])
+    if not all(_available_day(day,now) for day in (price_day,holding_day)):raise EvidenceError('SOURCE_NOT_AVAILABLE_AS_OF')
+    # Validate the definition of USD NAV per ETF share from issuer assets/shares.
+    prices=values['prices']
+    if (decimal_value(prices['sharesOutstanding'])<=0 or decimal_value(prices['nav'])<=0
+            or abs(decimal_value(prices['marketValue'])/decimal_value(prices['sharesOutstanding'])-decimal_value(prices['nav']))>Decimal('.00001')):
+        raise EvidenceError('QQQ_NAV_SHARE_RECONCILIATION_FAILED')
+    decoded=unescape(base64.b64decode(page['raw_base64']).decode('utf-8-sig')).replace('\\"','"')
+    maps=[]
+    for match in re.finditer(r'"productListFieldValueMap"\s*:\s*(\{[^{}]*\})',decoded):
+        row=json.loads(match.group(1))
+        if row.get('ticker')=='QQQ' and row.get('cusip')=='46090E103':maps.append(row)
+    if not maps or len({str(m.get('totalExpenseRatio')) for m in maps})!=1:raise EvidenceError('QQQ_FEE_METADATA_MISSING_OR_CONFLICTING')
+    fee=maps[0];ratio=decimal_value(fee['totalExpenseRatio'])
+    if not 0<=ratio<2:raise EvidenceError('QQQ_FEE_OUTSIDE_VALID_RANGE')
+    evs={};texts={}
+    for key,val,day in [('pe',values['pe'],pe_day),('navs',{'cusip':'46090E103','currency':'USD','baseline':baseline,'latest':latest},latest_day),
+                         ('prices',prices,price_day),('holdings',values['holdings'],holding_day),('fee',fee,None)]:
+        evs[key],texts[key]=_json_evidence(store,page if key=='fee' else sources[key],val,period_end=day)
+        out['primary_evidence'].append(evs[key])
+    def part(key,**fields):return dict(fields,evidence_refs=[evs[key]['id']],source_url=evs[key]['source_url'],source_excerpt=texts[key])
+    holdings=[];unweighted=[]
+    for i,row in enumerate(values['holdings']['holdings']):
+        if row['percentageOfTotalNetAssets'] is None:
+            if row.get('securityTypeName')!='Currency' or row.get('ticker')!='USDPDV':raise EvidenceError('QQQ_HOLDINGS_WEIGHT_MISSING')
+            unweighted.append(row)
+            continue  # Pending dividend row is disclosed, never imputed as an equity weight.
+        weight=decimal_value(row['percentageOfTotalNetAssets'])/100
+        if not 0<=weight<=1 and not (row.get('securityTypeName')=='Synthetic Cash' and Decimal('-.02')<=weight<0):
+            raise EvidenceError('QQQ_HOLDINGS_WEIGHT_INVALID')
+        holdings.append({'symbol':row.get('ticker') or 'CASH_'+str(i),'weight':str(weight),
+            'name':row.get('issuerName'),'security_type':row.get('securityTypeName')})
+    total=sum(decimal_value(r['weight']) for r in holdings)
+    if not holdings or not Decimal('.95')<=total<=Decimal('1.01'):raise EvidenceError('QQQ_HOLDINGS_COVERAGE_INCOMPLETE')
+    out['etf_valuation']={'issuer_verified':True,'currency':'USD','price_unit':'per_share',
+        'timing_contract':'issuer_month_end_with_daily_risk_v1',
+        'nav':part('navs',value=str(decimal_value(baseline['value'])),as_of=pe_day,currency='USD',price_unit='per_share'),
+        'pe':part('pe',value=str(decimal_value(values['pe']['priceToEarningsRatio'])),as_of=pe_day,
+            methodology='Issuer month-end weighted harmonic portfolio P/E; excludes negative earnings per issuer methodology; implied ETF earnings proxy, not reported corporate EPS'),
+        'latest_nav':part('prices',value=str(decimal_value(prices['nav'])),as_of=price_day,currency='USD',price_unit='per_share'),
+        'holdings':part('holdings',as_of=holding_day,rows=holdings,coverage=str(total),unweighted_disclosures=unweighted,
+            concentration={'top10_weight':str(sum(sorted((decimal_value(r['weight']) for r in holdings),reverse=True)[:10]))}),
+        'expense_ratio':part('fee',value=str(ratio),unit='percent_per_year'),
+        'corporate_actions':[],
+        'timing_disclosure':'NAV and P/E share the exact month-end date. Newer holdings describe current concentration risk only. Latest daily NAV is a separate execution premium gate; no dates are silently shifted.'}
+    out['primary_financials']['instrument']=dict(is_adr=False,asset_type='etf',quote_currency='USD',quote_price_unit='per_share',
+        stock_eps_valuation_applicable=False,evidence_refs=[evs['prices']['id']],source_excerpt=texts['prices'],
+        source_locator='Invesco /prices: CUSIP, USD NAV, net assets and ETF shares reconcile; fund is identified by official issuer page')
 
 
 def _sec_equity(store, out, now, transport):
@@ -1012,8 +1095,73 @@ def _sec_equity(store, out, now, transport):
             if not recovered:
                 _gap(out['primary_gaps'],'SEC_NEWER_EARNINGS_RELEASE_UNAVAILABLE','latest_earnings_release',url)
         break  # One latest announced quarter, at most two bounded document fetches.
+    if symbol=='AMZN':
+        _amazon_operating_basis(store,out,recent,now,transport)
     if (moment.date() - datetime.fromisoformat(max(r['row']['end'] for r in selected)).date()).days > 200:
         _gap(out['primary_gaps'], 'SEC_LATEST_PERIOD_STALE', symbol)
+
+
+def _amazon_operating_basis(store,out,recent,now,transport):
+    """Two original earnings announcements; exclude investment marks from EPS proxies."""
+    latest=out['primary_financials'].get('latest_earnings_release') or {}
+    refs=latest.get('evidence_refs') or []
+    if not refs:return
+    original=store.get('external_evidence',refs[0]);text=original['content']
+    lines=text.splitlines()
+    try:
+        start=next(i for i,line in enumerate(lines) if 'Supplemental Financial Information' in line)
+        end=next((i for i in range(start+1,len(lines)) if 'Supplemental Financial Information' in lines[i]),len(lines))
+        section=lines[start:end]
+        header=next(line for line in section if re.search(r'Q[1-4] 20\d{2}Q[1-4] 20\d{2}',line))
+        quarters=re.findall(r'Q([1-4]) (20\d{2})',header)
+        if len(quarters)!=6:raise EvidenceError('AMZN_TTM_COLUMNS_CHANGED')
+        q,year=map(int,quarters[-1]);day=f'{year}-{q*3:02d}-'+('30' if q in (2,3) else '31')
+        selected={}
+        for metric,label in [('operating_income_ttm','Operating income -- TTM'),
+                             ('operating_cash_flow_ttm','Operating cash flow -- trailing twelve months (TTM)'),
+                             ('free_cash_flow_ttm','Free cash flow -- TTM (1)')]:
+            # Issuer uses Unicode/nonbreaking dashes and parentheses in labels.
+            words=label.split(' -- ')[0]
+            candidates=[line for line in section if line.startswith(label+'$')]
+            if len(candidates)!=1:raise EvidenceError('AMZN_TTM_ROW_AMBIGUOUS:'+metric)
+            line=candidates[0];tail=line.split('$',1)[1]
+            vals=re.findall(NUMBER,tail)
+            if len(vals)<6:raise EvidenceError('AMZN_TTM_VALUES_CHANGED')
+            selected[metric]={'value':str(decimal_value(vals[5].replace(',','').replace('(','-').replace(')',''))/1000),
+                'unit':'USD_billions','source_excerpt':line,'column_header':header,'unit_source_excerpt':'(in millions, except per share data)',
+                'scale_conversion':'reported millions / 1000 = billions','evidence_refs':refs,'as_of':day}
+        index=next(i for i,line in enumerate(lines) if line.startswith('Weighted-average shares used in computation'))
+        shareline=next(line for line in lines[index+1:index+5] if line.startswith('Diluted'))
+        shares=re.findall(NUMBER,shareline)
+        if len(shares)!=4:raise EvidenceError('AMZN_DILUTED_COLUMNS_CHANGED')
+        selected['diluted_shares_quarter']={'value':str(decimal_value(shares[1].replace(',',''))/1000),
+            'unit':'billions_of_shares','as_of':day,'evidence_refs':refs,
+            'source_excerpt':shareline,'unit_source_excerpt':'(in millions, except per share data)',
+            'column':'current three-month diluted weighted-average; second of four cells',
+            'scale_conversion':'reported millions / 1000 = billions'}
+        for item in selected.values():item.update(source_url=original['source_url'],published_at=original['published_at'])
+        out['primary_financials']['operating_basis']=selected
+    except (StopIteration,ValueError,IndexError) as error:
+        _gap(out['primary_gaps'],str(error) if isinstance(error,EvidenceError) else 'AMZN_OPERATING_BASIS_CHANGED','AMZN_OPERATING_BASIS')
+    # The preceding release establishes the non-operating gain explicitly. It
+    # remains original evidence, never inferred from GAAP EPS differences.
+    candidates=[i for i,form in enumerate(recent.get('form',[])) if form=='8-K'
+        and '2.02' in recent.get('items',['']*len(recent['form']))[i]
+        and parse_time(recent['acceptanceDateTime'][i])<=parse_time(now)]
+    if len(candidates)<2:return
+    i=candidates[1]
+    accession=recent['accessionNumber'][i].replace('-','');document=recent['primaryDocument'][i]
+    url=f'https://www.sec.gov/Archives/edgar/data/1018724/{accession}/{document}'
+    try:
+        filing=_fetch(store,url,now,transport);parser=_HTML()
+        parser.feed(base64.b64decode(filing['raw_base64']).decode('utf-8-sig'))
+        link=next(urljoin(url,href) for href,label in parser.links if re.search(r'99[._-]?1|99\.1',href+' '+label,re.I) and _allowed(urljoin(url,href)))
+        release=_fetch(store,link,now,transport)
+        ev=_evidence(store,release,published_at=recent['acceptanceDateTime'][i]);out['primary_evidence'].append(ev)
+        out['primary_financials']['previous_earnings_release']=dict(evidence_refs=[ev['id']],source_url=link,
+            published_at=recent['acceptanceDateTime'][i],instruction='Original preceding-quarter release: separate investment gains from recurring operating income.')
+    except Exception:
+        _gap(out['primary_gaps'],'AMZN_PREVIOUS_RELEASE_UNAVAILABLE','AMZN_NONOPERATING_GAIN',url)
 
 
 def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transport=None):

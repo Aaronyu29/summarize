@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import re
+from decimal import Decimal
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from .common import decimal_value, parse_time, utc_now, stable_id
@@ -326,6 +328,7 @@ def _primary_verified(store, record):
         official = official or (host=='d18rn0p25nwr6d.cloudfront.net' and parsed.path=='/CIK-0001652044/513183d2-787c-48f5-8da7-8a897b1649e0.html')
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/265218871/files/'))
         official = official or (source['source_url'] == 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html')
+        official = official or (host=='dng-api.invesco.com' and parsed.path.startswith('/cache/v1/accounts/en_US/shareclasses/46090E103'))
         official = official or (host=='www.intc.com' and parsed.path.startswith('/news-events/press-releases/detail/'))
         if parsed.scheme != 'https' or not official:
             return False
@@ -498,6 +501,13 @@ def instrument_contract(fundamentals, *, store=None):
         excerpt = instrument.get('source_excerpt', '')
         unit_text = (re.search(r'\b(?:ADR|ADS)\b', excerpt, re.I) if unit == 'per_adr'
             else re.search(r'\b(?:(?:common|ordinary)\s+(?:stock|shares?)|per\s+(?:common\s+)?shares?)\b', excerpt, re.I))
+        if not unit_text and asset_type=='etf' and symbol=='QQQ':
+            try:
+                row=json.loads(excerpt)
+                unit_text=(row['cusip']=='46090E103' and row['currency']=='USD'
+                    and decimal_value(row['sharesOutstanding'])>0 and decimal_value(row['nav'])>0
+                    and abs(decimal_value(row['marketValue'])/decimal_value(row['sharesOutstanding'])-decimal_value(row['nav']))<=Decimal('.00001'))
+            except (ValueError,TypeError,KeyError):pass
         if (unit in {'per_share', 'per_adr'} and currency == contract['quote_currency']
                 and currency is not None and unit_text
                 and instrument.get('is_adr') is (unit == 'per_adr')):
@@ -512,7 +522,9 @@ def instrument_contract(fundamentals, *, store=None):
                 nav, pe, holdings = components
                 try:
                     dates = {datetime.strptime(item['as_of'], '%Y-%m-%d').date() for item in components}
-                    valid = (etf.get('issuer_verified') is True and len(dates) == 1
+                    monthly=(symbol=='QQQ' and etf.get('timing_contract')=='issuer_month_end_with_daily_risk_v1'
+                        and nav.get('as_of')==pe.get('as_of') and holdings.get('as_of','')>=pe.get('as_of',''))
+                    valid = (etf.get('issuer_verified') is True and (len(dates) == 1 or monthly)
                         and all(_primary_verified(store, item) for item in components)
                         and nav.get('currency') == 'USD' and nav.get('price_unit') == 'per_share'
                         and decimal_value(nav.get('value')) > 0 and decimal_value(pe.get('value')) > 0

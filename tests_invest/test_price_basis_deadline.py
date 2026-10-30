@@ -87,10 +87,10 @@ class PriceBasisDeadlineTests(unittest.TestCase):
         return {'etf_valuation': {'nav': {'as_of': '2026-10-22'}, 'corporate_actions': [{'type': 'split',
             'effective_at': effective, 'source_excerpt': text, 'evidence_refs': ['issuer-split']}]}}
 
-    def test_verified_split_generates_new_york_midnight_deadline_not_utc_midnight(self):
+    def test_verified_split_expires_at_previous_regular_close_with_dst(self):
         data = self.issuer_action()
         self.assertEqual(_price_basis_deadline(data, '2026-10-24T01:00:00Z', {'issuer-split'}, self.store),
-                         '2026-11-05T05:00:00+00:00')
+                         '2026-11-04T21:00:00+00:00')
 
     def test_corporate_action_date_must_match_original_source_not_only_existing_excerpt(self):
         data = self.issuer_action(effective='2026-11-06')

@@ -315,6 +315,19 @@ class Runner:
         period = cal["completed_session"] if cal else parse_time(now).date().isoformat()
         for symbol in symbols:
             cached = self.store.get("fundamental_cache", symbol)
+            discovered=self.store.get('research_discovered_symbol',symbol) or {}
+            video_source=discovered.get('source_id')
+            new_video=bool(video_source and (cached or {}).get('last_video_source')!=video_source)
+            if new_video and self.primary_enricher and self.execute:
+                from .primary_evidence import SEC_ISSUERS, QQQ_API, SOXX_PAGE, SOXX_HOLDINGS
+                cik=SEC_ISSUERS.get(symbol)
+                for fetch_key,fetch in self.store.items('primary_fetch'):
+                    original=self.store.get('primary_source',fetch.get('source_id','')) or {}
+                    url=original.get('source_url','')
+                    mutable=((cik and ('CIK'+cik+'.json') in url)
+                        or (symbol=='QQQ' and (url.startswith(QQQ_API) or 'invesco-qqq-trust' in url))
+                        or (symbol=='SOXX' and (url in (SOXX_PAGE,SOXX_HOLDINGS) or 'component=fundDownload' in url)))
+                    if mutable:self.store.put('primary_fetch',fetch_key,dict(fetch,expires_at=now))
             enrichment_revision = (("issuer-evidence-v2" if symbol in {"CRCL", "SOXX"} else "issuer-evidence-v1")
                 if self.primary_enricher and self.execute else None)
             if self.config.system_remediation_enabled and symbol == 'SOXX' and enrichment_revision:
@@ -324,7 +337,9 @@ class Runner:
             if symbol in {'AMZN','INTC','MSFT'} and enrichment_revision:
                 enrichment_revision+='-sec-facts-v2-fiscal-periods'
             if symbol=='QQQ' and enrichment_revision:
-                enrichment_revision+='-issuer-fund-v1'
+                enrichment_revision+='-issuer-fund-v2-public-json'
+            if symbol=='AMZN' and enrichment_revision:
+                enrichment_revision+='-operating-original-v1'
             refresh_due = False
             if cached and (cached.get("data") or {}).get("primary_refresh_after"):
                 try:
@@ -332,7 +347,7 @@ class Runner:
                 except (TypeError, ValueError):
                     refresh_due = True
             if (cached and cached.get("period") == period
-                    and cached.get("enrichment_revision") == enrichment_revision and not refresh_due):
+                    and cached.get("enrichment_revision") == enrichment_revision and not refresh_due and not new_video):
                 fundamentals[symbol] = cached["data"]
                 continue
             try:
@@ -360,7 +375,7 @@ class Runner:
                 previous = cached["data"] if cached else None
                 changed = previous is not None and _logical_fundamentals(previous) != _logical_fundamentals(data)
                 self.store.put("fundamental_cache", symbol, {"period": period, "data": data, "changed": changed,
-                    "enrichment_revision": enrichment_revision})
+                    "enrichment_revision": enrichment_revision,'last_video_source':video_source})
                 if changed:
                     self._queue_review(stable_id("fundamental_change", symbol, _logical_fundamentals(data)), {
                         "symbol": symbol, "kind": "fundamental_change", "timestamp": now,
@@ -677,7 +692,8 @@ class Runner:
     def _research_cycle(self, symbols, fundamentals):
         owner = self
         class CancellableModel:
-            config = dict(getattr(owner.model, "config", {}), bounded_feedback_since=getattr(owner.config,'research_since',None))
+            config = dict(getattr(owner.model, "config", {}), bounded_feedback_since=getattr(owner.config,'research_since',None),
+                primary_underwriting_symbols=('AMZN','QQQ','SOXX') if getattr(owner.config,'system_remediation_enabled',False) else ())
             def run(self, *args, **kwargs):
                 if owner._stop.is_set():
                     raise RuntimeError("Investment worker is stopping; no new paid call started")
@@ -688,6 +704,11 @@ class Runner:
                                  "deferred_unresolved_risk_count": 0},
                    "reviewed_count": 0}
         try:
+            if getattr(self.config,'system_remediation_enabled',False) and not self._stop.is_set():
+                from .underwriting import advance
+                summary['primary_underwriting']=advance(self.store,model,fundamentals,self.clock())
+                summary['errors'].extend({'stage':'primary_underwriting',**v} for v in summary['primary_underwriting']['errors'])
+                summary['deferred'].extend({'stage':'primary_underwriting',**v} for v in summary['primary_underwriting']['deferred'])
             if not self._stop.is_set():
                 holdings = ingest_holdings(self.store, model=model, fundamentals=fundamentals, now=self.clock())
                 summary['holding_research'] = {'symbols': holdings['symbols'], 'plan_count': len(holdings['plans']),
@@ -729,6 +750,10 @@ class Runner:
                 if trigger.get("processed") or self._stop.is_set():
                     continue
                 if self._consume_legacy_review(key, trigger):
+                    continue
+                if trigger.get('symbol') in model.config['primary_underwriting_symbols'] and trigger.get('kind')=='fundamental_change':
+                    self.store.put('review_trigger',key,dict(trigger,processed=True,processed_at=self.clock(),
+                        delegated_to='primary-underwriting-v1'))
                     continue
                 for plan in self._plans():
                     if plan["symbol"] == trigger["symbol"]:

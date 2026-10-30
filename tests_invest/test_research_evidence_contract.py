@@ -228,7 +228,7 @@ class EvidenceContractTests(unittest.TestCase):
         model = IndependentModel('SOXX')
         plan = self.ingest(model, data)
         self.assertEqual(plan['status'], 'active', plan['review_issues'])
-        self.assertEqual(plan['price_basis_valid_until'], '2026-11-05T05:00:00+00:00')
+        self.assertEqual(plan['price_basis_valid_until'], '2026-11-04T21:00:00+00:00')
         self.assertEqual(plan['next_review_at'], plan['price_basis_valid_until'])
         self.assertEqual(plan['targets'][0]['price'], '121.00')
         self.assertEqual(plan['targets'][0]['method'], 'etf_nav_scenario')

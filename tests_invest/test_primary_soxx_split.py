@@ -37,7 +37,7 @@ class IssuerSplitSupplementTests(unittest.TestCase):
         self.assertEqual(self.store.events('ledger'), [])
         self.assertEqual(self.store.items('ledger_staged'), [])
         refs = set(action['evidence_refs'])
-        self.assertEqual(_price_basis_deadline(data, NOW, refs, self.store), '2026-11-05T05:00:00+00:00')
+        self.assertEqual(_price_basis_deadline(data, NOW, refs, self.store), '2026-11-04T21:00:00+00:00')
 
     def test_future_confirming_page_is_not_backdated_to_old_announcement(self):
         data = self.collect(now='2026-10-20T23:59:59Z')

@@ -192,6 +192,8 @@ def _evaluate(store, plan, snapshot, portfolio, moment):
     price = _number(quote.get('price'))
     schema_errors = validate_plan(plan)
     errors = list(schema_errors)
+    from .underwriting import execution_gaps
+    errors.extend(execution_gaps(store,plan,snapshot,moment))
     for key, prior in store.items('advice_intent'):
         if prior.get('account') != account or prior.get('symbol') != symbol or prior.get('status') not in {'pending', 'suspended'} or key == entry_intent_id:
             continue

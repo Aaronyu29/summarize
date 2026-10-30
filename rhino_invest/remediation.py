@@ -197,6 +197,7 @@ def adjudicate_research(store,model,fundamentals,now,priority_symbols=()):
     order={symbol:i for i,symbol in enumerate(priority_symbols)}
     jobs=[j for _,j in store.items('research_system_repair') if j.get('plan_revision') and j.get('status')!='completed']
     for job in sorted(jobs,key=lambda j:(order.get(j['symbol'],len(order)),j['symbol'])):
+        if job['symbol'] in getattr(model,'config',{}).get('primary_underwriting_symbols',()):continue
         key=stable_id('research-execution-separation-review-v1',job['id'])
         previous=store.get('research_reaudit',key)
         if previous and previous.get('terminal'):continue
@@ -367,6 +368,7 @@ def remediate_plans(store, model, fundamentals, now, priority_symbols=()):
     plans = [p for _,p in store.items('plan') if p.get('status') == 'needs_review']
     order={symbol:index for index,symbol in enumerate(priority_symbols)}
     for current in sorted(plans,key=lambda p:(order.get(p.get('symbol'),len(order)),p.get('symbol',''))):
+        if current['symbol'] in getattr(model,'config',{}).get('primary_underwriting_symbols',()):continue
         symbol=current['symbol']; source=store.get('research_evidence',current.get('research_snapshot_id',''))
         if not source:
             continue
