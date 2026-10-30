@@ -677,7 +677,7 @@ class Runner:
     def _research_cycle(self, symbols, fundamentals):
         owner = self
         class CancellableModel:
-            config = getattr(owner.model, "config", {})
+            config = dict(getattr(owner.model, "config", {}), bounded_feedback_since=getattr(owner.config,'research_since',None))
             def run(self, *args, **kwargs):
                 if owner._stop.is_set():
                     raise RuntimeError("Investment worker is stopping; no new paid call started")

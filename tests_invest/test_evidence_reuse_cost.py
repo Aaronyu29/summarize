@@ -105,6 +105,44 @@ class CompletedCycleIntegrationTests(unittest.TestCase):
     setUp=fixtures.EvidenceContractTests.setUp
     facts=critiques.CritiqueTests.facts
 
+    def test_verified_fund_missing_valuation_gets_one_reviewed_zero_allocation_abstention(self):
+        class AbstentionModel(fixtures.IndependentModel):
+            config={'enabled':True,'reuse_evidence_cycles':True,'bounded_feedback_since':'1970-01-01T00:00:00Z'}
+            def run(self,purpose,payload,**kwargs):
+                result=super().run(purpose,payload,**kwargs)
+                if purpose=='review_plan':result['no_buy_reviewed']=True
+                return result
+        data=self.facts();data['identity'][0]['name_en']='Official Test ETF'
+        data['primary_financials']['instrument']['stock_eps_valuation_applicable']=False
+        model=AbstentionModel()
+        result=ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':data},now=NOW)
+        self.assertEqual(result['errors'],[])
+        p=result['plans'][0]
+        self.assertEqual(p['research_assessment']['status'],'approved_no_buy',p.get('review_issues'))
+        self.assertEqual(p['entry']['amount_usd'],'0')
+        self.assertIsNone(p['horizon_months'])
+        self.assertEqual(model.calls.count('compile_plan'),0)
+        self.assertEqual(model.calls.count('review_plan'),1)
+        ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':data},now='2026-10-29T15:00:00Z')
+        self.assertEqual(model.calls.count('review_plan'),1)
+        from rhino_invest.common import validate_plan
+        self.assertIn('no-buy research cannot authorize execution',validate_plan(p))
+
+    def test_current_source_feedback_is_exactly_one_pair_and_never_resets_for_ticks(self):
+        model=critiques.CritiqueModel(always_reject=True)
+        model.config={'enabled':True,'reuse_evidence_cycles':True,'bounded_feedback_since':'1970-01-01T00:00:00Z'}
+        facts=self.facts()
+        initial=ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':facts},now=NOW)
+        self.assertEqual(initial['errors'],[])
+        self.assertEqual(model.calls.count('compile_plan'),1)
+        for _ in range(3):
+            result=ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':facts},now='2026-10-29T15:00:00+00:00')
+            self.assertEqual(result['errors'],[])
+        self.assertEqual(model.calls.count('compile_plan'),2)
+        self.assertEqual(model.calls.count('review_plan'),2)
+        self.assertEqual(len(self.store.items('research_critique_attempt')),1)
+        self.assertEqual(len(self.store.items('research_critique_result')),1)
+
     def test_rejected_real_workflow_does_not_start_critique_on_future_ticks(self):
         model=critiques.CritiqueModel(always_reject=True)
         model.config={'enabled':True,'reuse_evidence_cycles':True}

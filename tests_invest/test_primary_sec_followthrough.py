@@ -100,6 +100,10 @@ class PrimaryFollowthroughTests(unittest.TestCase):
         self.assertIn('no-buy research cannot authorize execution',validate_plan(p))
         self.assertNotIn('price_unit must be per_share/per_adr',classify_plan_validation(p)['research_errors'])
         self.assertIn('price_unit must be per_share/per_adr',validate_plan(p))
+        p['entry']['amount_usd']='0';p['horizon_months']=None
+        p['verification']['unit']=False
+        self.assertEqual(classify_plan_validation(p)['research_errors'],[])
+        self.assertTrue(validate_plan(p))
         changed=copy.deepcopy(p);changed['research_intent']=None
         self.assertIn('price_unit must be per_share/per_adr',classify_plan_validation(changed)['research_errors'])
 

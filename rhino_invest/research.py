@@ -236,6 +236,8 @@ Always set plan.research_intent explicitly to buy or no_buy INSIDE plan. A prose
 abstention without research_intent=no_buy is an invalid purchase proposal. For
 insufficient_valuation retain only verified facts and explicit gaps, use targets=[],
 and leave unverified price_unit null rather than claiming a verified unit.
+For no_buy set entry.amount_usd=0; policy.amount_usd is only a FUTURE purchase
+default, never an allocation. No-buy may use horizon_months=null (no holding period).
 '''
 REVIEW = '''Independently review each target scenario, arithmetic, explicit assumptions,
 financial source periods/units, ADR conversion, downside, entry/stop/TP, thesis invalidation
@@ -285,6 +287,17 @@ For valuation_basis.kind=insufficient_valuation with no entry/targets/stop/TP, r
 whether the historical facts and disclosed valuation gaps justify abstaining; do not
 force invented forecasts or claim that a point valuation has passed. Empty targets
 are allowed ONLY for this explicit non-executable, evidence-limited no-buy decision.
+For this price-free abstention entry.amount_usd=0 is the actual proposed allocation;
+policy.amount_usd is a default for FUTURE buys, not an allocation now. A null/zero
+holding horizon means no holding is proposed; next_review_at governs follow-up.
+entry.basis=independent_valuation names the research workflow, not a claim that a
+valuation has passed when valuation_basis.kind=insufficient_valuation. Verify the
+acknowledged missing inputs; do not reject solely because they are still missing.
+A null price_unit is honest absence of a price conversion, not an ambiguous
+asserted conversion. Do not demand a fabricated unit for an abstention with no prices.
+When a specific SEC/issuer fact is source_verified and supports its claimed unit,
+an unrelated unverified native report or unreleased consensus flag cannot negate it.
+Reject actual source mismatches, bad bridges or unsupported normalization regardless.
 '''
 EVENT_REVIEW = REVIEW + ''' For a risk event, also return assessment:{triggered:false,
 condition:null,evidence_refs:[],rationale:null}. Set triggered true ONLY when the new
@@ -1386,8 +1399,8 @@ def _critique_ready(store, plan, fundamental, moment):
     binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
     review = binding.get('review') or {}
     if (plan.get('status') != 'needs_review' or binding.get('plan_hash') != plan_fingerprint(plan)
-            or review.get('accepted') is not False or review.get('deterministic_preflight')
-            or not isinstance(review.get('issues'), list) or not review['issues']):
+            or not isinstance(review.get('accepted'), bool) or review.get('deterministic_preflight')
+            or not isinstance(review.get('issues'), list) or not (review['issues'] or plan.get('review_issues'))):
         return False
     contract = fundamental.get('instrument_contract') or {}
     if contract.get('quote_currency') != 'USD' or contract.get('quote_price_unit') not in {'per_share', 'per_adr'}:
@@ -1473,6 +1486,19 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if model is not None and getattr(model, 'config', {}).get('reuse_evidence_cycles'):
             from .reuse import completed_evidence_plan
             reused = completed_evidence_plan(store, snapshot, symbol, fundamental, context, moment)
+            since = getattr(model, 'config', {}).get('bounded_feedback_since')
+            # One pre-existing critique operation per primary evidence root;
+            # no event IDs/timestamps reset its completed request fences.
+            if (reused is not None and not context and since and published_at
+                    and parse_time(published_at) >= parse_time(since)
+                    ):
+                old_review=(store.get('research_plan_review',reused.get('review_evidence_id','')) or {}).get('review') or {}
+                official_instrument=(fundamental.get('primary_financials') or {}).get('instrument') or {}
+                official_abstention=(old_review.get('deterministic_preflight') is True
+                    and fundamental['instrument_contract'].get('asset_type')=='etf'
+                    and official_instrument.get('source_verified') is True)
+                if _critique_ready(store,reused,fundamental,moment) or official_abstention:
+                    reused = None
             if reused is not None:
                 plans.append(reused)
                 continue
@@ -1493,6 +1519,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             'new_evidence': _stable_fundamentals(context.get('new_evidence'))}
         operation_key = stable_id('plan-operation-v4-evidence-repair', snapshot['id'], symbol, fid,
                                   _model_cache_identity(model), event_context)
+        primary_instrument=(fundamental.get('primary_financials') or {}).get('instrument') or {}
+        preflight_abstention=(fundamental['instrument_contract'].get('asset_type')=='etf'
+            and primary_instrument.get('source_verified') is True
+            and bool(_etf_input_gaps(fundamental,moment,_nested_refs(fundamental),store)))
+        if preflight_abstention:
+            operation_key=stable_id(operation_key,'official-fund-abstention-v1')
         model_ready = model is not None and getattr(model, 'config', {}).get('enabled', True) is not False
         if holding_source:
             operation_key = stable_id(operation_key, 'holding-research-v1', model_ready)
@@ -1531,7 +1563,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                         'source_plan_hash': plan_fingerprint(parent_plan), 'source_plan_revision': parent_plan['revision'],
                         'source_review_id': parent_plan['review_evidence_id'], 'source_review_hash': stable_id(binding),
                         'economic_proposal': {key: parent_plan[key] for key in COMPILE_TEMPLATE['plan'] if key in parent_plan},
-                        'blocking_review_issues': binding['review']['issues'], 'review_is_untrusted_opinion': True,
+                        'blocking_review_issues': binding['review']['issues'] or parent_plan.get('review_issues',[]), 'review_is_untrusted_opinion': True,
                         'calculation_book': _calculate_target_prices(parent_plan)[1],
                         'timestamp': moment, 'compile_instruction': COMPILE + CRITIQUE_INSTRUCTION,
                         'review_instruction': REVIEW, 'max_semantic_attempts': 1, 'max_paid_requests_including_json_recovery': 5}
@@ -1660,6 +1692,13 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 proposed['entry'].update(basis='independent_valuation', conditions=['Required issuer evidence and independent research review must be completed'])
                 unit = fundamental['instrument_contract'].get('quote_price_unit')
                 proposed['is_adr'] = True if unit == 'per_adr' else False if unit == 'per_share' else None
+            elif preflight_abstention:
+                proposed.update(research_intent='no_buy',horizon_months=None,
+                    thesis='No new purchase is proposed: the official issuer confirms this is an ETF, but the supplied dated fund valuation inputs are incomplete. No fund-accounting EPS is used as company operating earnings.',
+                    valuation_basis={'kind':'insufficient_valuation','gaps':preflight_gaps},
+                    invalidation_conditions=['Reassess only after the missing dated issuer inputs are obtained and independently reviewed. No automatic purchase.'])
+                proposed['entry'].update(basis='independent_valuation',amount_usd='0',
+                    conditions=['No purchase; obtain missing issuer valuation evidence before proposing any entry.'])
         elif (context or {}).get('kind') == 'system-plan-remediation-v1' and context.get('review_only_candidate'):
             candidate=context['review_only_candidate']
             if plan_fingerprint(candidate)!=context.get('candidate_hash'):
@@ -1752,7 +1791,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         plan['horizon_until'] = _horizon_end(plan_moment, plan.get('horizon_months'))
         plan['policy'] = {'amount_usd': policy['amount_usd'], 'amount_basis': policy['amount_basis']}
         if isinstance(plan.get('entry'), dict):
-            plan['entry']['amount_usd'] = policy['amount_usd']
+            plan['entry']['amount_usd'] = '0' if plan.get('research_intent')=='no_buy' else policy['amount_usd']
+        if plan.get('research_intent')=='no_buy':
+            plan['policy']['proposed_new_investment_usd']='0'
         if current_basis:
             plan['take_profit_position_basis'] = current_basis
         plan.setdefault('stop', {})
@@ -1786,7 +1827,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             else:
                 store.put('research_critique_review_input', operation_key,
                     {'payload': review_payload, 'payload_hash': stable_id(review_payload)}, immutable=True)
-        if preflight_gaps:
+        if preflight_gaps and not preflight_abstention:
             review = {'accepted': False, 'checks': {}, 'issues': preflight_gaps,
                 'deterministic_preflight': True}
         else:

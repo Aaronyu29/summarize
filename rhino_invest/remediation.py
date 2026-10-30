@@ -304,6 +304,7 @@ def update_research_followups(store,now):
         progress.update(evidence_gaps=gaps, primary_gaps=data.get('primary_gaps',[]),
             next_public_evidence_check=data.get('primary_refresh_after'),
             next_action='monitor_entry' if ready else 'refresh_public_evidence_then_review',
+            max_semantic_feedback_attempts=1,
             repeat_same_evidence_paid_calls_allowed=False)
         summary['ready' if ready else 'researching']+=1
         if progress['last_assessment']=='approved_no_buy':summary['approved_no_buy']+=1
