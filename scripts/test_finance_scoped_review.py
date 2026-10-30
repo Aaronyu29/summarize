@@ -7,11 +7,25 @@ from unittest.mock import patch
 from finance_cloud import review_evidence, review_candidate, repair_frames
 from finance_jobs import Jobs
 from finance_alerts import scan_missing_reports
-from finance_manual_review import load_correction
+from finance_manual_review import load_correction, repair
 import test_finance_manual_review as manual_tests
 
 
 class ScopedReviewTests(unittest.TestCase):
+    def test_completed_correction_returns_delivery_without_paid_replay_or_status_reset(self):
+        fixture=manual_tests.ManualReviewTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        fixture.jobs.save(fixture.vid,status='complete',human_correction_verified=True,
+                          delivery={'status':'delivered','url':'https://example.test/done'})
+        before=fixture.jobs.get(fixture.vid)
+        with patch('finance_cloud.review_candidate') as review,patch('finance_manual_review.Publisher') as publisher:
+            self.assertEqual(repair(fixture.jobs,fixture.vid,fixture.root,{})['status'],'already_delivered')
+        review.assert_not_called();publisher.assert_not_called()
+        self.assertEqual(fixture.jobs.get(fixture.vid),before)
+        fixture.jobs.save(fixture.vid,human_correction_verified=False)
+        with self.assertRaisesRegex(ValueError,'cannot be reset'):
+            repair(fixture.jobs,fixture.vid,fixture.root,{})
+        self.assertEqual(fixture.jobs.get(fixture.vid)['status'],'complete')
+
     def test_citations_and_context_retained_without_unrelated_long_transcript(self):
         payload={'segments':[{'segment_id':f'S{i:06d}','start_seconds':i*10,
             'end_seconds':i*10+9,'text':'original'} for i in range(1000)],

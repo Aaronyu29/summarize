@@ -194,6 +194,11 @@ def _repair(jobs, vid, root, env):
     from finance_cloud import (review_candidate, canonicalize_evidence, publication_time,
         validate, validate_readability, REPORT_STYLE_VERSION, finalize_analysis, delivery_title)
     job=jobs.get(vid)
+    if job and job['status']=='complete':
+        delivery=job['checkpoint'].get('delivery') or {}
+        if job['checkpoint'].get('human_correction_verified') and delivery.get('status') in {'delivered','already_delivered'}:
+            return {**delivery, 'status':'already_delivered'}
+        raise ValueError('Completed job cannot be reset by correction')
     if not job or job['status']!='needs_review':raise ValueError('Correction requires a held review job')
     capture=pathlib.Path(job['checkpoint'].get('capture') or pathlib.Path(root)/'videos'/vid)
     if not capture.resolve().is_relative_to((pathlib.Path(root)/'videos').resolve()):
@@ -241,7 +246,7 @@ def _repair(jobs, vid, root, env):
     if result.get('status') not in {'delivered','already_delivered'}:
         raise ValueError('Corrected document not delivered')
     jobs.save(vid,status='complete',analysis_complete=True,report=str(report),delivery=result,
-              human_correction_verified=True)
+              human_correction_verified=True,review_issues=[],recovery_exhausted=False,error=None)
     return result
 
 
@@ -254,7 +259,9 @@ def main():
         if a.repair:
             try:result=repair(jobs,a.video,a.data,os.environ)
             except Exception as error:
-                job=jobs.get(a.video);jobs.save(a.video,status='needs_review',review_issues=getattr(error,'issues',job['checkpoint'].get('review_issues',[])))
+                job=jobs.get(a.video)
+                if not job or job['status']=='complete':raise
+                jobs.save(a.video,status='needs_review',review_issues=getattr(error,'issues',job['checkpoint'].get('review_issues',[])))
                 result=handoff(jobs,a.video,a.data,os.environ)
         else:result=handoff(jobs,a.video,a.data,os.environ)
         from finance_alerts import flush
