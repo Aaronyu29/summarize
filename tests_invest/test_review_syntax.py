@@ -29,6 +29,14 @@ class ReviewSyntaxTests(unittest.TestCase):
         self.assertEqual(result,expected);self.assertEqual(edit['operation'],'replace')
         self.assertEqual(edit['before'],'}');self.assertEqual(edit['after'],']')
 
+    def test_extra_object_closer_at_array_boundary_is_deleted_without_changing_decision(self):
+        for accepted in (True,False):
+            expected={'accepted':accepted,'issues':[] if accepted else ['wrong facts'],
+                'checks':dict.fromkeys(['provenance','currency','unit','adr'],True),'notes':['literal } is retained']}
+            raw=json.dumps(expected,separators=(',',':')).replace('"literal } is retained"]','"literal } is retained"}]')
+            output,edit=recover_review_array_close(raw)
+            self.assertEqual(output,expected);self.assertEqual(edit['operation'],'delete')
+
     def test_duplicates_missing_values_and_incomplete_outputs_stay_blocked(self):
         _,raw=self.text()
         for bad in [raw.replace('"accepted":true','"accepted":true,"accepted":false'),

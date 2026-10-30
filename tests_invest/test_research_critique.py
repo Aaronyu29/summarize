@@ -162,7 +162,9 @@ class CritiqueTests(unittest.TestCase):
         model = self.gateway(self.provider(CritiqueModel(), calls, failure=fail))
         self.ingest(model, data)
         result = self.ingest(model, data)
-        self.assertEqual(result['errors'][0]['error'], 'ModelOutputInvalid')
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['held'][0]['error'], 'ModelOutputInvalid')
+        self.assertEqual(result['held'][0]['scope'], 'symbol')
         self.assertEqual(len(calls), 7)
         for _ in range(3):
             result = self.ingest(model, data)

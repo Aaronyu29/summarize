@@ -107,4 +107,38 @@ class PrimaryFollowthroughTests(unittest.TestCase):
         changed=copy.deepcopy(p);changed['research_intent']=None
         self.assertIn('price_unit must be per_share/per_adr',classify_plan_validation(changed)['research_errors'])
 
+    def test_closed_malformed_symbol_does_not_block_other_symbols_but_unknown_billing_does(self):
+        from rhino_invest.research import _compile_archive_symbols
+        from rhino_invest.model import ModelOutputInvalid,UnknownModelOutcome
+        with Store(':memory:') as s:
+            s.put('model_receipt','closed',{'response':{'choices':[]}},immutable=True)
+            s.put('plan',stable_id('investment-plan','AAA'),{'id':stable_id('investment-plan','AAA'),
+                'symbol':'AAA','status':'active','review_issues':[]})
+            calls=[]
+            def compile_one(store,snapshot,levels,*args,**kwargs):
+                symbol=levels[0]['symbol'];calls.append(symbol)
+                if symbol=='AAA':raise ModelOutputInvalid('bad',call_id='closed')
+                return [{'symbol':symbol,'status':'needs_review'}]
+            result={'held':[]};snapshot={'id':'video','video_id':'source','revision':'1'}
+            with patch('rhino_invest.research.compile_plan',side_effect=compile_one):
+                output=_compile_archive_symbols(s,snapshot,[{'symbol':'AAA'},{'symbol':'BBB'}],object(),{},NOW,result)
+            self.assertEqual(calls,['AAA','BBB']);self.assertEqual(len(result['held']),1)
+            self.assertEqual(output[-1]['symbol'],'BBB')
+            self.assertEqual(s.get('plan',stable_id('investment-plan','AAA'))['status'],'needs_review')
+            with patch('rhino_invest.research.compile_plan',side_effect=UnknownModelOutcome('billing unknown')):
+                with self.assertRaises(UnknownModelOutcome):
+                    _compile_archive_symbols(s,snapshot,[{'symbol':'AAA'},{'symbol':'BBB'}],object(),{},NOW,{'held':[]})
+
+    def test_first_bad_symbol_stays_visible_for_future_recovery_without_approved_revision(self):
+        from rhino_invest.research import _compile_archive_symbols
+        from rhino_invest.model import ModelOutputInvalid
+        with Store(':memory:') as s:
+            s.put('model_receipt','closed',{'response':{}},immutable=True)
+            snapshot={'id':'video','video_id':'source','revision':'1','metadata':{'upload_date':'20261030'}}
+            with patch('rhino_invest.research.compile_plan',side_effect=ModelOutputInvalid('bad',call_id='closed')):
+                plans=_compile_archive_symbols(s,snapshot,[{'symbol':'AAA'}],object(),{},NOW,{'held':[]})
+            self.assertEqual(plans[0]['revision'],0)
+            self.assertEqual(s.get('plan',plans[0]['id'])['status'],'needs_review')
+            self.assertFalse(s.items('plan_revision'))
+
 if __name__=='__main__':unittest.main()

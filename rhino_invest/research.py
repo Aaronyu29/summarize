@@ -1551,6 +1551,13 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 operation_key = stable_id('plan-critique-v1', source_operation_key, _logical_fundamentals(fundamental))
                 terminal = store.get('research_critique_result', operation_key)
                 repaired = store.get('plan_operation', operation_key)
+                if terminal and terminal.get('status')=='output_invalid' and terminal.get('phase')=='review':
+                    from .model import recover_review_array_close
+                    receipt=store.get('model_receipt',terminal.get('receipt_id','')) or {}
+                    choices=(receipt.get('response') or {}).get('choices') or []
+                    if (len(choices)==1 and choices[0].get('finish_reason')=='stop'
+                            and recover_review_array_close((choices[0].get('message') or {}).get('content')) is not None):
+                        terminal=None  # Resume the SAME frozen review from its completed receipt, no provider retry.
                 if repaired or terminal:
                     plans.append(previous if terminal and terminal.get('status') == 'superseded' and previous
                         else (repaired or {}).get('plan') or committed['plan'])
@@ -1921,7 +1928,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 _persist_plan(store, plan)
             store.put('plan_operation', operation_key, {'plan': plan}, immutable=True)
             if critique:
-                store.put('research_critique_result', operation_key, {'status': plan['status'],
+                prior_result=store.get('research_critique_result',operation_key)
+                result_kind='research_critique_recovery_result' if prior_result and prior_result.get('status')=='output_invalid' else 'research_critique_result'
+                store.put(result_kind, operation_key, {'status': plan['status'],
                     'plan_id': plan_id, 'revision': revision, 'review_id': plan['review_evidence_id'],
                     'semantic_attempts': 1, 'terminal': True}, immutable=True)
         plans.append(plan)
@@ -2016,6 +2025,52 @@ def ingest_holdings(store, *, model=None, fundamentals=None, now=None, seed_only
     return result
 
 
+def _compile_archive_symbols(store,snapshot,levels,model,fundamentals,moment,result,**kwargs):
+    """A closed malformed response holds one instrument, not the whole video.
+
+    Unknown/possibly charged requests still stop at the global billing fence.
+    """
+    from .model import ModelOutputInvalid
+    plans=[]
+    for symbol in sorted({level['symbol'] for level in levels}):
+        selected=[level for level in levels if level['symbol']==symbol]
+        try:
+            plans.extend(compile_plan(store,snapshot,selected,model,fundamentals,moment,**kwargs))
+        except ModelOutputInvalid as error:
+            if not error.call_id or not store.get('model_receipt',error.call_id):raise
+            key=stable_id('closed-symbol-response',snapshot['id'],symbol,error.call_id)
+            hold=store.get('research_symbol_hold',key) or {'video_id':snapshot['video_id'],
+                'revision':snapshot['revision'],'source_id':snapshot['id'],'symbol':symbol,
+                'call_id':error.call_id,'error':'ModelOutputInvalid','status':'needs_review',
+                'paid_replay_allowed':False,'scope':'symbol','first_observed_at':moment}
+            store.put('research_symbol_hold',key,hold)
+            result['held'].append(hold)
+            prior=store.get('plan',stable_id('investment-plan',symbol))
+            if prior is None:
+                # A revision-zero placeholder reserves no approved revision and
+                # remains visible/reachable in later cached workflow cycles.
+                prior={'id':stable_id('investment-plan',symbol),'symbol':symbol,'revision':0,
+                    'created_at':moment,'source_published_at':_published_at(snapshot['metadata']),
+                    'research_snapshot_id':snapshot['id'],'review_issues':[],
+                    'research_assessment':{'status':'needs_evidence','repair_status':'closed_output_invalid'},
+                    'research_gaps':[{'code':'MODEL_OUTPUT_INVALID','blocking':True,'scope':'research_plan'}]}
+            prior=dict(prior,status='needs_review',review_issues=list(dict.fromkeys(
+                prior.get('review_issues',[])+['Latest symbol research response is malformed; original receipt retained'])))
+            store.put('plan',prior['id'],prior);plans.append(prior)
+    return plans
+
+
+def _resolve_archive_syntax_hold(store,video,revision,moment):
+    key=stable_id(video,revision);hold=store.get('research_archive_hold',key)
+    if hold and hold.get('status')!='resolved' and store.get('model_syntax_recovery',hold.get('call_id','')):
+        store.put('research_archive_hold',key,dict(hold,status='resolved',
+            resolution='original_review_recovered_without_paid_replay',resolved_at=moment))
+    for key,hold in store.items('research_symbol_hold'):
+        if (hold.get('video_id')==video and hold.get('revision')==revision and hold.get('status')!='resolved'
+                and store.get('model_syntax_recovery',hold.get('call_id',''))):
+            store.put('research_symbol_hold',key,dict(hold,status='resolved',resolved_at=moment))
+
+
 def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals=None, now=None, research_since=None,
                     defer_missing_fundamentals=False):
     moment = now or utc_now()
@@ -2070,10 +2125,11 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                                 cached_levels = [level for _, level in store.items('research_level')
                                     if snapshot['id'] in level.get('evidence_refs', [])
                                     and level.get('symbol') == cached_plan['symbol']]
-                                revised = compile_plan(store, snapshot, cached_levels, model, fundamentals, moment)
+                                revised = _compile_archive_symbols(store,snapshot,cached_levels,model,fundamentals,moment,result)
                                 candidate = next((plan for plan in revised if plan['symbol'] == cached_plan['symbol']), candidate)
                             result['plans'].append(candidate)
                     result['deferred_unresolved_risk'].extend(completed.get('deferred_unresolved_risk', []))
+                    _resolve_archive_syntax_hold(store,row[0],row[1],moment)
                 continue
             attempt = store.get('research_attempt', workflow_id)
             if not attempt:
@@ -2125,7 +2181,7 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 # regular tick. Do not pay to compile a deliberately empty bundle.
                 levels=[l for l in levels if l.get('symbol') not in missing]
             source_deferred = []
-            plans = compile_plan(store, snapshot, levels, model, fundamentals, workflow_moment,
+            plans = _compile_archive_symbols(store, snapshot, levels, model, fundamentals, workflow_moment,result,
                 operation_id=workflow_id, deferred=source_deferred)
             store.put('research_workflow', workflow_id, {'id': workflow_id, 'plans': plans,
                 'level_ids': [l['id'] for l in levels], 'completed_at': workflow_moment,

@@ -708,7 +708,8 @@ class Runner:
                     "deferred_before_since_count": len(ingestion.get("deferred_before_since", [])),
                     "deferred_unresolved_risk_count": len(ingestion.get("deferred_unresolved_risk", [])),
                     "missing_fundamentals_symbols":ingestion.get('deferred_missing_fundamentals',[]),
-                    "held_video_count":len(ingestion.get('held',[]))}
+                    "held_video_count":sum(v.get('scope')!='symbol' for v in ingestion.get('held',[])),
+                    "held_symbol_count":sum(v.get('scope')=='symbol' for v in ingestion.get('held',[]))}
                 if ingestion.get("deferred_unresolved_risk"):
                     summary["deferred"].append({"stage": "verified_thesis_risk", "reason": "UNRESOLVED_VERIFIED_THESIS_RISK"})
                 for error in ingestion.get("errors", []):

@@ -85,7 +85,8 @@ def recover_plan_delimiters(content):
 def recover_review_array_close(content):
     """Repair one lexer-proven array boundary in a completed review.
 
-    Require a unique full parse from one insertion or delimiter substitution.
+    Require a unique full parse from one insertion, delimiter substitution or
+    deletion of an unexpected object closer at an array boundary.
     Never complete a truncated
     response, drop fields, modify scalar text, or invent an acceptance flag.
     """
@@ -120,7 +121,8 @@ def recover_review_array_close(content):
     if quoted or len(stack)<2 or stack[-2:]!=['{','[']:return None
     candidates={}
     for value,edit in [(content[:offset]+']'+content[offset:],{'operation':'insert','offset':offset,'text':']'}),
-                       (content[:offset]+']'+content[offset+1:],{'operation':'replace','offset':offset,'before':'}','after':']'})]:
+                       (content[:offset]+']'+content[offset+1:],{'operation':'replace','offset':offset,'before':'}','after':']'}),
+                       (content[:offset]+content[offset+1:],{'operation':'delete','offset':offset,'before':'}'})]:
         try:output=decode(value)
         except ValueError:continue
         if not (isinstance(output,dict) and type(output.get('accepted')) is bool
