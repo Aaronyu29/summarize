@@ -1,0 +1,282 @@
+import unittest
+import json
+from unittest.mock import patch
+
+from rhino_invest.config import Config
+from rhino_invest.store import Store
+from rhino_invest.runner import Runner
+from tests_invest.plan_fixtures import seal_fixture_review as seal_plan_review
+from rhino_invest.ledger import stage_entry, confirm_entry
+from tests_invest.test_acceptance_core import approved_plan, quote, FixtureCalendar
+
+
+class Calendar:
+    def state(self, now):
+        return {'source': 'fixture', 'completed_session': '2026-10-23', 'completed_close': '2026-10-23T20:00:00Z',
+                'next_regular_close': '2026-10-26T20:00:00Z', 'weekly_due': True,
+                'quarter_end_due': False, 'week': '2026-W43', 'quarter': '2026-Q4'}
+
+
+class Market:
+    def __init__(self):
+        self.quote_calls = 0
+    def snapshots(self, symbols, now=None):
+        self.quote_calls += 1
+        return [{'symbol': s, 'selected': {'symbol': s, 'price': '100', 'status': 'current',
+                'source': 'longbridge-openapi', 'currency': 'USD', 'session': 'regular', 'quote_time': now}} for s in symbols]
+    def fundamentals(self, symbol, now=None):
+        return {'symbol': symbol, 'financial_report': {}, 'fetched_at': now}
+
+
+class Feishu:
+    app_token = 'fixture'
+    def __init__(self):
+        self.calls = []
+        self.fail_input = False
+    def poll_inputs(self):
+        if self.fail_input:
+            raise TimeoutError('private')
+        return {'errors': []}
+    def upsert(self, table, fields):
+        self.calls.append((table, fields))
+        return {'record': {'record_id': 'a'}}
+    def notify(self, key, text):
+        return {'status': 'disabled'}
+
+
+class RunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.store = Store(':memory:')
+        self.config, self.market, self.feishu = Config(symbols=('TSM',)), Market(), Feishu()
+        self.now = '2026-10-23T20:10:00Z'
+        self.runner = Runner(self.store, self.config, market=self.market, feishu=self.feishu,
+                             calendar=Calendar(), execute=True, clock=lambda: self.now)
+    def tearDown(self):
+        self.store.close()
+
+    def test_restart_schedule_dedup_and_no_model_while_unconfigured(self):
+        first = self.runner.run_once()
+        self.assertEqual(len(first['reports']), 4)  # daily+weekly, real+paper
+        writes = len(self.feishu.calls)
+        self.now = '2026-10-23T20:11:00Z'
+        second = self.runner.run_once()
+        self.assertEqual(second['reports'], [])
+        self.assertEqual(len(self.feishu.calls), writes)
+        self.assertEqual(self.market.quote_calls, 2)
+        self.assertEqual(self.store.items('model_call'), [])
+        self.assertIsNone(first['portfolio']['cash'])
+
+    def test_quote_failure_keeps_worker_alive_and_records_unknown(self):
+        self.market.snapshots = lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError('secret'))
+        result = self.runner.run_once()
+        self.assertEqual(result['quotes'], [])
+        self.assertTrue(any(e['stage'] == 'official_quotes' for e in result['errors']))
+        self.assertNotIn('secret', str(result))
+        self.assertIsNotNone(self.store.get('worker', 'latest'))
+
+    def test_ledger_poll_failure_is_passed_to_decision_gate(self):
+        self.feishu.fail_input = True
+        self.store.put('plan', 'p1', {'id': 'p1', 'symbol': 'TSM', 'status': 'active'})
+        seen = []
+        def decide(store, plan, quote, portfolio, now=None):
+            seen.append(portfolio)
+            return {'id': 'r' + portfolio['account'], 'symbol': 'TSM', 'account': portfolio['account'], 'action': 'watch', 'status': 'data_blocked', 'reasons': []}
+        with patch('rhino_invest.runner.evaluate', side_effect=decide):
+            self.runner.run_once()
+        real = next(p for p in seen if p['account'] == 'real')
+        self.assertFalse(real['ledger_input_current'])
+
+    def test_paper_pending_replayed_before_new_signals(self):
+        self.store.put('plan', 'p1', {'id': 'p1', 'symbol': 'TSM', 'revision': 1, 'status': 'active', 'next_review_at': '2027-01-01T00:00:00Z'})
+        self.store.put('recommendation', 'previous', {'id': 'previous', 'account': 'paper', 'plan_id': 'p1', 'revision': 1, 'status': 'actionable'})
+        self.store.put('advice_intent', 'previous', {'status': 'pending'})
+        with patch('rhino_invest.runner.simulate', return_value={'status': 'skipped'}) as simulate, patch('rhino_invest.runner.evaluate', return_value={'id': 'previous', 'action': 'buy', 'status': 'actionable'}):
+            self.runner.run_once()
+        self.assertEqual(simulate.call_count, 1)
+        self.assertEqual(simulate.call_args.args[1]['id'], 'previous')
+
+    def test_paper_replay_rejects_invalidated_or_missing_plan(self):
+        self.store.put('recommendation', 'stale', {'id': 'stale', 'account': 'paper', 'plan_id': 'gone', 'revision': 1, 'status': 'actionable'})
+        self.store.put('advice_intent', 'stale', {'status': 'pending'})
+        with patch('rhino_invest.runner.simulate') as simulate:
+            self.runner.run_once()
+        self.assertEqual(simulate.call_count, 0)
+        self.assertIsNotNone(self.store.get('paper_cancel', 'stale'))
+
+    def _approved_fixture(self):
+        self.store.put('research_evidence', 'sealed:1', {'id': 'sealed:1', 'source_type': 'sealed_analysis',
+            'analysis_sha256': 'a' * 64, 'transcript_sha256': 'b' * 64, 'visual_sha256': 'c' * 64}, immutable=True)
+        plan = approved_plan()
+        seal_plan_review(self.store, plan, {'accepted': True, 'issues': []}, plan['evidence_refs'])
+        self.store.put('plan', plan['id'], plan)
+        self.config.symbols = ('SOXX',)
+        self.runner.calendar = FixtureCalendar()
+        return plan
+
+    def test_clock_refresh_allows_actual_post_fetch_depth_to_fill_next_tick(self):
+        self._approved_fixture()
+        self.now = '2026-10-23T15:00:00+00:00'
+        owner = self
+        class AdvancingMarket(Market):
+            def snapshots(self, symbols, now=None):
+                minute = now[14:16]
+                fetched = f'2026-10-23T15:{minute}:02+00:00'
+                owner.now = fetched
+                snapshots = [quote(fetched, symbol=s) for s in symbols]
+                return snapshots
+        self.runner.market = AdvancingMarket()
+        first = self.runner.run_once()
+        self.assertEqual(first['timestamp'], '2026-10-23T15:00:02+00:00')
+        self.assertEqual(self.store.items('paper_fill'), [])
+        self.now = '2026-10-23T15:01:00+00:00'
+        second = self.runner.run_once()
+        fills = self.store.items('paper_fill')
+        self.assertEqual(second['timestamp'], '2026-10-23T15:01:02+00:00')
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0][1]['timestamp'], second['timestamp'])
+
+    def test_each_account_report_uses_its_own_advice_and_cash(self):
+        self._approved_fixture()
+        self.now = '2026-10-23T15:00:00+00:00'
+        self.runner.market.snapshots = lambda symbols, now=None: [quote(now, symbol=s) for s in symbols]
+        class AllReportsCalendar(FixtureCalendar):
+            def state(self, now):
+                return dict(super().state(now), weekly_due=True, quarter_end_due=True)
+        self.runner.calendar = AllReportsCalendar()
+        stage_entry(self.store, {'id': 'known-real-cash', 'account': 'real', 'type': 'opening_cash',
+            'timestamp': '2026-10-22T15:00:00+00:00', 'currency': 'USD', 'amount': '1234'})
+        confirm_entry(self.store, 'known-real-cash')
+        # Cash is confirmed, but the real inventory has deliberately not been
+        # reconciled. The separate paper account starts from known empty holdings.
+        result = self.runner.run_once()
+        self.assertEqual(result['errors'], [])
+        real = result['recommendations']
+        paper = result['paper_recommendations']
+        self.assertEqual(len(real), 1)
+        self.assertEqual(len(paper), 1)
+        self.assertEqual(real[0]['account'], 'real')
+        self.assertIn('actual_holdings_not_reconciled', real[0]['reasons'])
+        self.assertNotIn(real[0]['action'], ('buy', 'add'))
+        self.assertEqual((paper[0]['account'], paper[0]['action']), ('paper', 'buy'))
+        kinds = {'每日复盘', '每周复盘', '季度复核'}
+        reports = [r for r in result['reports'] if r['kind'] in kinds]
+        self.assertEqual(len(reports), 6)
+        for report in reports:
+            with self.subTest(kind=report['kind'], account=report['account']):
+                expected = paper if report['account'] == 'paper' else real
+                other = real if report['account'] == 'paper' else paper
+                self.assertEqual(report['recommendation_ids'], [r['id'] for r in expected])
+                self.assertTrue(set(report['recommendation_ids']).isdisjoint(r['id'] for r in other))
+                self.assertEqual(self.store.get('report', report['id']), report)
+                if report['account'] == 'paper':
+                    self.assertEqual(report['portfolio']['cash'], '20000')
+                    self.assertIn('实际现金：20000 USD', report['body'])
+                    self.assertIn('首次买入', report['body'])
+                    self.assertNotIn('实际现金：1234', report['body'])
+                else:
+                    self.assertEqual(report['portfolio']['cash'], '1234')
+        self.assertEqual(self.store.items('paper_fill'), [])
+
+    def test_synchronous_research_elapsed_time_ages_quote_before_decision(self):
+        self._approved_fixture()
+        self.now = '2026-10-23T15:00:00+00:00'
+        self.config.archive_database = 'fixture-read-only.sqlite'
+        self.runner.market.snapshots = lambda symbols, now=None: [quote(now, symbol=s) for s in symbols]
+        def delayed_ingest(*_args, **_kwargs):
+            self.now = '2026-10-23T15:02:00+00:00'
+            return {'ingested': 0, 'plans': [], 'errors': []}
+        with patch('rhino_invest.runner.ingest_archives', side_effect=delayed_ingest):
+            result = self.runner.run_once()
+        self.assertEqual(result['timestamp'], self.now)
+        self.assertFalse(self.store.get('market_latest', 'SOXX')['business_gate']['eligible'])
+        paper_recs = [r for _, r in self.store.items('recommendation') if r['account'] == 'paper']
+        self.assertEqual(paper_recs[-1]['status'], 'data_blocked')
+        self.assertIn('quote_timestamp_not_fresh', paper_recs[-1]['reasons'])
+
+    def test_processed_review_trigger_is_not_rearmed_by_identical_next_tick(self):
+        plan = {'id': 'p1', 'symbol': 'TSM', 'revision': 3, 'status': 'needs_review'}
+        self.store.put('plan', 'p1', plan)
+        recommendation = {'id': 'r1', 'symbol': 'TSM', 'action': 'watch', 'status': 'needs_review',
+                          'reasons': ['scheduled_thesis_review_due']}
+        with patch('rhino_invest.runner.evaluate', return_value=recommendation):
+            self.runner.run_once()
+            key, trigger = self.store.items('review_trigger')[0]
+            self.store.put('review_trigger', key, dict(trigger, processed=True, processed_at=self.now))
+            processed = self.store.get('review_trigger', key)
+            self.now = '2026-10-23T20:11:00Z'
+            self.runner.run_once()
+        self.assertEqual(self.store.get('review_trigger', key), processed)
+
+    def test_background_ingestion_errors_are_blocked_with_sanitized_counts(self):
+        self.config.archive_database = 'fixture-archive.sqlite'
+        self.runner.model = object()
+        payload = {'ingested': 2, 'unchanged': 3, 'plans': [{'id': 'p'}], 'deferred_before_since': ['old'],
+                   'errors': [{'error': 'ValueError', 'detail': 'SECRET_PRIVATE_CONFIGURATION'}]}
+        with patch('rhino_invest.runner.ingest_archives', return_value=payload):
+            self.runner._research_cycle(['TSM'], {})
+        health = self.store.get('research_worker', 'latest')
+        self.assertEqual(health['status'], 'blocked')
+        self.assertEqual(health['error_count'], 1)
+        self.assertEqual(health['ingestion']['ingested'], 2)
+        self.assertEqual(health['ingestion']['plan_count'], 1)
+        self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(health))
+
+    def test_budget_deferral_is_not_falsely_completed_or_failed(self):
+        self.config.archive_database = 'fixture-archive.sqlite'
+        self.runner.model = object()
+        with patch('rhino_invest.runner.ingest_archives', return_value={
+                'errors': [{'error': 'ModelBudgetExceeded', 'detail': 'private'}], 'plans': []}):
+            self.runner._research_cycle(['TSM'], {})
+        health = self.store.get('research_worker', 'latest')
+        self.assertEqual(health['status'], 'deferred')
+        self.assertEqual(health['error_count'], 0)
+        self.assertEqual(health['deferred_count'], 1)
+
+    def test_operational_health_alerts_are_state_change_only_and_recovery_once(self):
+        notices = []
+        self.feishu.notify = lambda key, text: notices.append((key, text)) or {'status': 'provider_ack'}
+        self.store.put('research_worker', 'latest', {'status': 'blocked', 'errors': [{'error': 'UnknownModelOutcome'}]})
+        self.runner.run_once()
+        operational = [n for n in notices if '运维通知' in n[1]]
+        self.assertEqual(len(operational), 1)
+        self.assertIn('非投资建议', operational[0][1])
+        self.runner.run_once()
+        self.assertEqual(len([n for n in notices if '运维通知' in n[1]]), 1)
+        self.store.put('research_worker', 'latest', {'status': 'completed', 'errors': []})
+        self.runner.run_once()
+        self.runner.run_once()
+        operational = [n for n in notices if '运维通知' in n[1]]
+        self.assertEqual(len(operational), 2)
+        self.assertIn('运行已恢复', operational[-1][1])
+
+    def test_operational_notification_failure_never_recurses_or_retries_same_state(self):
+        attempts = []
+        def failing_notice(key, text):
+            attempts.append(key)
+            raise TimeoutError('SECRET_PRIVATE_CONFIGURATION')
+        self.feishu.notify = failing_notice
+        result = {'errors': [{'stage': 'official_quotes:private-id', 'error': 'ConnectionError'}]}
+        self.runner._observe_health(result, self.now)
+        self.assertEqual(attempts, [])  # one transient request failure stays quiet
+        self.runner._observe_health(result, self.now)
+        restarted = Runner(self.store, self.config, market=self.market, feishu=self.feishu,
+                           calendar=Calendar(), execute=True, clock=lambda: self.now)
+        restarted._observe_health(result, self.now)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result['errors'], [{'stage': 'official_quotes:private-id', 'error': 'ConnectionError'}])
+        record = self.store.items('ops_notice')[0][1]
+        self.assertEqual(record['status'], 'unknown')
+        self.assertNotIn('SECRET_PRIVATE_CONFIGURATION', json.dumps(record))
+        self.assertNotIn('private-id', json.dumps(self.store.get('ops_health', 'latest')))
+
+    def test_completed_bad_output_stays_internal_without_claiming_unknown_outcome(self):
+        notices=[]
+        self.feishu.notify=lambda key,text:notices.append(text) or {'status':'provider_ack'}
+        self.store.put('research_worker','latest',{'status':'blocked','errors':[{'error':'ModelOutputInvalid'}]})
+        self.runner._observe_health({'errors':[]},self.now)
+        self.assertEqual(notices,[])
+        self.assertEqual(self.store.get('ops_health','latest')['issues'][0]['error'],'ModelOutputInvalid')
+
+
+if __name__ == '__main__':
+    unittest.main()

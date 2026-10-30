@@ -1,0 +1,43 @@
+[Unit]
+Description=Rhino manual investment research and Feishu worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/rhino-invest/current
+EnvironmentFile=/etc/rhino-invest/investment.env
+Environment=PYTHONUNBUFFERED=1
+Environment=INVEST_SYSTEM_REMEDIATION_ENABLED=true
+ExecStart=/opt/rhino-invest/current/venv/bin/python -m rhino_invest serve --execute
+Restart=on-failure
+RestartSec=30
+NotifyAccess=main
+WatchdogSec=20min
+WatchdogSignal=SIGTERM
+TimeoutAbortSec=700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rhino-invest
+ReadOnlyPaths=/opt/rhino-video-digest
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+CPUQuota=50%
+# The evidence/receipt archive outgrew 640M: sustained memory.high reclaim stalled shutdown.
+# Keep a hard ceiling while allowing source extraction and serialized Feishu sync to finish.
+MemoryHigh=896M
+MemoryMax=1152M
+MemorySwapMax=256M
+TasksMax=64
+Nice=10
+TimeoutStopSec=700
+
+[Install]
+WantedBy=multi-user.target

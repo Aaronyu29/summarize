@@ -5,8 +5,9 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import Mock
 
-from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url
+from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url, highlighted_elements, verify_full_text
 
 
 class Response:
@@ -61,6 +62,107 @@ class FakeSession:
 
 
 class FeishuTests(unittest.TestCase):
+    def test_full_text_readback_catches_unhighlighted_changed_numbers_and_missing_conditions(self):
+        source='# 财报\n\n**博主判断**；预计全年现金流为正，尚未实现。\n\n本季现金流-424亿美元。'
+        raw='财报\n博主判断；预计全年现金流为正，尚未实现。\n本季现金流-424亿美元。'
+        verify_full_text(source,raw)
+        for changed in (raw.replace('-424','424'),raw.replace('尚未实现。',''),raw.replace('预计','')):
+            with self.assertRaisesRegex(RuntimeError,'full text'):verify_full_text(source,changed)
+        verify_full_text('> **若**&gt;20%，保留条件。\n\n[原视频](https://example.test)\n\nFINANCE_IMAGE_0000',
+                         '若>20%，保留条件。原视频')
+
+    def test_native_highlight_keeps_conditional_and_unfinished_wording(self):
+        text = '观察：**若跌破698，风险升高；当前尚未触发**；**融资尚未完成**。'
+        elements = highlighted_elements(text)
+        self.assertEqual(''.join(e['text_run']['content'] for e in elements), text.replace('**', ''))
+        emphasized = [e['text_run'] for e in elements if e['text_run'].get('text_element_style')]
+        self.assertEqual(len(emphasized), 2)
+        self.assertTrue(all(r['text_element_style'] == {'bold': True, 'background_color': 3} for r in emphasized))
+
+    def test_import_losing_emphasis_stops_before_notification(self):
+        self.md.write_text('# Sample\n\n**Important condition**\n\n![Image caption](frame.jpg)\n', encoding='utf-8')
+        session = FakeSession()
+        with self.assertRaisesRegex(RuntimeError, 'lost required emphasis'):
+            self.publisher(session).run()
+        self.assertFalse(any('/hook/' in url for _, url in session.calls))
+
+    def test_highlight_is_patched_and_read_back(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**QQQ 698；尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': 'QQQ 698；尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        def call(method, path, *, json_body):
+            block['text']['elements'] = json_body['update_text_elements']['elements']
+        publisher.call = call
+        publisher.block = lambda doc, block_id: block
+        publisher.emphasize_and_verify('doc')
+        self.assertEqual(block['text']['elements'][0]['text_run']['text_element_style']['background_color'], 3)
+
+    def test_duplicate_phrase_must_be_emphasized_at_every_occurrence(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**尚未触发**\n\n**尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': highlighted_elements('**尚未触发**')}}
+        publisher.list_blocks = lambda doc: [block]
+        with self.assertRaisesRegex(RuntimeError, 'lost required emphasis'):
+            publisher.emphasize_and_verify('doc')
+
+    def test_imported_negative_number_and_encoded_comparison_are_repaired_in_place(self):
+        publisher=self.publisher(FakeSession())
+        publisher.content='除AI**-0.32**；**59%是&gt;20%回撤占比，不是当前亏损比例**。'
+        block={'block_id':'focus','block_type':2,'text':{'elements':[{'text_run':{
+            'content':'除AI**-0.32**；59%是>20%回撤占比，不是当前亏损比例。'}}]}}
+        publisher.list_blocks=lambda doc:[block]
+        def call(method,path,*,json_body):
+            block['text']['elements']=json_body['update_text_elements']['elements']
+        publisher.call=call;publisher.block=lambda doc,block_id:block
+        publisher.emphasize_and_verify('doc')
+        self.assertTrue(publisher.state['highlight_verified'])
+        self.assertEqual(''.join(e['text_run']['content'] for e in block['text']['elements']),
+            '除AI-0.32；59%是>20%回撤占比，不是当前亏损比例。')
+
+    def test_emphasis_repair_cannot_replace_different_provider_text(self):
+        publisher=self.publisher(FakeSession());publisher.content='**条件A尚未触发**'
+        block={'block_id':'focus','block_type':2,'text':{'elements':[{'text_run':{'content':'条件B已触发'}}]}}
+        publisher.list_blocks=lambda doc:[block];publisher.call=Mock()
+        with self.assertRaisesRegex(RuntimeError,'lost required emphasis'):
+            publisher.emphasize_and_verify('doc')
+        publisher.call.assert_not_called()
+
+    def test_server_splitting_styled_runs_is_accepted(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**QQQ 698；尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': 'QQQ 698；尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        def call(method, path, *, json_body):
+            block['text']['elements'] = highlighted_elements('**QQQ 698；****尚未触发**')
+        publisher.call = call
+        publisher.block = lambda doc, block_id: block
+        publisher.emphasize_and_verify('doc')
+        self.assertTrue(publisher.state['highlight_verified'])
+
+    def test_failed_style_readback_does_not_mark_verified(self):
+        publisher = self.publisher(FakeSession())
+        publisher.content = '**尚未触发**'
+        block = {'block_id': 'focus', 'block_type': 2, 'text': {'elements': [
+            {'text_run': {'content': '尚未触发', 'text_element_style': {'bold': True}}}]}}
+        publisher.list_blocks = lambda doc: [block]
+        publisher.call = lambda *args, **kwargs: None
+        publisher.block = lambda doc, block_id: block
+        with self.assertRaisesRegex(RuntimeError, 'highlight readback failed'):
+            publisher.emphasize_and_verify('doc')
+        self.assertNotIn('highlight_verified', publisher.state)
+
+    def test_document_only_acceptance_does_not_send_notification(self):
+        session = FakeSession()
+        publisher = self.publisher(session)
+        result = publisher.run(notify=False)
+        self.assertEqual(result['status'], 'document_verified')
+        self.assertFalse(any('/hook/' in url for _, url in session.calls))
+        self.assertNotIn('webhook_sent', publisher.state)
+        self.assertEqual(publisher.run()['status'], 'delivered')
+
     def setUp(self):
         root = pathlib.Path(__file__).resolve().parent.parent / ".cache" / "finance-tests"
         root.mkdir(parents=True, exist_ok=True)
@@ -131,6 +233,27 @@ class FeishuTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Unreconciled"):
             self.publisher(session).run()
         self.assertEqual(len(session.calls), before)
+
+    def test_exact_image_creation_is_reconciled_by_readback_without_new_post(self):
+        publisher=self.publisher(FakeSession())
+        marker='FINANCE_IMAGE_0000'
+        publisher.state.update(pending_write='create_image:'+marker,doc_token='doc',
+            images={marker:{'parent':'doc','marker_block':'marker-id'}})
+        publisher.block=lambda doc,identity: ({'children':['marker-id','created-image']} if identity=='doc'
+            else {'block_type':27,'block_id':identity})
+        publisher.reconcile_pending()
+        self.assertEqual(publisher.state['images'][marker]['block_id'],'created-image')
+        self.assertNotIn('pending_write',publisher.state)
+        self.assertEqual(publisher.session.calls,[])
+
+    def test_absent_image_target_stays_unknown_and_never_recreated(self):
+        publisher=self.publisher(FakeSession());marker='FINANCE_IMAGE_0000'
+        publisher.state.update(pending_write='create_image:'+marker,doc_token='doc',
+            images={marker:{'parent':'doc','marker_block':'marker-id'}})
+        publisher.block=lambda *args:{'children':['marker-id']}
+        with self.assertRaisesRegex(RuntimeError,'target not found'):publisher.reconcile_pending()
+        self.assertIn('pending_write',publisher.state)
+        self.assertEqual(publisher.session.calls,[])
 
     def test_definitive_permission_rejection_can_resume_after_permission_is_fixed(self):
         publisher = self.publisher(FakeSession())

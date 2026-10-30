@@ -14,6 +14,7 @@ import sqlite3
 
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 KINDS = {"creator_view": "博主观点", "on_screen": "画面信息", "analyst_inference": "分析推断"}
+REPORT_STYLE_VERSION = "concise-highlight-v1"
 
 
 def load(path):
@@ -97,6 +98,37 @@ def timestamp_link(vid, seconds):
     return f"https://www.youtube.com/watch?v={vid}&t={seconds}s"
 
 
+def rich_text(value):
+    """Render only inline emphasis and line breaks; evidence text stays escaped."""
+    escaped = html.escape(value)
+    return re.sub(r"\*\*([^*\n]+)\*\*", r"<strong class='focus'>\1</strong>", escaped).replace("\n", "<br>")
+
+
+def markdown_text(value):
+    # Markdown soft breaks can collapse on import; preserve the approved short-line layout.
+    return '  \n'.join(line.strip() for line in value.strip().splitlines())
+
+
+def validate_readability(video):
+    """New cloud candidates must carry emphasis before they can be delivered."""
+    if len(video['overview'].replace('**', '')) > 220:
+        raise ValueError('Overview exceeds 220 characters; move evidence and review conditions to their sections')
+    overview_lines = [line for line in video['overview'].splitlines() if line.strip()]
+    if not 2 <= len(overview_lines) <= 5:
+        raise ValueError('Overview needs a short conclusion and separate takeaway lines (2-5 lines)')
+    fields = [('overview', video['overview']), ('review_questions', video['review_questions'])]
+    for index, claim in enumerate(video['claims']):
+        fields.append((f'claim {index}', claim['text']))
+        if claim.get('uncertainty'):
+            fields.append((f'uncertainty {index}', claim['uncertainty']))
+    for name, value in fields:
+        spans = re.findall(r'\*\*([^*\n]+)\*\*', value)
+        if not spans or '**' in re.sub(r'\*\*([^*\n]+)\*\*', '', value):
+            raise ValueError(f'{name} must include balanced emphasis around key information and conditions')
+        if any(len(span) > 90 for span in spans):
+            raise ValueError(f'{name} highlights a long paragraph; emphasize short phrases instead')
+
+
 def render(analysis, records):
     esc = html.escape
     parts = ["<!doctype html><html lang='zh-CN'><meta charset='utf-8'>",
@@ -109,12 +141,13 @@ def render(analysis, records):
              ".meta{font-size:14px;color:#526174}.tag{font-size:13px;background:#e0f2fe;padding:3px 8px;"
              "border-radius:4px}.claim{border-top:1px solid #dbe4ed;padding:20px 0}"
              "details{font-size:14px;color:#475569}nav a{display:block}"
+             ".focus{background:#fff0a6;color:#172033;padding:0 2px}"
              "@media print{section{break-inside:avoid}body{background:white}main{padding:0}}",
              "</style><main><h1>RhinoFinance · 中文研究简报</h1>",
              f"<p class='meta'>{esc(analysis['edition'])} · 样板 v{esc(str(analysis['revision']))}</p>",
              "<p>讲述依据为本地自动转写，关键画面由分析者核对。财经数据和观点均归属于原视频；"
              "本报告未独立核实公司公告或实时行情。完整音频、视频和自动转写随档案保存。</p>",
-             f"<section><h2>三期速读</h2><p>{esc(analysis['summary'])}</p><nav>"]
+             f"<section><h2>{'本期速读' if len(records) == 1 else '多期速读'}</h2><p>{rich_text(analysis['summary'])}</p><nav>"]
     for record in records:
         vid = record["info"]["id"]
         parts.append(f"<a href='#{vid}'>{esc(record['info']['title'])}</a>")
@@ -125,15 +158,17 @@ def render(analysis, records):
         parts.extend([f"<section id='{vid}'><h2>{esc(info['title'])}</h2>",
                       f"<p class='meta'>发布：{esc(video['published_shanghai'])}（北京时间） · "
                       f"时长 {info['duration']//60:02}:{info['duration']%60:02} · "
-                      f"<a href='{timestamp_link(vid,0)}'>原视频</a></p>",
-                      f"<p><strong>核心判断：</strong>{esc(video['overview'])}</p>"])
-        for claim in video["claims"]:
+                      f"<a href='{timestamp_link(vid,0)}'>原视频</a></p>"])
+        if len(records) > 1:
+            parts.append(f"<p><strong>核心判断：</strong>{rich_text(video['overview'])}</p>")
+        for index, claim in enumerate(video["claims"], 1):
             second = int(claim["timestamp_seconds"])
-            parts.extend(["<article class='claim'>", f"<span class='tag'>{KINDS[claim['kind']]}</span> "
+            parts.extend(["<article class='claim'>", f"<h3>{index}. {esc(claim['headline'])}</h3>",
+                          f"<span class='tag'>{KINDS[claim['kind']]}</span> "
                           f"<a href='{timestamp_link(vid,second)}'>{second//60:02}:{second%60:02} ↗</a>",
-                          f"<p>{esc(claim['text'])}</p>"])
+                          f"<p>{rich_text(claim['text'])}</p>"])
             if claim.get("uncertainty"):
-                parts.append(f"<p class='meta'>核对说明：{esc(claim['uncertainty'])}</p>")
+                parts.append(f"<p class='meta'>核对说明：{rich_text(claim['uncertainty'])}</p>")
             if claim.get("frame_seconds") is not None:
                 frame = record["frames"][claim["frame_seconds"]]
                 src = f"{vid}/{pathlib.Path(frame['path']).as_posix()}"
@@ -144,8 +179,8 @@ def render(analysis, records):
                 excerpt = " ".join(s["text"] for s in record["transcript"]["segments"] if s["id"] in refs)
                 parts.append(f"<details><summary>查看对应自动转写（可能有识别错误）</summary>{esc(excerpt)}</details>")
             parts.append("</article>")
-        parts.append(f"<h3>后续复盘</h3><p>{esc(video['review_questions'])}</p></section>")
-    parts.append(f"<section><h2>跨期观察</h2><p>{esc(analysis['cross_video_observations'])}</p>"
+        parts.append(f"<h3>后续复盘</h3><p>{rich_text(video['review_questions'])}</p></section>")
+    parts.append(f"<section><h2>跨期观察</h2><p>{rich_text(analysis['cross_video_observations'])}</p>"
                  "<p class='meta'>跨期观察是本报告的分析归纳，不等同于博主原话或预测胜率。"
                  "本样板未接入后续行情验证。</p></section></main></html>")
     return "\n".join(parts)
@@ -155,27 +190,29 @@ def render_markdown(analysis, records):
     lines = ["# RhinoFinance 中文研究简报", "", f"{analysis['edition']} · 样板 v{analysis['revision']}", "",
              "> 讲述来源：本地自动转写；关键画面经分析者核对。下述数据和观点归属于视频发布时的博主，"
              "未独立核实公司公告或实时行情。转写可能存在识别错误；条件、估值区间与实际交易须分别理解。", "",
-             "## 三期速读", "", analysis["summary"], ""]
+             "## 本期速读" if len(records) == 1 else "## 多期速读", "", markdown_text(analysis["summary"]), ""]
     for record in records:
         video, info = record["analysis"], record["info"]
         vid = info["id"]
         lines.extend([f"## {info['title']}", "", f"发布：{video['published_shanghai']}（北京时间） · "
-                      f"时长 {info['duration']//60:02}:{info['duration']%60:02} · [原视频]({timestamp_link(vid,0)})", "",
-                      f"**核心判断：** {video['overview']}", ""])
+                      f"时长 {info['duration']//60:02}:{info['duration']%60:02} · [原视频]({timestamp_link(vid,0)})", ""])
+        if len(records) > 1:
+            lines.extend([f"**核心判断：** {markdown_text(video['overview'])}", ""])
         for index, claim in enumerate(video["claims"], 1):
             second = int(claim["timestamp_seconds"])
             lines.extend([f"### {index}. {claim['headline']}", "",
                           f"**{KINDS[claim['kind']]}** · [{second//60:02}:{second%60:02}]({timestamp_link(vid,second)})", "",
-                          claim["text"], ""])
+                          markdown_text(claim["text"]), ""])
             if claim.get("uncertainty"):
-                lines.extend([f"> 核对说明：{claim['uncertainty']}", ""])
+                note = markdown_text(claim['uncertainty']).replace('\n', '\n> ')
+                lines.extend([f"> 核对说明：{note}", ""])
             if claim.get("frame_seconds") is not None:
                 frame = record["frames"][claim["frame_seconds"]]
                 src = f"{vid}/{pathlib.Path(frame['path']).as_posix()}"
                 lines.extend([f"![关键画面：{claim['headline']}]({src})", "",
                               f"[回看画面对应时刻]({timestamp_link(vid,claim['frame_seconds'])})", ""])
-        lines.extend(["### 后续复盘问题", "", video["review_questions"], ""])
-    lines.extend(["## 跨期观察", "", analysis["cross_video_observations"], "",
+        lines.extend(["### 后续复盘问题", "", markdown_text(video["review_questions"]), ""])
+    lines.extend(["## 跨期观察", "", markdown_text(analysis["cross_video_observations"]), "",
                   "跨期观察属于本报告归纳，不等同于博主原话、预测胜率或实际交易收益。", "",
                   "## 原始材料与复盘", "",
                   "本地同目录保留 discovery.json、每条视频的元数据、音视频、transcript.asr.json、"
@@ -184,7 +221,7 @@ def render_markdown(analysis, records):
     return "\n".join(lines)
 
 
-def publish(analysis_path: pathlib.Path, database: pathlib.Path):
+def publish(analysis_path: pathlib.Path, database: pathlib.Path, *, register=True):
     capture = analysis_path.parent
     analysis = load(analysis_path)
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", str(analysis.get("revision", ""))):
@@ -195,8 +232,21 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
     sealed = capture / f"analysis-v{revision}.json"
     if sealed.exists() and sha(sealed) != fingerprint:
         raise ValueError("Analysis revision is immutable; use a new revision")
-    sealed.write_bytes(analysis_path.read_bytes())
     report = capture / f"brief-v{revision}.html"
+    manifest_path = capture / f"manifest-v{revision}.json"
+    if sealed.exists() and manifest_path.exists() and report.exists() and (capture / f'brief-v{revision}.md').exists():
+        existing_manifest = load(manifest_path)
+        if existing_manifest.get('analysis_sha256') != fingerprint:
+            raise ValueError('Existing manifest does not seal this analysis')
+        artifacts = {item['path']: item['sha256'] for item in existing_manifest['artifacts']}
+        for suffix in ('md', 'html'):
+            name = f'brief-v{revision}.{suffix}'
+            if artifacts.get(name) != sha(capture / name):
+                raise ValueError('Existing archived report changed; inspect before replay')
+        if register:
+            register_archive(analysis_path, database)
+        return report
+    sealed.write_bytes(analysis_path.read_bytes())
     report.write_text(render(analysis, records), encoding="utf-8")
     (capture / f"brief-v{revision}.md").write_text(render_markdown(analysis, records), encoding="utf-8")
     artifacts = []
@@ -207,6 +257,22 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
     manifest = {"schema_version": 1, "analysis_sha256": fingerprint,
                 "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "artifacts": artifacts}
     (capture / f"manifest-v{revision}.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    if register:
+        register_archive(analysis_path, database)
+    return report
+
+
+def register_archive(analysis_path: pathlib.Path, database: pathlib.Path):
+    """Expose the revision only after reports and manifest are finalized."""
+    capture = analysis_path.parent
+    analysis = load(analysis_path)
+    records = validate(analysis, capture)
+    revision = str(analysis['revision'])
+    fingerprint = sha(analysis_path)
+    if sha(capture / f'analysis-v{revision}.json') != fingerprint:
+        raise ValueError('Sealed analysis changed before registration')
+    if load(capture / f'manifest-v{revision}.json')['analysis_sha256'] != fingerprint:
+        raise ValueError('Manifest does not seal analysis before registration')
     database.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE IF NOT EXISTS analyses (video_id TEXT, revision TEXT, source TEXT, "
@@ -226,7 +292,6 @@ def publish(analysis_path: pathlib.Path, database: pathlib.Path):
             transcript = " ".join(s["text"] for s in record["transcript"]["segments"])
             connection.execute("INSERT INTO research_fts VALUES (?,?,?)", (vid, revision,
                                record["info"]["title"] + "\n" + payload + "\n" + transcript))
-    return report
 
 
 def main():

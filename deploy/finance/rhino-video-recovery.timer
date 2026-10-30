@@ -1,0 +1,11 @@
+[Unit]
+Description=Check RhinoFinance recovery queue every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+AccuracySec=15s
+Unit=rhino-video-recovery.service
+
+[Install]
+WantedBy=timers.target

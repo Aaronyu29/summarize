@@ -8,19 +8,61 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import hmac
+import html
 import json
 import os
 import pathlib
 import re
 import time
 import urllib.parse
+from collections import Counter
+from finance_recovery import advisory_lock
 
 BASES = {"feishu": "https://open.feishu.cn/open-apis", "lark": "https://open.larksuite.com/open-apis"}
 IMAGE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
 ENV_KEYS = {"FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_FOLDER_TOKEN", "LARK_WEBHOOK_URL", "LARK_WEBHOOK_SECRET"}
 ENV_ALIASES = {"APPID": "FEISHU_APP_ID", "APPSecret": "FEISHU_APP_SECRET", "LARK_WEBHOOK": "LARK_WEBHOOK_URL"}
+
+
+def highlighted_elements(text):
+    """Convert editorial emphasis to native Feishu bold with a pale yellow background."""
+    elements = []
+    for index, fragment in enumerate(re.split(r'\*\*([^*\n]+)\*\*', text)):
+        if fragment:
+            run = {'content': fragment}
+            if index % 2:
+                run['text_element_style'] = {'bold': True, 'background_color': 3}
+            elements.append({'text_run': run})
+    return elements
+
+
+def verify_full_text(content, raw):
+    """Every source line must survive import, including unbolded qualifiers and numbers."""
+    normalize=lambda value:re.sub(r'\s+','',html.unescape(value))
+    actual=normalize(raw)
+    for line in content.splitlines():
+        if not line.strip() or re.fullmatch(r'\s*(FINANCE_IMAGE_\d+|---+)\s*',line):continue
+        plain=re.sub(r'^\s*(?:#{1,6}\s+|>\s*|[-*]\s+|\d+[.)]\s+)','',line)
+        plain=re.sub(r'\[([^\]]+)\]\([^)]+\)',r'\1',plain)
+        plain=re.sub(r'\\([\[\]`])',r'\1',plain).replace('**','').replace('`','')
+        if normalize(plain) and normalize(plain) not in actual:
+            raise RuntimeError('Document full text verification failed; webhook not sent')
+
+
+def text_payload(block):
+    return next((value for value in block.values()
+                 if isinstance(value, dict) and isinstance(value.get('elements'), list)), {})
+
+
+def bold_content(block, *, highlighted=False):
+    """Keep adjacent styled runs together, but never bridge an unstyled gap."""
+    return ''.join(run.get('content', '') if run.get('text_element_style', {}).get('bold')
+                   and (not highlighted or run.get('text_element_style', {}).get('background_color') == 3) else '\0'
+                   for element in text_payload(block).get('elements', [])
+                   for run in [element.get('text_run', {})])
 
 
 def load_environment(path):
@@ -129,13 +171,19 @@ class Publisher:
 
     def call(self, method, path, *, json_body=None, data=None, files=None, auth=True):
         headers = {"Authorization": f"Bearer {self.token}"} if auth else {}
-        self.sleep(0.4)
-        try:
-            response = self.session.request(method, self.base + path, headers=headers,
-                                            json=json_body, data=data, files=files,
-                                            timeout=(10, 30), allow_redirects=False)
-        except Exception:
-            raise RuntimeError("API transport failed; inspect saved receipt before retrying a write") from None
+        for attempt in range(3 if method == 'GET' else 1):
+            self.sleep(0.4 if not attempt else 2**attempt)
+            try:
+                response = self.session.request(method, self.base + path, headers=headers,
+                                                json=json_body, data=data, files=files,
+                                                timeout=(10, 30), allow_redirects=False)
+            except Exception:
+                if method == 'GET' and attempt < 2:
+                    continue
+                raise RuntimeError("API transport failed; inspect saved receipt before retrying a write") from None
+            if method == 'GET' and response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
+                continue
+            break
         if response.status_code != 200:
             try:
                 detail = response.json()
@@ -159,6 +207,7 @@ class Publisher:
 
     def mutate(self, label, function, save_result):
         self.state["pending_write"] = label
+        self.state['pending_since_epoch'] = time.time()
         self.save()
         try:
             result = function()
@@ -172,6 +221,40 @@ class Publisher:
         self.state.pop("pending_write", None)
         self.save()
         return result
+
+    def reconcile_pending(self):
+        """Resolve exact provider targets by GET; never recreate or resend blindly."""
+        label = self.state.get('pending_write')
+        if not label:
+            return
+        if label == 'create_import' and self.state.get('ticket'):
+            pass  # The stored provider ticket proves this import request returned.
+        elif str(label).startswith('create_image:') and self.state.get('doc_token'):
+            marker = label.removeprefix('create_image:')
+            receipt = self.state.get('images', {}).get(marker) or {}
+            if not receipt.get('parent') or not receipt.get('marker_block'):
+                raise RuntimeError('Unreconciled image creation lacks its exact marker target')
+            parent = self.block(self.state['doc_token'], receipt['parent'])
+            children = parent.get('children', [])
+            if receipt['marker_block'] not in children:
+                raise RuntimeError('Unreconciled image creation marker is missing')
+            index = children.index(receipt['marker_block']) + 1
+            if index >= len(children):
+                raise RuntimeError('Unreconciled image creation; provider target not found yet')
+            identity = children[index]
+            block = self.block(self.state['doc_token'], identity)
+            used = {item.get('block_id') for key, item in self.state['images'].items() if key != marker}
+            if block.get('block_type') != 27 or identity in used:
+                raise RuntimeError('Unreconciled image creation has no unique adjacent image')
+            receipt['block_id'] = identity
+            self.state['images'][marker] = receipt
+        elif label == 'send_webhook' and self.state.get('webhook_sent'):
+            pass
+        else:
+            raise RuntimeError('Unreconciled write: no exact receipt; do not blindly resend')
+        self.state.setdefault('reconciled_writes', []).append({'step': label, 'at_epoch': time.time()})
+        self.state.pop('pending_write', None)
+        self.save()
 
     def upload(self, path, parent_type, parent_node=None):
         path = pathlib.Path(path)
@@ -202,19 +285,93 @@ class Publisher:
     def block(self, doc, block):
         return self.call("GET", f"/docx/v1/documents/{doc}/blocks/{block}")["data"]["block"]
 
-    def run(self):
+    def emphasize_and_verify(self, doc):
+        normalize = lambda value: re.sub(r'\s+', '', html.unescape(value))
+        expected = Counter(normalize(value) for value in re.findall(r'\*\*([^*\n]+)\*\*', self.content))
+        if not expected:
+            return
+        blocks = self.list_blocks(doc)
+        actual = [normalize(bold_content(block)) for block in blocks]
+        if any(sum(value.count(phrase) for value in actual) < count for phrase, count in expected.items()):
+            # Some imports treat **-0.32** as literal punctuation and invert later
+            # styles. Restore only uniquely matching source paragraphs; never
+            # invent text or weaken the final readback gate.
+            paragraphs = {}
+            for paragraph in re.split(r'\n\s*\n', self.content):
+                if '**' not in paragraph or re.search(r'(?m)^#|\]\(', paragraph):continue
+                source = html.unescape(re.sub(r'(?m)^>\s?', '', paragraph))
+                plain = source.replace('**','')
+                paragraphs.setdefault(normalize(plain), []).append(source)
+            for block in blocks:
+                if block.get('block_type') not in {2,12,13,15}:continue
+                elements = text_payload(block).get('elements',[])
+                if not elements or any('text_run' not in element for element in elements):continue
+                observed = ''.join(e['text_run']['content'] for e in elements)
+                matches = paragraphs.get(normalize(observed.replace('**','')),[])
+                if len(matches)!=1:continue
+                required=Counter(normalize(v) for v in re.findall(r'\*\*([^*\n]+)\*\*',matches[0]))
+                current=normalize(bold_content(block))
+                if all(current.count(phrase)>=count for phrase,count in required.items()):continue
+                corrected = highlighted_elements(matches[0])
+                self.call('PATCH',f"/docx/v1/documents/{doc}/blocks/{block['block_id']}",
+                          json_body={'update_text_elements':{'elements':corrected}})
+                confirmed = self.block(doc,block['block_id'])
+                content = ''.join(e.get('text_run',{}).get('content','') for e in text_payload(confirmed).get('elements',[]))
+                if normalize(content)!=normalize(matches[0].replace('**','')):
+                    raise RuntimeError('Document emphasis repair changed text; webhook not sent')
+            blocks = self.list_blocks(doc)
+            actual = [normalize(bold_content(block)) for block in blocks]
+            if any(sum(value.count(phrase) for value in actual) < count for phrase, count in expected.items()):
+                raise RuntimeError('Document lost required emphasis during import; webhook not sent')
+        for block in blocks:
+            # Headings already have a visual hierarchy. Highlight inline emphasis in body/list/quote blocks.
+            if block.get('block_type') not in {2, 12, 13, 15}:
+                continue
+            elements = copy.deepcopy(text_payload(block).get('elements', []))
+            changed = False
+            for element in elements:
+                run = element.get('text_run', {})
+                style = run.get('text_element_style', {})
+                if style.get('bold') and style.get('background_color') != 3:
+                    style['background_color'] = 3
+                    changed = True
+            if changed:
+                self.call('PATCH', f"/docx/v1/documents/{doc}/blocks/{block['block_id']}",
+                          json_body={'update_text_elements': {'elements': elements}})
+                confirmed = self.block(doc, block['block_id'])
+                # Feishu may split a run when applying styles. Compare content and coverage, not segmentation.
+                expected_content = normalize(bold_content({'text': {'elements': elements}}))
+                confirmed_content = normalize(bold_content(confirmed, highlighted=True))
+                if expected_content != confirmed_content:
+                    raise RuntimeError('Document highlight readback failed; webhook not sent')
+        final = [normalize(bold_content(block, highlighted=True)) for block in self.list_blocks(doc)]
+        if any(sum(value.count(phrase) for value in final) < count for phrase, count in expected.items()):
+            raise RuntimeError('Document highlight readback failed; webhook not sent')
+        self.state['highlight_verified'] = True
+        self.state['highlight_span_count'] = sum(expected.values())
+        self.save()
+
+    def run(self, *, notify=True):
         lock = self.state_path.with_suffix(".lock")
-        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        guard = advisory_lock(lock)
+        guard.__enter__()
         try:
-            os.close(descriptor)
             self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else self.state
             if self.state.get("pending_write"):
-                raise RuntimeError(f"Unreconciled write: {self.state['pending_write']}; do not blindly resend")
+                label = self.state['pending_write']
+                reconcilable = (str(label).startswith('create_image:') or
+                    (label == 'create_import' and self.state.get('ticket')) or
+                    (label == 'send_webhook' and self.state.get('webhook_sent')))
+                if not reconcilable:
+                    raise RuntimeError(f"Unreconciled write: {label}; do not blindly resend")
+                if label == 'send_webhook' and self.state.get('webhook_sent'):
+                    self.reconcile_pending()
             if self.state.get("webhook_sent"):
                 return {"status": "already_delivered", "url": self.state["url"]}
             auth = self.call("POST", "/auth/v3/tenant_access_token/internal", auth=False,
                              json_body={"app_id": self.env["FEISHU_APP_ID"], "app_secret": self.env["FEISHU_APP_SECRET"]})
             self.token = auth["tenant_access_token"]
+            self.reconcile_pending()
             staged = self.markdown_path.parent / f".feishu-import-{self.identity[:16]}.md"
             if not self.state.get("ticket") and not self.state.get("doc_token"):
                 staged.write_text(self.content, encoding="utf-8")
@@ -281,8 +438,15 @@ class Publisher:
             if ("FINANCE_IMAGE_" in raw or not raw.strip() or
                     any(re.sub(r"\s", "", heading) not in normalized_raw for heading in headings)):
                 raise RuntimeError("Document content verification failed; webhook not sent")
+            self.emphasize_and_verify(doc)
+            raw = self.call("GET", f"/docx/v1/documents/{doc}/raw_content")["data"]["content"]
+            verify_full_text(self.content, raw)
+            self.state['full_text_verified'] = True
             self.state["document_verified"] = True
             self.save()
+            if not notify:
+                return {"status": "document_verified", "url": self.state["url"],
+                        "image_count": len(self.images), "highlight_span_count": self.state.get('highlight_span_count', 0)}
             payload = {"msg_type": "text", "content": {"text": f"{self.title}\n{self.state['url']}"}}
             if self.env.get("LARK_WEBHOOK_SECRET"):
                 payload["timestamp"] = str(int(time.time()))
@@ -305,7 +469,7 @@ class Publisher:
             self.mutate("send_webhook", notify, lambda _: self.state.update(webhook_sent=True))
             return {"status": "delivered", "url": self.state["url"], "image_count": len(self.images)}
         finally:
-            lock.unlink(missing_ok=True)
+            guard.__exit__(None, None, None)
 
 
 def main():
