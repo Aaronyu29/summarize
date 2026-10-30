@@ -641,7 +641,7 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                     issues.append('Entry band differs from its single referenced source zone')
             except ValueError:
                 issues.append('Entry source zone bounds unresolved')
-    elif entry.get('basis') != 'independent_valuation':
+    elif entry.get('basis') != 'independent_valuation' and not (evidence_limited_no_buy(plan) and entry.get('basis') is None):
         issues.append('Explicit entry basis required: source_level or independent_valuation')
     if entry.get('basis') == 'independent_valuation' and not evidence_limited_no_buy(plan):
         contract = fundamentals.get('instrument_contract') or {}
@@ -1859,7 +1859,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
             if (context or {}).get('kind') == 'system-plan-remediation-v1':
                 from .remediation import resolution_errors, economic_consistency_errors
                 issues.extend(resolution_errors(plan, review, context, set(evidence_ids)))
-            if (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
+            if not evidence_limited_no_buy(plan) and (plan.get('entry') or {}).get('basis') != 'independent_valuation' and not any(l.get('verified') and l.get('symbol') == symbol for l in levels):
                 issues.append('No individually verified source levels')
             execution_gaps = classify_plan_validation(plan)['execution_gaps'] if not issues else []
             research_gaps = _typed_research_gaps(issues, review, evidence_ids)

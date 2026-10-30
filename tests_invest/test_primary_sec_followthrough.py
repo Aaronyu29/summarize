@@ -104,6 +104,12 @@ class PrimaryFollowthroughTests(unittest.TestCase):
         p['verification']['unit']=False
         self.assertEqual(classify_plan_validation(p)['research_errors'],[])
         self.assertTrue(validate_plan(p))
+        from rhino_invest.research import _assess_plan
+        p['entry']['basis']=None
+        review={'accepted':True,'no_buy_reviewed':True,'issues':[],
+            'checks':dict.fromkeys(['provenance','currency','unit','adr'],True)}
+        issues=_assess_plan(p,review,p['evidence_refs'],{'instrument_contract':{'asset_type':'etf'}})
+        self.assertNotIn('Explicit entry basis required: source_level or independent_valuation',issues)
         changed=copy.deepcopy(p);changed['research_intent']=None
         self.assertIn('price_unit must be per_share/per_adr',classify_plan_validation(changed)['research_errors'])
 
