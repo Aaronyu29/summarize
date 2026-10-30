@@ -71,6 +71,8 @@ def review_abstentions(store,model,now,*,research_since=None):
                     'source_id':source['id'],'source_manifest_hash':source.get('manifest_sha256'),
                     'native_identity':identity,'issuer_identity':{k:instrument.get(k) for k in
                         ('asset_type','evidence_refs','source_excerpt','source_locator','source_verified')},
+                    'issuer_sources':[{'id':ref,**{k:(store.get('external_evidence',ref) or {}).get(k)
+                        for k in ('source_url','sha256')}} for ref in instrument.get('evidence_refs',[])],
                     'financial_numbers_attested_by_this_review':False},
                 'source_scope':'Original financial documents and rejected valuation remain archived; this review attests only zero allocation and system-state provenance.'}
             frozen={'timestamp':now,'plan_hash':plan_fingerprint(plan),'payload':payload}
