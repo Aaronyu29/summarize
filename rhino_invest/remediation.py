@@ -286,7 +286,8 @@ def update_research_followups(store,now):
     """No-buy is an interim result; only a verified priced entry closes follow-up."""
     from .common import validate_plan
     from .decisions import _has_provenance
-    summary={'researching':0,'ready':0,'approved_no_buy':0,'awaiting_evidence':0}
+    from .abstention import current_decision
+    summary={'researching':0,'ready':0,'approved_no_buy':0,'awaiting_evidence':0,'reviewed_abstentions':0}
     for _,plan in store.items('plan'):
         if plan.get('status') in {'superseded','invalidated'}:continue
         symbol=plan['symbol']
@@ -308,6 +309,7 @@ def update_research_followups(store,now):
             repeat_same_evidence_paid_calls_allowed=False)
         summary['ready' if ready else 'researching']+=1
         if progress['last_assessment']=='approved_no_buy':summary['approved_no_buy']+=1
+        if current_decision(plan):summary['reviewed_abstentions']+=1
         if gaps or progress['primary_gaps']:summary['awaiting_evidence']+=1
         if ready:progress.update(status='ready',completed_at=now)
         if any(followup.get(key)!=value for key,value in progress.items()):

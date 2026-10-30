@@ -718,7 +718,7 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
 
 def plan_fingerprint(plan):
     return stable_id({k: v for k, v in plan.items()
-        if k not in {'status', 'review_evidence_id', 'review_issues'}})
+        if k not in {'status', 'review_evidence_id', 'review_issues','abstention_decision'}})
 
 
 def plan_evidence_refs(plan):
@@ -1396,6 +1396,9 @@ evidence gaps explicit. This is a fresh complete proposal, followed by independe
 
 
 def _critique_ready(store, plan, fundamental, moment):
+    from .abstention import current_decision
+    current=store.get('plan',plan.get('id','')) or {}
+    if current_decision(plan) or (current_decision(current) and plan_fingerprint(current)==plan_fingerprint(plan)):return False
     binding = store.get('research_plan_review', plan.get('review_evidence_id', '')) or {}
     review = binding.get('review') or {}
     if (plan.get('status') != 'needs_review' or binding.get('plan_hash') != plan_fingerprint(plan)
@@ -1769,7 +1772,7 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 plans.append(current)
                 continue
         plan, calculation = _calculate_target_prices(proposed)
-        for field in ('review_issues', 'review_evidence_id', 'research_gaps', 'research_assessment', 'execution_requirements'):
+        for field in ('review_issues', 'review_evidence_id', 'research_gaps', 'research_assessment', 'execution_requirements','abstention_decision'):
             plan.pop(field, None)
         calculation['source_operation_id'] = source_operation_key
         if calculation_seed:

@@ -416,6 +416,11 @@ def plan_row(plan, recommendation=None):
         row['状态'] = item['status']
         row['建议动作'] = '等待补证据后复核'
         row['理由'] = '；'.join(item['reasons']) + '；证据更新后继续自动复核'
+    from .abstention import current_decision
+    if current_decision(plan):
+        row.update(状态='估值待补齐·已复核暂不买',建议动作='不新增买入',单次买入美元='0',买入区间='无买入建议',
+            理由='当前没有通过复核的买入方案，本次新增投入0美元；系统继续补证，估值及入场价尚未获认可。',
+            证据引用='暂不买决定已独立复核；原估值及失败记录保留，未获批准。')
     return row
 
 

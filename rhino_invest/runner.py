@@ -736,6 +736,11 @@ class Runner:
                         summary["reviewed_count"] += 1
                 self.store.put("review_trigger", key, dict(trigger, processed=True, processed_at=self.clock()))
             from .remediation import update_research_followups
+            if getattr(self.config,'system_remediation_enabled',False) and not self._stop.is_set():
+                from .abstention import review_abstentions
+                summary['abstention']=review_abstentions(self.store,model,self.clock(),research_since=getattr(self.config,'research_since',None))
+                summary['errors'].extend({'stage':'abstention_review','error':_safe_error(v['error'])} for v in summary['abstention']['errors'])
+                summary['deferred'].extend({'stage':'abstention_review',**v} for v in summary['abstention']['deferred'])
             summary['followups'] = update_research_followups(self.store,self.clock())
             summary.update(timestamp=self.clock(), error_count=len(summary["errors"]), deferred_count=len(summary["deferred"]),
                            status="blocked" if summary["errors"] else "deferred" if summary["deferred"] else "completed")
