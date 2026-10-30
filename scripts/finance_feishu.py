@@ -39,6 +39,19 @@ def highlighted_elements(text):
     return elements
 
 
+def verify_full_text(content, raw):
+    """Every source line must survive import, including unbolded qualifiers and numbers."""
+    normalize=lambda value:re.sub(r'\s+','',html.unescape(value))
+    actual=normalize(raw)
+    for line in content.splitlines():
+        if not line.strip() or re.fullmatch(r'\s*(FINANCE_IMAGE_\d+|---+)\s*',line):continue
+        plain=re.sub(r'^\s*(?:#{1,6}\s+|>\s*|[-*]\s+|\d+[.)]\s+)','',line)
+        plain=re.sub(r'\[([^\]]+)\]\([^)]+\)',r'\1',plain)
+        plain=re.sub(r'\\([\[\]`])',r'\1',plain).replace('**','').replace('`','')
+        if normalize(plain) and normalize(plain) not in actual:
+            raise RuntimeError('Document full text verification failed; webhook not sent')
+
+
 def text_payload(block):
     return next((value for value in block.values()
                  if isinstance(value, dict) and isinstance(value.get('elements'), list)), {})
@@ -426,6 +439,9 @@ class Publisher:
                     any(re.sub(r"\s", "", heading) not in normalized_raw for heading in headings)):
                 raise RuntimeError("Document content verification failed; webhook not sent")
             self.emphasize_and_verify(doc)
+            raw = self.call("GET", f"/docx/v1/documents/{doc}/raw_content")["data"]["content"]
+            verify_full_text(self.content, raw)
+            self.state['full_text_verified'] = True
             self.state["document_verified"] = True
             self.save()
             if not notify:

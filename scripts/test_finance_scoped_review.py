@@ -53,7 +53,7 @@ class ScopedReviewTests(unittest.TestCase):
             def review(d,name,instruction,request,images,env):
                 names.append(name)
                 return {'accepted':True,'issues':[],'checked_claim_indices':[0],
-                        'overview_checked':True,'review_questions_checked':True}
+                        'overview_checked':True,'review_questions_checked':True,'source_decisions_checked':True}
             with patch('finance_cloud.model_json',side_effect=review),patch('finance_cloud.effective_response_file',side_effect=lambda d,n:n):
                 for _ in range(2):review_candidate(root,video,payload,[(55,image)],{})
                 payload['segments'][0]['text']='changed evidence'
@@ -85,6 +85,30 @@ class ScopedReviewTests(unittest.TestCase):
         candidate,_=load_correction(fixture.capture,fixture.vid)
         self.assertEqual(candidate['claims'][0]['frame_seconds'],1000)
         replacement.write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):load_correction(fixture.capture,fixture.vid)
+
+    def test_global_review_requires_source_decisions_instead_of_only_consistent_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);image=root/'a.jpg';image.write_bytes(b'image')
+            video={'claims':[{'evidence_segment_ids':[0],'frame_seconds':55}]}
+            def review(d,name,instruction,request,images,env):
+                if name.endswith('global'):
+                    self.assertIn('完整转写反查',instruction)
+                    self.assertIn('建仓淡化为观察',instruction)
+                    return {'accepted':True,'issues':[],'overview_checked':True,'review_questions_checked':True}
+                return {'accepted':True,'issues':[],'checked_claim_indices':[0]}
+            with patch('finance_cloud.model_json',side_effect=review),patch('finance_cloud.effective_response_file',side_effect=lambda d,n:n):
+                issues,_=review_candidate(root,video,{'video_id':'test'},[(55,image)],{})
+            self.assertTrue(issues)
+
+    def test_summary_correction_is_explicit_and_cannot_edit_arbitrary_metadata(self):
+        fixture=manual_tests.ManualReviewTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+        value=fixture.correction();value['video_changes']=[{'field':'overview','before':'**待核对**','after':'**博主观点**\n保留条件'}]
+        fixture.write(fixture.capture/'user-correction.json',value)
+        result,_=load_correction(fixture.capture,fixture.vid)
+        self.assertEqual(result['overview'],'**博主观点**\n保留条件')
+        value['video_changes'][0]['field']='published_shanghai'
+        fixture.write(fixture.capture/'user-correction.json',value)
         with self.assertRaises(ValueError):load_correction(fixture.capture,fixture.vid)
 
 

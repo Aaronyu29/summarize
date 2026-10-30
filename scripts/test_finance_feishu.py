@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url, highlighted_elements
+from finance_feishu import Publisher, RemoteError, load_environment, prepare, signature, validate_doc_url, highlighted_elements, verify_full_text
 
 
 class Response:
@@ -62,6 +62,15 @@ class FakeSession:
 
 
 class FeishuTests(unittest.TestCase):
+    def test_full_text_readback_catches_unhighlighted_changed_numbers_and_missing_conditions(self):
+        source='# 财报\n\n**博主判断**；预计全年现金流为正，尚未实现。\n\n本季现金流-424亿美元。'
+        raw='财报\n博主判断；预计全年现金流为正，尚未实现。\n本季现金流-424亿美元。'
+        verify_full_text(source,raw)
+        for changed in (raw.replace('-424','424'),raw.replace('尚未实现。',''),raw.replace('预计','')):
+            with self.assertRaisesRegex(RuntimeError,'full text'):verify_full_text(source,changed)
+        verify_full_text('> **若**&gt;20%，保留条件。\n\n[原视频](https://example.test)\n\nFINANCE_IMAGE_0000',
+                         '若>20%，保留条件。原视频')
+
     def test_native_highlight_keeps_conditional_and_unfinished_wording(self):
         text = '观察：**若跌破698，风险升高；当前尚未触发**；**融资尚未完成**。'
         elements = highlighted_elements(text)

@@ -145,7 +145,8 @@ class RecoveryTests(unittest.TestCase):
         def reviewer(directory,name,instruction,request,images,env):
             seen.append((name,request,images))
             if name.endswith('global'):
-                return {'accepted':True,'issues':[],'overview_checked':True,'review_questions_checked':True}
+                return {'accepted':True,'issues':[],'overview_checked':True,'review_questions_checked':True,
+                        'source_decisions_checked':True}
             return {'accepted':True,'issues':[],'checked_claim_indices':request['global_claim_indices']}
         with patch('finance_cloud.model_json',side_effect=reviewer),patch('finance_cloud.effective_response_file',side_effect=lambda d,n:n+'.response.json'):
             issues,receipts=review_candidate(self.root,video,payload,frames,self.env)

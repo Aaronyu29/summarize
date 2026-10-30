@@ -282,7 +282,14 @@ INSTRUCTION = '''你是中文财经视频研究员。完整阅读本视频全部
 每个重点给出2至10个精确的S000000格式segment_id及接近其发言的timestamp_seconds。
 evidence_segment_ids 必须复制给定的S前缀字符串，不能填秒数或数字编号；frame_seconds只能选给定帧，
 且须与证据段时间相近。选有信息量的财报表格、图表、持仓画面，至少5个重点带图。
-不得使用片外行情或自造数据，不输出投资指令。中文总结应解释依据、条件、反例、后续如何复盘。
+配图必须直接支持本条具体数据；纯口述的发债、评级等内容若没有相关原图，frame_seconds填null，
+不能拿同期股价图冒充发债或评级数据的画面凭证。时间接近不能替代内容一致。
+不得使用片外行情或自造数据，不替读者给出本报告自己的买卖指令。
+必须忠实转述博主明确表达的建仓、买点、减仓、止损、持有或观望意见，标为“博主观点”，保留对象、仓位前提、
+价格区间、触发/失效条件和节目时点；不能把“建仓”擅自淡化为“观察”，也不能把条件买点写成已成交。
+每个主要标的先回答博主怎么看、理由是什么、什么情况下改变判断，再给财报数据；正反两面都保留。
+“预计/指引财年现金流为正”不等于“已实现现金流为正”。核对说明必须反映具体证据，
+原图清晰可见的内容不得写成看不清或未知；不要用泛化免责声明替代研究结论。中文总结应解释依据、条件、反例和复盘。
 标题和正文都要核对时间语义：“开场”不是“开盘”，“当日收盘表现”不是“开盘表现”。
 复盘条件、反例等若为本报告归纳，须在正文中明确标为“本报告复盘补充”，不能归为博主原话。
 估值中位、估值区间与技术支撑不是同一概念；已经发生的价位变化不能写成尚未触发的条件。
@@ -449,11 +456,16 @@ def review_candidate(directory, video, payload, frames, env):
     selected = [item for item in frames if item[0] in {c.get('frame_seconds') for c in candidate['claims']}]
     if len(selected) > 8:
         selected = [selected[round(i*(len(selected)-1)/7)] for i in range(8)]
-    instruction = VERIFY + ('\n本批专门检查overview和review_questions与已逐条审核通过的claims是否一致。'
+    instruction = VERIFY + ('\n本批检查overview和review_questions与已逐条审核通过的claims是否一致，'
+        '同时必须利用本批完整转写反查全篇是否遗漏或歪曲博主的核心决策观点。'
+        '逐一核对各主要标的的建仓/买点/减仓/止损/持有/观望、仓位前提、价格和触发条件；'
+        '把明确建仓淡化为观察、遗漏重仓持有与预留仓位、把预计写成已实现，均是实质错误。'
+        '意见必须列真实段号；没有说过的内容不能为了让报告可操作而补造。'
         '全部claims已分批对原图审核，本批不得因为某张已审原图未再次附上而推翻它；完整转写与视觉观察可辅助核查。'
         '摘要不能引入已审claims之外的新事实，复盘假设须有若/待核限定，不能误读为已发生事件。'
         '只指出确切证据冲突、重要遗漏或强调缺口，不为措辞偏好编造问题。'
-        '输出JSON：{"accepted":true或false,"overview_checked":true,"review_questions_checked":true,"issues":[具体问题]}。')
+        '输出JSON：{"accepted":true或false,"overview_checked":true,"review_questions_checked":true,'
+        '"source_decisions_checked":true,"issues":[具体问题]}。')
     evidence = {**payload, 'candidate': candidate, 'claims_independently_reviewed': True}
     identity = {'payload': evidence, 'instruction': instruction,
                 'frames': [(second, sha(path)) for second, path in selected]}
@@ -462,7 +474,8 @@ def review_candidate(directory, video, payload, frames, env):
     review = model_json(directory, name, instruction, evidence, selected, env)
     files.append(effective_response_file(directory, name))
     if not (review.get('accepted') is True and review.get('issues') == [] and
-            review.get('overview_checked') is True and review.get('review_questions_checked') is True):
+            review.get('overview_checked') is True and review.get('review_questions_checked') is True and
+            review.get('source_decisions_checked') is True):
         reasons = review.get('issues')
         if isinstance(reasons, list) and reasons:
             issues.extend(str(item)[:800] for item in reasons)

@@ -77,11 +77,19 @@ def load_correction(capture, vid):
         valid=(isinstance(after,list) and bool(after) and all(isinstance(v,str) and v in segments for v in after)
                and len(set(after))==len(after)) if field=='evidence_segment_ids' else isinstance(after,str) and bool(after.strip())
         if field == 'frame_seconds':
-            valid = type(after) is int and after == second and after in frames
+            valid = ((after is None and second == original_second)
+                     or (type(after) is int and after == second and after in frames))
         if candidate['claims'][index][field] != change['before'] or not valid:
             raise ValueError('Correction original text mismatch')
         candidate['claims'][index][field] = change['after']
-    if not seen:
+    video_seen=set()
+    for change in correction.get('video_changes', []):
+        field=change['field'];after=change['after']
+        if (field not in {'overview','review_questions'} or field in video_seen
+                or not isinstance(after,str) or not after.strip() or candidate.get(field)!=change['before']):
+            raise ValueError('Correction video field mismatch')
+        video_seen.add(field);candidate[field]=after
+    if not seen and not video_seen:
         raise ValueError('Empty correction')
     return candidate, digest(path)
 
