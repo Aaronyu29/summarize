@@ -57,6 +57,10 @@
 
 `archive_database` 必须指向视频封存数据库（有 `analyses` 表），不是任务队列 `jobs.sqlite`。数据库以只读模式打开，逐条校验封存分析、manifest、音频、逐字稿、原始帧和视觉缓存的指纹。新封存 revision 会再次进入研究流程；相同输入和已完成的模型响应复用缓存。
 
+新视频的主要标的不受旧行情关注名单限制。先持久保存原始证据与价位，新的股票先补齐独立财务数据，再付费生成长期计划；未核实的价位仍不能触发买卖。新视频的首次价位提取复用正式报告选中的原图，并保留完整转写；布局在首次请求前封存，已有请求沿用原批次，不能通过换批次刷新付费重试。
+
+历史建议与发送回执按条件分批查询，保留原有审计而不在每分钟全量载入内存。独立的 systemd 看门狗只在前台周期完成后收到心跳；连续20分钟没有心跳时请求正常停止并受控重启，保留700秒排空时间，每小时最多启动3次。未决模型或发送回执的围栏不因重启清除。已完成但坏格式的原始模型回包作为待复核记录保留，不阻塞新视频，也不自动付费重做。
+
 ```console
 python -m rhino_invest --private-config /etc/rhino-invest/private.json diagnostics
 python -m rhino_invest --private-config /etc/rhino-invest/private.json diagnostics --live

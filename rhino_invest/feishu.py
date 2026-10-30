@@ -124,7 +124,7 @@ class Feishu:
                 return found
             raise UnknownOutcome("An earlier Feishu write is unresolved; readback did not prove delivery")
         if any(value.get("identity") == identity and value.get("status") in ("pending", "unknown")
-               for key, value in self.store.items("feishu_outbox") if key != op_id):
+               for key, value in self.store.iter_items("feishu_outbox", filters={'identity':identity,'status':['pending','unknown']}) if key != op_id):
             raise UnknownOutcome("An earlier write for this identity is unresolved; changing its payload cannot bypass reconciliation")
         operation = {"id": op_id, "identity": identity, "status": "pending", "method": method,
                      "path": path, "body": body, "timestamp": utc_now()}
@@ -239,7 +239,7 @@ class Feishu:
         identity = "record:" + table + ":" + fields["系统标识"]
         # Recover a response lost after server commit, even if this projection's
         # newer timestamp/content changed while the request was in flight.
-        for key, pending in self.store.items("feishu_outbox"):
+        for key, pending in self.store.iter_items("feishu_outbox", filters={'identity':identity,'status':['pending','unknown']}):
             if pending.get("identity") != identity or pending.get("status") not in ("pending", "unknown"):
                 continue
             expected = pending["body"]["fields"]
@@ -424,7 +424,7 @@ class Feishu:
             # A new payload or explicit staging never bypasses an earlier unknown
             # provider write. Only the old unique receipt can prove that outcome.
             recovered_ack = False
-            for op_key, operation in self.store.items("feishu_outbox"):
+            for op_key, operation in self.store.iter_items("feishu_outbox", filters={'identity':identity,'status':['pending','unknown']}):
                 if operation.get("identity") != identity or operation.get("status") not in ("pending", "unknown"):
                     continue
                 expected = operation.get("body", {}).get("fields", {}).get("设置回执")
@@ -487,7 +487,7 @@ class Feishu:
     def notify(self, notification_id, text):
         """Human-facing text; delivery IDs stay in the durable outbox."""
         if self.execute:
-            for _, operation in self.store.items("feishu_outbox"):
+            for _, operation in self.store.iter_items("feishu_outbox", filters={'identity':'notice:'+notification_id}):
                 if operation.get("identity") != "notice:" + notification_id:
                     continue
                 if operation.get("status") in ("delivered", "acknowledged"):
@@ -546,7 +546,7 @@ class Feishu:
             return {"status": "dry_run", "operation": identity, "route": "webhook",
                     "verification": "provider_ack_only", "readback_verified": False, "body": body}
         if any(v.get("identity") == identity and v.get("status") in ("pending", "unknown")
-               for _, v in self.store.items("feishu_outbox")):
+               for _, v in self.store.iter_items("feishu_outbox", filters={'identity':'notice:'+notification_id,'status':['pending','unknown']})):
             raise UnknownOutcome("An earlier notice outcome is unknown; switching notification routes cannot authorize resend")
         key = stable_id("feishu-webhook-notice", notification_id)
         operation = {"id": key, "identity": identity, "route": "webhook", "status": "pending",
@@ -590,7 +590,7 @@ class Feishu:
 
     def reconcile(self):
         resolved, unknown = [], []
-        for key, operation in self.store.items("feishu_outbox"):
+        for key, operation in self.store.iter_items("feishu_outbox", filters={'status':['pending','unknown']}):
             if operation["status"] not in ("pending", "unknown"):
                 continue
             identity = operation["identity"]

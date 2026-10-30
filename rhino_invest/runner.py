@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import signal
 import threading
+import re
+import os
+import socket
 
 from .common import utc_now, parse_time, stable_id, decimal_value
 from .ledger import portfolio
@@ -22,6 +25,22 @@ from .reporting import (make_report, report_row, plan_row, portfolio_rows, reada
 SAFE_ERRORS = {"ValueError", "TypeError", "KeyError", "OSError", "FileNotFoundError", "PermissionError",
                "TimeoutError", "ConnectionError", "UnknownModelOutcome", "ModelBudgetExceeded", "ModelOutputInvalid", "ModelRejected", "FeishuError",
                "UnknownOutcome", "RuntimeError", "OperationalError", "JSONDecodeError", "ImportError", "ModuleNotFoundError", "ModelBudgetConfigError"}
+
+
+def _watchdog_heartbeat():
+    """Only a completed foreground cycle feeds systemd's independent watchdog."""
+    address=os.environ.get('NOTIFY_SOCKET')
+    if not address:
+        return False
+    if address.startswith('@'):
+        address='\0'+address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as channel:
+            channel.settimeout(1)
+            channel.sendto(b'WATCHDOG=1',address)
+        return True
+    except OSError:
+        return False
 
 
 def _safe_error(value):
@@ -269,8 +288,8 @@ class Runner:
                          {p["symbol"] for p in paper_initial.get("positions", [])} |
                          {p["symbol"] for p in reported_holdings(self.store, now=now)} |
                          {level["symbol"] for _, level in self.store.items("research_level")
-                          if level.get("verified") is True and level.get("kind") in WATCH_KINDS
-                          and isinstance(level.get("symbol"), str)})
+                          if isinstance(level.get("symbol"), str)
+                          and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}',level['symbol'])})
         quotes = {}
         if symbols:
             try:
@@ -391,7 +410,7 @@ class Runner:
         # new advice. Newly generated signals cannot fill on the triggering tick.
         result["paper"] = []
         current_plans = {p["id"]: p for p in plans}
-        for _, pending in self.store.items("recommendation"):
+        for _, pending in self.store.iter_items("recommendation", filters={'account':'paper','status':'actionable'}):
             if pending.get("account") != "paper" or pending.get("status") != "actionable":
                 continue
             if self.store.get("paper_fill", pending["id"]):
@@ -595,7 +614,7 @@ class Runner:
                                    if old_id != key and old.get("kind") == "风险提示"
                                    and (old.get("risk_fact_id") or old.get("period")) == report["risk_fact_id"]}
                         if any(op.get("identity") in related and op.get("status") in {"pending", "unknown"}
-                               for _, op in self.store.items("feishu_outbox")):
+                               for _, op in self.store.iter_items("feishu_outbox", filters={'status':['pending','unknown']})):
                             if self.execute:
                                 self.store.put("notification", key, {"report_id": key, "status": "suppressed",
                                     "reason": "prior_risk_notice_outcome_unknown", "timestamp": now}, immutable=True)
@@ -640,6 +659,7 @@ class Runner:
             "quote_count": len(result["quotes"]), "errors": result["errors"], "report_count": len(result["reports"]),
             "recommendation_count": len(result["recommendations"])})
         self._observe_health(result, now)
+        _watchdog_heartbeat()
         if self._background_mode and self.execute and self.model and not self._stop.is_set():
             if not self._research_thread or not self._research_thread.is_alive():
                 self._research_thread = threading.Thread(target=self._research_cycle,
@@ -675,11 +695,14 @@ class Runner:
                     summary['deferred' if item['error'] == 'ModelBudgetExceeded' else 'errors'].append(item)
             if self.config.archive_database and not self._stop.is_set():
                 ingestion = ingest_archives(self.store, self.config.archive_database, model=model,
-                    symbols=symbols or None, fundamentals=fundamentals, now=self.clock(), research_since=self.config.research_since)
+                    symbols=None, fundamentals=fundamentals, now=self.clock(), research_since=self.config.research_since,
+                    defer_missing_fundamentals=True)
                 summary["ingestion"] = {"ingested": ingestion.get("ingested", 0), "unchanged": ingestion.get("unchanged", 0),
                     "plan_count": len(ingestion.get("plans", [])),
                     "deferred_before_since_count": len(ingestion.get("deferred_before_since", [])),
-                    "deferred_unresolved_risk_count": len(ingestion.get("deferred_unresolved_risk", []))}
+                    "deferred_unresolved_risk_count": len(ingestion.get("deferred_unresolved_risk", [])),
+                    "missing_fundamentals_symbols":ingestion.get('deferred_missing_fundamentals',[]),
+                    "held_video_count":len(ingestion.get('held',[]))}
                 if ingestion.get("deferred_unresolved_risk"):
                     summary["deferred"].append({"stage": "verified_thesis_risk", "reason": "UNRESOLVED_VERIFIED_THESIS_RISK"})
                 for error in ingestion.get("errors", []):
@@ -875,7 +898,7 @@ class Runner:
 
 
 def status(store):
-    outbox = [v for _, v in store.items("feishu_outbox")]
+    outbox = [v for _, v in store.iter_items("feishu_outbox", filters={'status':['pending','unknown']})]
     return {"worker": store.get("worker", "latest"),
             "research_worker": store.get("research_worker", "latest"),
             "shutdown": store.get("worker_shutdown", "latest"),

@@ -1938,12 +1938,13 @@ def ingest_holdings(store, *, model=None, fundamentals=None, now=None, seed_only
     return result
 
 
-def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals=None, now=None, research_since=None):
+def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals=None, now=None, research_since=None,
+                    defer_missing_fundamentals=False):
     moment = now or utc_now()
     cutoff = parse_time(research_since) if research_since is not None else None
     result = {'ingested': 0, 'unchanged': 0, 'errors': [], 'plans': [], 'deferred_before_since': [],
               'research_since': cutoff.isoformat() if cutoff else None, 'historical_revisions': [],
-              'deferred_unresolved_risk': []}
+              'deferred_unresolved_risk': [], 'deferred_missing_fundamentals': [], 'held': []}
     with contextlib.closing(sqlite3.connect(Path(archive_db).resolve().as_uri() + '?mode=ro', uri=True)) as db:
         rows = db.execute('SELECT video_id,revision,source,title,payload,analysis_sha256 FROM analyses ORDER BY video_id,revision').fetchall()
     latest = _latest_revisions(rows)
@@ -2007,11 +2008,30 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 levels = extraction['levels']
             else:
                 levels = []
-                frames = _frames(snapshot)
+                layout_key=stable_id('research-extraction-layout-v1',snapshot['id'])
+                layout=store.get('research_extraction_layout',layout_key)
+                if layout is None:
+                    # Existing requests retain their exact original frame batches.
+                    # New videos reuse the report's substantive frames, not every
+                    # repeated slide or sidebar quote in the capture interval.
+                    selected={c.get('frame_seconds') for c in snapshot.get('analysis',{}).get('claims',[])}
+                    selected.discard(None)
+                    use_focus=not existing and bool(selected)
+                    layout={'policy':'accepted_claim_frames' if use_focus else 'legacy_complete_frames',
+                        'frame_seconds':[f['timestamp_seconds'] for f in snapshot['frames']
+                            if not use_focus or f['timestamp_seconds'] in selected]}
+                    store.put('research_extraction_layout',layout_key,layout,immutable=True)
+                selected_frames=[f for f in snapshot['frames'] if f['timestamp_seconds'] in layout['frame_seconds']]
+                frames = _frames(dict(snapshot,frames=selected_frames))
+                instruction=EXTRACT
+                if layout['policy']=='accepted_claim_frames':
+                    instruction += ('\nOnly extract the principal instruments substantively discussed in the full transcript. '
+                        'Ignore sidebar quote tickers and names merely mentioned in passing. '
+                        'The provided frames are the accepted report scope; values must still be checked from original evidence.')
                 for start in range(0, len(frames), 8):
                     batch = frames[start:start + 8]
-                    batch_source = dict(snapshot, frames=snapshot['frames'][start:start + 8])
-                    extracted = _run(model, 'extract_levels', {'instruction': EXTRACT,
+                    batch_source = dict(snapshot, frames=selected_frames[start:start + 8])
+                    extracted = _run(model, 'extract_levels', {'instruction': instruction,
                         'source': batch_source, 'provided_frame_seconds': [s for s, _ in batch]}, batch, workflow_moment)
                     checked = _run(model, 'verify_levels', {'instruction': VERIFY, 'levels': extracted,
                         'source': batch_source}, batch, workflow_moment)
@@ -2022,6 +2042,12 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 store.put('research_level', level['id'], level, immutable=True)
             if symbols:
                 levels = [l for l in levels if l.get('symbol') in symbols]
+            if defer_missing_fundamentals:
+                missing=sorted({l['symbol'] for l in levels if l.get('symbol') and l['symbol'] not in (fundamentals or {})})
+                result['deferred_missing_fundamentals'].extend(missing)
+                # Quotes/fundamentals discover these persisted symbols on the next
+                # regular tick. Do not pay to compile a deliberately empty bundle.
+                levels=[l for l in levels if l.get('symbol') not in missing]
             source_deferred = []
             plans = compile_plan(store, snapshot, levels, model, fundamentals, workflow_moment,
                 operation_id=workflow_id, deferred=source_deferred)
@@ -2033,6 +2059,13 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
         except Exception as exc:
             if not seal_validated and row[1] == latest.get(row[0]):
                 _block_old_revision_plans(store, row[0])
+            from .model import ModelOutputInvalid
+            if defer_missing_fundamentals and isinstance(exc,ModelOutputInvalid) and store.get('model_receipt',getattr(exc,'call_id','')):
+                hold={'video_id':row[0],'revision':row[1],'error':'ModelOutputInvalid',
+                      'call_id':exc.call_id,'status':'needs_review','paid_replay_allowed':False}
+                store.put('research_archive_hold',stable_id(row[0],row[1]),hold)
+                result['held'].append(hold)
+                continue
             result['errors'].append({'video_id': row[0], 'revision': row[1], 'error': type(exc).__name__,
                                      'detail': str(exc) if isinstance(exc, ValueError) else 'Research workflow blocked; inspect durable receipts'})
     return result

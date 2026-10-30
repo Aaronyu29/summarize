@@ -143,7 +143,7 @@ def notify_attention(store, feishu, plans, *, now, when, enabled, execute):
     if not enabled or not execute:
         return {'status':'disabled' if not enabled else 'dry_run','items':items}
     if previous and previous.get('status') in {'sending','unknown'}:
-        confirmed=next((v for _,v in store.items('feishu_outbox') if v.get('identity')=='notice:'+previous['id']
+        confirmed=next((v for _,v in store.iter_items('feishu_outbox',filters={'identity':'notice:'+previous['id']}) if v.get('identity')=='notice:'+previous['id']
                         and v.get('status') in {'delivered','acknowledged'}),None)
         if not confirmed:raise UnknownOutcome('Research outcome notice is unresolved; preserve the original send identity')
         previous=dict(previous,status='sent',receipt=confirmed.get('result',{}))

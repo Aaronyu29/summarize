@@ -2,6 +2,8 @@
 Description=Rhino manual investment research and Feishu worker
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -14,6 +16,10 @@ Environment=INVEST_SYSTEM_REMEDIATION_ENABLED=true
 ExecStart=/opt/rhino-invest/current/venv/bin/python -m rhino_invest serve --execute
 Restart=on-failure
 RestartSec=30
+NotifyAccess=main
+WatchdogSec=20min
+WatchdogSignal=SIGTERM
+TimeoutAbortSec=700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

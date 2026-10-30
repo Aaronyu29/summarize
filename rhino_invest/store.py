@@ -47,6 +47,14 @@ class Store:
             CREATE TRIGGER IF NOT EXISTS invest_event_delete BEFORE DELETE ON invest_events
                 BEGIN SELECT RAISE(ABORT,'immutable event'); END;
         """)
+        # Query the small pending/identity subsets without materializing years of
+        # immutable recommendations and delivery receipts in Python memory.
+        self.db.executescript("""
+            CREATE INDEX IF NOT EXISTS invest_status_lookup
+                ON invest_records(kind,json_extract(payload,'$.status'),key);
+            CREATE INDEX IF NOT EXISTS invest_identity_lookup
+                ON invest_records(kind,json_extract(payload,'$.identity'),key);
+        """)
 
     @contextmanager
     def transaction(self):
@@ -103,6 +111,35 @@ class Store:
         with self._lock:
             rows = self.db.execute("SELECT key,payload FROM invest_records WHERE kind=? ORDER BY key", (kind,)).fetchall()
         return [(key, json.loads(payload)) for key, payload in rows]
+
+    def iter_items(self, kind, *, filters=None, page_size=64):
+        """Bounded keyset pages; release the shared DB lock before yielding."""
+        if type(page_size) is not int or not 1 <= page_size <= 256:
+            raise ValueError('Invalid record page size')
+        clauses, values = ['kind=?'], [kind]
+        for field, value in (filters or {}).items():
+            if field not in {'status', 'identity', 'account'}:
+                raise ValueError('Unsupported record filter')
+            choices = list(value) if isinstance(value, (list, tuple)) else [value]
+            if not choices or any(not isinstance(v, str) for v in choices):
+                raise ValueError('Record filters require nonempty strings')
+            clauses.append("json_extract(payload,'$." + field + "') IN (" + ','.join('?' for _ in choices) + ')')
+            values.extend(choices)
+        where = ' AND '.join(clauses)
+        with self._lock:
+            last = self.db.execute('SELECT max(key) FROM invest_records WHERE '+where, values).fetchone()[0]
+        if last is None:
+            return
+        cursor = ''
+        while True:
+            with self._lock:
+                rows = self.db.execute('SELECT key,payload FROM invest_records WHERE '+where+
+                    ' AND key>? AND key<=? ORDER BY key LIMIT ?', (*values,cursor,last,page_size)).fetchall()
+            if not rows:
+                return
+            for key, payload in rows:
+                cursor = key
+                yield key, json.loads(payload)
 
     def append_event(self, kind, event_id, payload):
         with self.transaction():

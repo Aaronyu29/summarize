@@ -254,6 +254,8 @@ class ResearchTests(unittest.TestCase):
             'artifacts': [{'path': str(p.relative_to(self.root)).replace('\\', '/'), 'sha256': digest(p)}
                 for p in self.root.rglob('*') if p.is_file() and p.name != 'manifest-v1.json']})
         model = FixtureModel()
+        # Already ingested archives keep their original complete-frame layout.
+        ingest_archives(self.store, self.db, now=NOW)
         first = ingest_archives(self.store, self.db, model=model,
             fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
         self.assertEqual(first['errors'], [])
