@@ -378,6 +378,32 @@ def effective_response_file(directory, name):
     raise RecoveryExhausted('No complete effective model receipt was found')
 
 
+def review_evidence(payload, claims):
+    """Keep cited segments, their neighbors and nearby speech; never truncate a citation."""
+    segments = payload.get('segments', [])
+    refs = {ref for c in claims for ref in c.get('evidence_segment_ids', [])}
+    moments = [c.get(key) for c in claims for key in ('timestamp_seconds', 'frame_seconds')
+               if isinstance(c.get(key), (int, float))]
+    positions = {i for i, segment in enumerate(segments) if segment.get('segment_id') in refs}
+    keep = {j for i in positions for j in range(max(0, i-2), min(len(segments), i+3))}
+    keep.update(i for i, segment in enumerate(segments)
+                if any(segment.get('start_seconds', float('inf')) <= second+45 and
+                       segment.get('end_seconds', -float('inf')) >= second-45 for second in moments))
+    selected = {c.get('frame_seconds') for c in claims}
+    return {**payload, 'segments': [segment for i, segment in enumerate(segments) if i in keep],
+            'available_frames': [second for second in payload.get('available_frames', []) if second in selected],
+            'visual_observations': [f for f in payload.get('visual_observations', [])
+                                    if f.get('timestamp_seconds') in selected],
+            'evidence_scope': '本批引用原文、相邻上下文及证据时刻前后45秒；不是全片转写。只审本批条目。'}
+
+
+def repair_frames(issues, video, frames):
+    """Attach disputed originals, including an explicitly mentioned replacement timestamp."""
+    selected = {c.get('frame_seconds') for c in video['claims']}
+    mentioned = {int(v) for v in re.findall(r'(\d+)\s*秒', ' '.join(issues))}
+    return [(second, path) for second, path in frames if second in selected or second in mentioned]
+
+
 def review_candidate(directory, video, payload, frames, env):
     """Claims see their original images; global prose is checked separately."""
     issues, files = [], []
@@ -385,16 +411,23 @@ def review_candidate(directory, video, payload, frames, env):
         claims = copy.deepcopy([video['claims'][i] for i in indices])
         for claim in claims:
             claim['evidence_segment_ids'] = [f'S{ref:06d}' for ref in claim['evidence_segment_ids']]
-        signature = hashlib.sha256(json.dumps({'claims': claims, 'indices': indices}, sort_keys=True).encode()).hexdigest()[:16]
-        name = f'verification-v2-{signature}-claims-{batch_index:03}'
+        for index, claim in zip(indices, claims):
+            claim['claim_index'] = index
         instruction = VERIFY + ('\n本批只审global_claim_indices所列claims及标题、条件、引用与强调。'
             'overview和review_questions由独立全局审核检查，本批不因未提供它们或其他批的原图而拒绝。'
             '只指出确切证据冲突或影响含义的问题，意见须给原文段号或画面时刻；不要用常识替代原图。'
-            'checked_claim_indices必须逐一覆盖global_claim_indices。')
+            'candidate.claims是本批紧凑列表；每项claim_index才是原始全局编号，不能用全局编号访问本批数组。'
+            '例如第二批局部位置0的claim_index为8，并非数组越界。'
+            'checked_claim_indices必须返回每项claim_index，逐一覆盖global_claim_indices。')
         selected = {claim.get('frame_seconds') for claim in claims}
-        review = model_json(directory, name, instruction,
-            {**payload, 'candidate': {'claims': claims}, 'global_claim_indices': indices},
-            [(second, path) for second, path in frames if second in selected], env)
+        evidence = {**review_evidence(payload, claims), 'candidate': {'claims': claims},
+                    'global_claim_indices': indices}
+        images = [(second, path) for second, path in frames if second in selected]
+        identity = {'payload': evidence, 'instruction': instruction,
+                    'frames': [(second, sha(path)) for second, path in images]}
+        signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+        name = f'verification-v3-{signature}-claims-{batch_index:03}'
+        review = model_json(directory, name, instruction, evidence, images, env)
         checked = review.get('checked_claim_indices')
         accepted = (review.get('accepted') is True and review.get('issues') == [] and
                     isinstance(checked, list) and all(type(i) is int for i in checked) and
@@ -413,8 +446,6 @@ def review_candidate(directory, video, payload, frames, env):
     candidate = copy.deepcopy(video)
     for claim in candidate['claims']:
         claim['evidence_segment_ids'] = [f'S{ref:06d}' for ref in claim['evidence_segment_ids']]
-    signature = hashlib.sha256(json.dumps(candidate, sort_keys=True).encode()).hexdigest()[:16]
-    name = f'verification-v2-{signature}-global'
     selected = [item for item in frames if item[0] in {c.get('frame_seconds') for c in candidate['claims']}]
     if len(selected) > 8:
         selected = [selected[round(i*(len(selected)-1)/7)] for i in range(8)]
@@ -423,8 +454,12 @@ def review_candidate(directory, video, payload, frames, env):
         '摘要不能引入已审claims之外的新事实，复盘假设须有若/待核限定，不能误读为已发生事件。'
         '只指出确切证据冲突、重要遗漏或强调缺口，不为措辞偏好编造问题。'
         '输出JSON：{"accepted":true或false,"overview_checked":true,"review_questions_checked":true,"issues":[具体问题]}。')
-    review = model_json(directory, name, instruction,
-        {**payload, 'candidate': candidate, 'claims_independently_reviewed': True}, selected, env)
+    evidence = {**payload, 'candidate': candidate, 'claims_independently_reviewed': True}
+    identity = {'payload': evidence, 'instruction': instruction,
+                'frames': [(second, sha(path)) for second, path in selected]}
+    signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+    name = f'verification-v3-{signature}-global'
+    review = model_json(directory, name, instruction, evidence, selected, env)
     files.append(effective_response_file(directory, name))
     if not (review.get('accepted') is True and review.get('issues') == [] and
             review.get('overview_checked') is True and review.get('review_questions_checked') is True):
@@ -513,7 +548,8 @@ def analyze(capture_dir, info, env):
             '\n按审核意见修订候选，保留有依据的重点，删除无依据断言。严格区分画面、口述、转写识别和本报告推断；'
             '估值中位不是技术支撑。审核意见也是待核意见，须对照原文原图，不得为迎合意见改变原意或虚构事实。'
             '所有博主判断保留主体和条件，标题也不能把预测或观点写成已核实事实。使用给定S前缀证据编号，输出完整JSON。',
-            {**payload, 'candidate_needing_repair': result, 'review_issues': issues}, [], env)
+            {**payload, 'candidate_needing_repair': result, 'review_issues': issues},
+            repair_frames(issues, video, frames), env)
         try:
             analysis = build(result, repaired, True, candidate_name)
         except ValueError as error:

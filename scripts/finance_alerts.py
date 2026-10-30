@@ -101,7 +101,9 @@ def scan_missing_reports(root, *, now=None):
         cp=json.loads(raw);delivery=cp.get('delivery') or {};draft=cp.get('human_review_delivery') or {}
         if (delivery.get('status') in {'delivered','already_delivered'} or
                 draft.get('status') in {'delivered','already_delivered'}):continue
-        if status=='needs_review' or (status in {'queued','retry','processing'} and moment-updated>=5400):
+        # The worker first holds the job, then imports and verifies the draft.
+        # Definitive publication failures already enqueue immediately in handoff.
+        if (status=='needs_review' and moment-updated>=600) or (status in {'queued','retry','processing'} and moment-updated>=5400):
             enqueue(root,json.loads(source),'人工审核文档待交付',ReviewRejected(cp.get('review_issues') or ['处理超过90分钟或自动任务已暂停，尚未交付文档。']),
                 '目前没有已交付的正式文档或人工审核草稿；请核查原视频及发布状态。',
                 identity_key=['human-review-missing',vid]);queued+=1

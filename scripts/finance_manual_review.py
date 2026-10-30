@@ -57,18 +57,27 @@ def load_correction(capture, vid):
     for change in correction['changes']:
         index, field = change['claim_index'], change['field']
         if (type(index) is not int or not 0 <= index < len(candidate['claims'])
-                or field not in {'headline', 'text', 'uncertainty','evidence_segment_ids'} or (index, field) in seen):
+                or field not in {'headline', 'text', 'uncertainty','evidence_segment_ids','frame_seconds'} or (index, field) in seen):
             raise ValueError('Correction scope invalid')
         second=change.get('frame_seconds',correction['frame_seconds'])
         expected=change.get('frame_sha256',correction['frame_sha256'])
         frame=frames[second];image=(capture/vid/frame['path']).resolve()
-        if (candidate['claims'][index].get('frame_seconds')!=second or frame['sha256']!=expected
+        original_second = candidate['claims'][index].get('frame_seconds')
+        if field == 'frame_seconds':
+            original = frames[original_second]
+            original_image = (capture/vid/original['path']).resolve()
+            if (not original_image.is_relative_to((capture/vid).resolve())
+                    or digest(original_image) != original['sha256']):
+                raise ValueError('Original correction frame integrity mismatch')
+        if ((field != 'frame_seconds' and original_second!=second) or frame['sha256']!=expected
                 or not image.is_relative_to((capture/vid).resolve()) or digest(image)!=expected):
             raise ValueError('Correction claim frame mismatch')
         seen.add((index, field))
         after=change['after']
         valid=(isinstance(after,list) and bool(after) and all(isinstance(v,str) and v in segments for v in after)
                and len(set(after))==len(after)) if field=='evidence_segment_ids' else isinstance(after,str) and bool(after.strip())
+        if field == 'frame_seconds':
+            valid = type(after) is int and after == second and after in frames
         if candidate['claims'][index][field] != change['before'] or not valid:
             raise ValueError('Correction original text mismatch')
         candidate['claims'][index][field] = change['after']

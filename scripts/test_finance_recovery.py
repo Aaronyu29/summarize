@@ -137,6 +137,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_claims_use_original_frames_and_global_review_is_separate(self):
         frames=[(i,self.root/f'{i}.jpg') for i in range(9)]
+        for _, path in frames:path.write_bytes(b'original frame')
         video={'overview':'summary','review_questions':'follow-up','claims':[
             {'frame_seconds':i,'evidence_segment_ids':[i],'text':'condition'} for i in range(9)]}
         payload={'video_id':self.vid,'segments':[]}
@@ -153,6 +154,8 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn('overview',seen[0][1]['candidate'])
         self.assertIn('overview',seen[-1][1]['candidate'])
         self.assertEqual(video['claims'][0]['evidence_segment_ids'],[0])
+        self.assertEqual(seen[1][1]['candidate']['claims'][0]['claim_index'],8)
+        self.assertEqual(seen[1][1]['global_claim_indices'],[8])
 
     def test_malformed_coverage_does_not_pass_or_crash_global_check(self):
         video={'claims':[{'evidence_segment_ids':[0],'frame_seconds':1}]}
