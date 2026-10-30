@@ -839,7 +839,14 @@ def main():
                 terminal = handle_failure(jobs, vid, root, os.environ, error)
                 failed = failed or terminal
                 deferred += not terminal
-    failed = failed or bool(jobs.counts().get('needs_review'))
+    # A previously delivered review draft remains held, but is not a new
+    # operational failure on every otherwise idle recovery tick.
+    undelivered = False
+    for row in jobs.db.execute("SELECT checkpoint FROM jobs WHERE status='needs_review'"):
+        checkpoint = json.loads(row[0])
+        delivered = (checkpoint.get('human_review_delivery') or {}).get('status') in {'delivered','already_delivered'}
+        undelivered = undelivered or not delivered
+    failed = failed or undelivered
     if args.retry_only and not should_scan and not work_seen and not deferred and not failed:
         log('recovery_idle', counts=jobs.counts())
         return

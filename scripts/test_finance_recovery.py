@@ -128,6 +128,17 @@ class RecoveryTests(unittest.TestCase):
             main()
         discover.assert_not_called();process.assert_not_called()
 
+    def test_delivered_held_draft_does_not_make_each_idle_recovery_fail(self):
+        self.jobs.save(self.vid,status='needs_review',human_review_delivery={'status':'delivered','url':'https://example.test/draft'})
+        before=self.jobs.get(self.vid)
+        with patch.dict(os.environ,self.env),patch('sys.argv',['worker','--data',str(self.root),'--retry-only']), \
+             patch('finance_cloud.discover') as discover,patch('finance_cloud.process') as process, \
+             patch('finance_manual_review.handoff',return_value={'status':'already_delivered'}), \
+             patch('finance_cloud.flush_notices',return_value={}),patch('finance_cloud.Jobs',return_value=self.jobs):
+            main()
+        discover.assert_not_called();process.assert_not_called()
+        self.assertEqual(self.jobs.get(self.vid),before)
+
     def test_stale_publisher_lock_inode_can_be_reused_and_concurrency_is_blocked(self):
         path=self.root/'publisher.lock';path.write_text('crashed prior worker')
         with advisory_lock(path):
