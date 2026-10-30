@@ -1051,7 +1051,7 @@ def _sec_equity(store, out, now, transport):
     for i, form in enumerate(recent.get('form', [])):
         if form != '8-K' or '2.02' not in recent.get('items', [''] * len(recent['form']))[i]: continue
         publication = recent['acceptanceDateTime'][i]
-        if parse_time(publication) > moment or parse_time(publication) <= parse_time(latest_pub): continue
+        if parse_time(publication) > moment or (symbol!='AMZN' and parse_time(publication) <= parse_time(latest_pub)): continue
         accession = recent['accessionNumber'][i].replace('-', '')
         document = recent['primaryDocument'][i]
         if not re.fullmatch(r'\d{18}', accession) or not re.fullmatch(r'[A-Za-z0-9_.-]+\.html?', document):
@@ -1068,8 +1068,8 @@ def _sec_equity(store, out, now, transport):
             out['primary_evidence'].append(ev)
             out['primary_financials']['latest_earnings_release']={
                 'published_at':publication,'evidence_refs':[ev['id']], 'source_url':ev['source_url'],
-                'tagged_financial_rows_not_yet_available':True,
-                'instruction':'Newer original earnings announcement; reconcile with older tagged facts. Never label its future guidance as reported results.'}
+                'tagged_financial_rows_not_yet_available':parse_time(publication)>parse_time(latest_pub),
+                'instruction':'Original earnings announcement; reconcile its period with tagged facts. Never label its future guidance as reported results.'}
         except Exception:
             recovered=False
             if symbol=='INTC':
