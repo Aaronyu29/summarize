@@ -322,7 +322,7 @@ class Runner:
             if symbol=='GOOG' and enrichment_revision:
                 enrichment_revision+='-class-filing-v1'
             if symbol in {'AMZN','INTC','MSFT'} and enrichment_revision:
-                enrichment_revision+='-sec-facts-v1'
+                enrichment_revision+='-sec-facts-v2-fiscal-periods'
             if symbol=='QQQ' and enrichment_revision:
                 enrichment_revision+='-issuer-fund-v1'
             refresh_due = False

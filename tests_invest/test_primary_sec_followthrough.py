@@ -51,6 +51,18 @@ class PrimaryFollowthroughTests(unittest.TestCase):
             self.assertEqual(result['primary_financials']['facts'],[])
             self.assertEqual(result['primary_gaps'][0]['code'],'SEC_INSTRUMENT_IDENTITY_MISMATCH')
 
+    def test_twelve_month_observation_is_not_mislabelled_as_fiscal_full_year(self):
+        values=sources('AMZN');url=f'https://data.sec.gov/api/xbrl/companyfacts/CIK{SEC_ISSUERS["AMZN"]}.json'
+        data=json.loads(values[url].content)
+        data['facts']['us-gaap']['EarningsPerShareDiluted']['units']['USD/shares'].append(
+            dict(start='2025-10-01',end='2026-09-30',val=12,accn='latest',filed='2026-10-29',form='10-Q'))
+        values[url]=Response(json.dumps(data))
+        with Store(':memory:') as s:
+            out=enrich_primary_fundamentals(s,'AMZN',{},now=NOW,transport=Transport(values))
+            ttm=next(f for f in out['primary_financials']['facts'] if f['period_type']=='trailing_twelve_months')
+            self.assertEqual(ttm['fiscal_period'],'TTM');self.assertIsNone(ttm['fiscal_year'])
+            self.assertFalse(any(f['fiscal_period']=='FY' for f in out['primary_financials']['facts']))
+
     def test_qqq_official_identity_is_not_a_fabricated_etf_valuation(self):
         page='Invesco QQQ Trust, Series 1\nETF Shares are not individually redeemable. Details on the official issuer website.'
         with Store(':memory:') as s:

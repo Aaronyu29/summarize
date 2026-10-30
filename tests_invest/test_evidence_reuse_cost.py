@@ -142,6 +142,13 @@ class CompletedCycleIntegrationTests(unittest.TestCase):
         self.assertEqual(model.calls.count('review_plan'),2)
         self.assertEqual(len(self.store.items('research_critique_attempt')),1)
         self.assertEqual(len(self.store.items('research_critique_result')),1)
+        changed=copy.deepcopy(facts);changed['financial_report']={'new_reported_eps':'5'}
+        for _ in range(3):
+            result=ingest_archives(self.store,self.db,model=model,fundamentals={'NVDA':changed},now='2026-10-30T15:00:00Z')
+            self.assertEqual(result['errors'],[])
+        self.assertEqual(model.calls.count('compile_plan'),3)
+        self.assertEqual(model.calls.count('review_plan'),3)
+        self.assertEqual(len(self.store.items('research_critique_attempt')),1)
 
     def test_rejected_real_workflow_does_not_start_critique_on_future_ticks(self):
         model=critiques.CritiqueModel(always_reject=True)

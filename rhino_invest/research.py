@@ -1414,6 +1414,19 @@ def _critique_ready(store, plan, fundamental, moment):
         and bool(fundamental.get('financial_report') or (fundamental.get('primary_financials') or {}).get('facts')))
 
 
+def _video_feedback_available(store,source_id,symbol,fundamental_id):
+    """One semantic feedback pair per video/instrument, even after parser fixes.
+
+    New actual facts still receive their normal draft/review. They do not reset
+    this extra paid-feedback allowance or replay old critique operations.
+    """
+    for _,attempt in store.items('research_critique_attempt'):
+        base=(store.get('plan_operation',attempt.get('base_operation_id','')) or {}).get('plan') or {}
+        if base.get('symbol')==symbol and base.get('research_snapshot_id')==source_id:
+            if base.get('fundamental_evidence_id')!=fundamental_id:return False
+    return True
+
+
 def _record_critique_output_failure(store, key, critique, phase, error):
     if not critique:
         return
@@ -1483,11 +1496,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
         if previous and published_at and previous.get('source_published_at') and parse_time(previous['source_published_at']) > parse_time(published_at):
             continue
         fundamental, identity = _research_fundamental(store, symbol, (fundamentals or {}).get(symbol))
+        fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
         if model is not None and getattr(model, 'config', {}).get('reuse_evidence_cycles'):
             from .reuse import completed_evidence_plan
             reused = completed_evidence_plan(store, snapshot, symbol, fundamental, context, moment)
             since = getattr(model, 'config', {}).get('bounded_feedback_since')
-            # One pre-existing critique operation per primary evidence root;
+            # One pre-existing critique operation per video/instrument;
             # no event IDs/timestamps reset its completed request fences.
             if (reused is not None and not context and since and published_at
                     and parse_time(published_at) >= parse_time(since)
@@ -1497,12 +1511,12 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 official_abstention=(old_review.get('deterministic_preflight') is True
                     and fundamental['instrument_contract'].get('asset_type')=='etf'
                     and official_instrument.get('source_verified') is True)
-                if _critique_ready(store,reused,fundamental,moment) or official_abstention:
+                if (_critique_ready(store,reused,fundamental,moment)
+                        and _video_feedback_available(store,snapshot['id'],symbol,fid)) or official_abstention:
                     reused = None
             if reused is not None:
                 plans.append(reused)
                 continue
-        fid = stable_id('fundamentals', _stable_fundamentals(fundamental))
         if (not context and previous and previous.get('condition_resolution') is not None
                 and previous.get('research_snapshot_id') == snapshot['id']
                 and previous.get('fundamental_evidence_id') == fid
@@ -1547,7 +1561,9 @@ def compile_plan(store, snapshot, levels, model, fundamentals=None, now=None, co
                 if completed_calculation:
                     committed = completed_calculation
                     calculation_seed = None
-            if calculation_seed is None and committed and model_ready and _critique_ready(store, committed['plan'], fundamental, moment):
+            feedback_available=(not getattr(model,'config',{}).get('bounded_feedback_since')
+                or _video_feedback_available(store,snapshot['id'],symbol,fid))
+            if calculation_seed is None and committed and model_ready and feedback_available and _critique_ready(store, committed['plan'], fundamental, moment):
                 operation_key = stable_id('plan-critique-v1', source_operation_key, _logical_fundamentals(fundamental))
                 terminal = store.get('research_critique_result', operation_key)
                 repaired = store.get('plan_operation', operation_key)

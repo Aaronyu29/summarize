@@ -889,6 +889,9 @@ def _sec_equity(store, out, now, transport):
         raise EvidenceError('SEC_FACTS_ISSUER_MISMATCH')
     recent = submission['filings']['recent']
     accepted = {a: t for a, t in zip(recent['accessionNumber'], recent['acceptanceDateTime'])}
+    fiscal_ends={day for i,(form,day) in enumerate(zip(recent.get('form',[]),recent.get('reportDate',[])))
+        if form in {'10-K','10-K/A'} and re.fullmatch(r'\d{4}-\d{2}-\d{2}',day or '')
+        and parse_time(recent['acceptanceDateTime'][i])<=moment}
     tags = [('eps_diluted', ['EarningsPerShareDiluted'], 'USD/shares'),
             ('diluted_shares', ['WeightedAverageNumberOfDilutedSharesOutstanding'], 'shares'),
             ('net_income', ['NetIncomeLoss'], 'USD'),
@@ -908,7 +911,10 @@ def _sec_equity(store, out, now, transport):
                     start, end = _date(row['start']), _date(row['end'])
                     publication = accepted.get(row['accn']) or _published(row['filed'])
                     days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
-                    kind = 'annual' if 330 <= days <= 380 else 'quarterly' if 60 <= days <= 110 else None
+                    # A twelve-month observation ending in June is not Amazon's
+                    # fiscal FY. Only actual 10-K report dates establish FY ends.
+                    kind = ('annual' if end in fiscal_ends else 'trailing_twelve_months') if 330 <= days <= 380 else 'quarterly' if 60 <= days <= 110 else None
+                    if kind=='trailing_twelve_months' and fiscal_ends and end<=max(fiscal_ends):continue
                     value = decimal_value(row['val'])
                     if (not kind or not value.is_finite() or parse_time(publication) > moment
                             or end > str(moment.date()) or start > end): continue
@@ -918,7 +924,7 @@ def _sec_equity(store, out, now, transport):
                             row=row, published_at=publication, period_type=kind)
                 except (KeyError, ValueError, TypeError):
                     continue
-            for kind, limit in [('annual', 2), ('quarterly', 4)]:
+            for kind, limit in [('annual', 2), ('quarterly', 4), ('trailing_twelve_months',1)]:
                 chosen.extend(sorted((v for v in candidates.values() if v['period_type'] == kind),
                     key=lambda v: (v['row']['end'], v['published_at']), reverse=True)[:limit])
             if chosen: break  # Do not double count alternate revenue taxonomy tags.
@@ -943,8 +949,9 @@ def _sec_equity(store, out, now, transport):
         out['primary_financials']['facts'].append(dict(metric=item['metric'], value=str(decimal_value(row['val'])),
             currency='USD' if item['unit'].startswith('USD') else None,
             price_unit='per_share' if item['unit'] == 'USD/shares' else None,
-            unit=item['unit'], period_type=item['period_type'], fiscal_year=fiscal_year,
-            fiscal_period='FY' if item['period_type'] == 'annual' else f'Q{quarter}',
+            unit=item['unit'], period_type=item['period_type'],
+            fiscal_year=None if item['period_type']=='trailing_twelve_months' else fiscal_year,
+            fiscal_period='FY' if item['period_type'] == 'annual' else 'TTM' if item['period_type']=='trailing_twelve_months' else f'Q{quarter}',
             period_start=row['start'], period_end=row['end'], as_of=row['end'],
             published_at=item['published_at'], value_kind='reported', evidence_refs=[ev['id']],
             source_url=ev['source_url'], source_locator='SEC us-gaap/' + item['tag'] + '/' + row['accn'],
