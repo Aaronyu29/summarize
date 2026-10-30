@@ -82,6 +82,54 @@ def recover_plan_delimiters(content):
     return None
 
 
+def recover_review_array_close(content):
+    """Repair one lexer-proven array boundary in a completed review.
+
+    Require a unique full parse from one insertion or delimiter substitution.
+    Never complete a truncated
+    response, drop fields, modify scalar text, or invent an acceptance flag.
+    """
+    if not isinstance(content,str) or len(content)>65536:return None
+    def pairs(values):
+        result={}
+        for key,value in values:
+            if key in result:raise ValueError('Duplicate review key')
+            result[key]=value
+        return result
+    def invalid(value):raise ValueError('Nonfinite review value')
+    def finite(value):
+        result=float(value)
+        if not math.isfinite(result):raise ValueError('Nonfinite review value')
+        return result
+    def decode(value):return json.loads(value,object_pairs_hook=pairs,parse_constant=invalid,parse_float=finite)
+    try:
+        decode(content);return None
+    except json.JSONDecodeError as error:offset=error.pos
+    except ValueError:return None
+    if offset>=len(content) or content[offset]!='}':return None
+    stack=[];quoted=escaped=False
+    for char in content[:offset]:
+        if quoted:
+            if escaped:escaped=False
+            elif char=='\\':escaped=True
+            elif char=='"':quoted=False
+        elif char=='"':quoted=True
+        elif char in '{[':stack.append(char)
+        elif char in '}]':
+            if not stack or stack.pop()!=('{' if char=='}' else '['):return None
+    if quoted or len(stack)<2 or stack[-2:]!=['{','[']:return None
+    candidates={}
+    for value,edit in [(content[:offset]+']'+content[offset:],{'operation':'insert','offset':offset,'text':']'}),
+                       (content[:offset]+']'+content[offset+1:],{'operation':'replace','offset':offset,'before':'}','after':']'})]:
+        try:output=decode(value)
+        except ValueError:continue
+        if not (isinstance(output,dict) and type(output.get('accepted')) is bool
+                and isinstance(output.get('issues'),list) and isinstance(output.get('checks'),dict)
+                and all(type(output['checks'].get(key)) is bool for key in ('provenance','currency','unit','adr'))):continue
+        candidates.setdefault(json.dumps(output,sort_keys=True,ensure_ascii=False),(output,edit))
+    return next(iter(candidates.values())) if len(candidates)==1 else None
+
+
 class UnknownModelOutcome(RuntimeError):
     pass
 
@@ -233,7 +281,7 @@ class ModelGateway:
             'generation': self.generation_options(), 'image_detail': 'original'}
 
     def _recover_completed_plan(self, fingerprint, scope, purpose):
-        if purpose != 'compile_plan' or self.store.get('model_rejection', fingerprint):
+        if purpose not in {'compile_plan','review_plan'} or self.store.get('model_rejection', fingerprint):
             return None
         receipt = self.store.get('model_receipt', fingerprint)
         call = self.store.get('model_call', fingerprint)
@@ -247,16 +295,19 @@ class ModelGateway:
         if not isinstance(message, dict):
             return None
         content = message.get('content')
-        recovered = recover_plan_delimiters(content)
+        recovered = recover_plan_delimiters(content) if purpose=='compile_plan' else recover_review_array_close(content)
         if recovered is None:
             return None
         self._unknown_scope_gate(scope, purpose)
-        output, removed = recovered
-        proof = {'call_id': fingerprint, 'rule': 'unique-extra-object-closers-v1',
-                 'removed_character_offsets': removed, 'receipt_hash': stable_id(receipt),
+        output, changed = recovered
+        proof = {'call_id': fingerprint,
+                 'rule': 'unique-extra-object-closers-v1' if purpose=='compile_plan' else 'unique-review-array-boundary-v1',
+                 **({'removed_character_offsets':changed} if purpose=='compile_plan' else {'structural_edits':[changed]}),
+                 'receipt_hash': stable_id(receipt),
                  'raw_content_sha256': hashlib.sha256(content.encode()).hexdigest(),
                  'output_hash': stable_id(output), 'scalar_text_modified': False,
-                 'independent_review_required': True}
+                 'independent_review_required': purpose=='compile_plan',
+                 **({'original_review_decision_preserved':True} if purpose=='review_plan' else {})}
         self.store.put('model_syntax_recovery', fingerprint, proof, immutable=True)
         self.store.put('model_response', fingerprint, {'output': output,
                        'timestamp': receipt['timestamp'], 'syntax_recovery': proof}, immutable=True)

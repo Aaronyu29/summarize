@@ -2085,6 +2085,10 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
             store.put('research_workflow', workflow_id, {'id': workflow_id, 'plans': plans,
                 'level_ids': [l['id'] for l in levels], 'completed_at': workflow_moment,
                 'deferred_unresolved_risk': source_deferred}, immutable=True)
+            hold_key=stable_id(row[0],row[1]);hold=store.get('research_archive_hold',hold_key)
+            if hold and store.get('model_syntax_recovery',hold.get('call_id','')):
+                store.put('research_archive_hold',hold_key,dict(hold,status='resolved',
+                    resolution='original_review_recovered_without_paid_replay',resolved_at=moment))
             result['plans'].extend(plans)
             result['deferred_unresolved_risk'].extend(source_deferred)
         except Exception as exc:
