@@ -323,7 +323,10 @@ class PrimaryEvidenceTests(unittest.TestCase):
         original = {'financial_report': {'EPS': None}}
         data, transport = self.enrich('ZZZZ', {}, fundamentals=original)
         self.assertEqual(transport.calls, [])
-        self.assertEqual(data, dict(original, symbol='ZZZZ'))
+        self.assertEqual({k:v for k,v in data.items() if not k.startswith('primary_')}, dict(original, symbol='ZZZZ'))
+        self.assertEqual(data['primary_gaps'][0]['code'],'PRIMARY_ISSUER_ADAPTER_UNAVAILABLE')
+        self.assertTrue(data['primary_gaps'][0]['blocking'])
+        self.assertEqual(data['primary_refresh_after'],'2026-10-24T07:00:00+00:00')
 
 
 if __name__ == '__main__':
