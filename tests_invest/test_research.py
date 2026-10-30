@@ -256,6 +256,15 @@ class ResearchTests(unittest.TestCase):
         model = FixtureModel()
         # Already ingested archives keep their original complete-frame layout.
         ingest_archives(self.store, self.db, now=NOW)
+        snapshot=self.store.items('research_evidence')[0][1]
+        self.store.put('research_extraction_layout',stable_id('research-extraction-layout-v1',snapshot['id']),
+                       {'policy':'legacy_complete_frames','frame_seconds':list(range(100,117))},immutable=True)
+        from rhino_invest.research import _logical_fundamentals
+        first_batch=frames[:8]
+        logical=stable_id('research-logical-call','extract_levels',snapshot['id'],None,
+            _logical_fundamentals(None),None,[f['timestamp_seconds'] for f in first_batch])
+        self.store.put('model_call','legacy-fixture-request',{'call_scope':stable_id('model-logical-call-v1',logical,
+            [(f['timestamp_seconds'],f['sha256']) for f in first_batch])},immutable=True)
         first = ingest_archives(self.store, self.db, model=model,
             fundamentals={'NVDA': {'financial_report': {'period': '2025'}}}, now=NOW)
         self.assertEqual(first['errors'], [])

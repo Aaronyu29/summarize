@@ -288,8 +288,10 @@ class Runner:
                          {p["symbol"] for p in paper_initial.get("positions", [])} |
                          {p["symbol"] for p in reported_holdings(self.store, now=now)} |
                          {level["symbol"] for _, level in self.store.items("research_level")
-                          if isinstance(level.get("symbol"), str)
-                          and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}',level['symbol'])})
+                          if level.get('verified') is True and level.get('kind') in WATCH_KINDS
+                          and isinstance(level.get("symbol"), str)} |
+                         {symbol for symbol,_ in self.store.items('research_discovered_symbol')
+                          if re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}',symbol)})
         quotes = {}
         if symbols:
             try:

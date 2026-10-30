@@ -508,6 +508,39 @@ def _frames(snapshot):
     return result
 
 
+def _extraction_layout(store, snapshot):
+    key=stable_id('research-extraction-layout-v1',snapshot['id'])
+    next_key=stable_id('research-extraction-layout-v2',snapshot['id'])
+    latest=store.get('research_extraction_layout',next_key)
+    if latest is not None:
+        return latest
+    existing=store.get('research_extraction_layout',key)
+    if existing is not None and existing.get('policy')=='accepted_claim_frames':
+        return existing
+    # The foreground seed may archive a new source before the research thread
+    # reaches it. Evidence existence is not proof that a paid request occurred.
+    scopes=set()
+    for offset in range(0,len(snapshot['frames']),8):
+        batch=snapshot['frames'][offset:offset+8]
+        seconds=[f['timestamp_seconds'] for f in batch]
+        for purpose in ('extract_levels','verify_levels'):
+            logical=stable_id('research-logical-call',purpose,snapshot['id'],None,
+                _logical_fundamentals(None),None,seconds)
+            scopes.add(stable_id('model-logical-call-v1',logical,[(f['timestamp_seconds'],f['sha256']) for f in batch]))
+    started=any(call.get('call_scope') in scopes for _,call in store.items('model_call'))
+    if existing is not None and started:
+        return existing
+    selected={c.get('frame_seconds') for c in snapshot.get('analysis',{}).get('claims',[])}
+    selected.discard(None)
+    focus=bool(selected) and not started
+    layout={'policy':'accepted_claim_frames' if focus else 'legacy_complete_frames',
+        'frame_seconds':[f['timestamp_seconds'] for f in snapshot['frames']
+                         if not focus or f['timestamp_seconds'] in selected]}
+    # Preserve an unissued legacy layout as audit; no paid scope may be reset.
+    store.put('research_extraction_layout',next_key if existing is not None else key,layout,immutable=True)
+    return layout
+
+
 def _verify_levels(snapshot, extracted, checked):
     levels = extracted.get('levels', [])
     checks = checked.get('checks', [])
@@ -2008,19 +2041,7 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 levels = extraction['levels']
             else:
                 levels = []
-                layout_key=stable_id('research-extraction-layout-v1',snapshot['id'])
-                layout=store.get('research_extraction_layout',layout_key)
-                if layout is None:
-                    # Existing requests retain their exact original frame batches.
-                    # New videos reuse the report's substantive frames, not every
-                    # repeated slide or sidebar quote in the capture interval.
-                    selected={c.get('frame_seconds') for c in snapshot.get('analysis',{}).get('claims',[])}
-                    selected.discard(None)
-                    use_focus=not existing and bool(selected)
-                    layout={'policy':'accepted_claim_frames' if use_focus else 'legacy_complete_frames',
-                        'frame_seconds':[f['timestamp_seconds'] for f in snapshot['frames']
-                            if not use_focus or f['timestamp_seconds'] in selected]}
-                    store.put('research_extraction_layout',layout_key,layout,immutable=True)
+                layout=_extraction_layout(store,snapshot)
                 selected_frames=[f for f in snapshot['frames'] if f['timestamp_seconds'] in layout['frame_seconds']]
                 frames = _frames(dict(snapshot,frames=selected_frames))
                 instruction=EXTRACT
@@ -2031,8 +2052,11 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 for start in range(0, len(frames), 8):
                     batch = frames[start:start + 8]
                     batch_source = dict(snapshot, frames=selected_frames[start:start + 8])
-                    extracted = _run(model, 'extract_levels', {'instruction': instruction,
-                        'source': batch_source, 'provided_frame_seconds': [s for s, _ in batch]}, batch, workflow_moment)
+                    request={'instruction':instruction,'source':batch_source,
+                             'provided_frame_seconds':[s for s,_ in batch]}
+                    if layout['policy']=='accepted_claim_frames':
+                        request['topic_scope']=[c.get('headline') for c in snapshot.get('analysis',{}).get('claims',[])]
+                    extracted = _run(model, 'extract_levels', request, batch, workflow_moment)
                     checked = _run(model, 'verify_levels', {'instruction': VERIFY, 'levels': extracted,
                         'source': batch_source}, batch, workflow_moment)
                     levels.extend(_verify_levels(batch_source, extracted, checked))
@@ -2040,6 +2064,13 @@ def ingest_archives(store, archive_db, *, model=None, symbols=None, fundamentals
                 store.put('research_extraction', extraction_key, {'levels': levels}, immutable=True)
             for level in levels:
                 store.put('research_level', level['id'], level, immutable=True)
+                layout=(store.get('research_extraction_layout',stable_id('research-extraction-layout-v2',snapshot['id']))
+                    or store.get('research_extraction_layout',stable_id('research-extraction-layout-v1',snapshot['id'])) or {})
+                if (layout.get('policy')=='accepted_claim_frames'
+                        and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}',str(level.get('symbol','')))):
+                    store.put('research_discovered_symbol',level['symbol'],{'symbol':level['symbol'],
+                        'video_id':snapshot['video_id'],'source_id':snapshot['id'],
+                        'purpose':'fetch_independent_fundamentals_only','approval':False})
             if symbols:
                 levels = [l for l in levels if l.get('symbol') in symbols]
             if defer_missing_fundamentals:
