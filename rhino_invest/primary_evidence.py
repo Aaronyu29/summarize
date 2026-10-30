@@ -35,6 +35,7 @@ SOXX_HOLDINGS = "https://www.ishares.com/us/products/239705/ishares-semiconducto
 CIRCLE_IR = "https://investor.circle.com/overview/default.aspx"
 SEC_ISSUERS = {"AMZN": "0001018724", "INTC": "0000050863", "MSFT": "0000789019"}
 QQQ_PAGE = 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html'
+INTEL_RESULTS = 'https://www.intc.com/financial-info/financial-results'
 CIRCLE_Q2_2026 = "https://s206.q4cdn.com/265218871/files/doc_news/2026/Aug/05/CIRCLE_Q2-2026.pdf"
 CIRCLE_FY2025 = "https://s206.q4cdn.com/265218871/files/doc_earnings/2025/q4/earnings-result/4Q25-Earnings-Release.pdf"
 SOXX_SPLIT_PDF = "https://www.ishares.com/us/literature/summary-prospectus/sp-ishares-phlx-semiconductor-etf-3-31.pdf"
@@ -109,6 +110,7 @@ def _allowed(url):
         return False
     return ((p.hostname == "investor.tsmc.com" and p.path.startswith("/english/")) or
             (url == QQQ_PAGE) or
+            (p.hostname=='www.intc.com' and (url==INTEL_RESULTS or p.path.startswith('/news-events/press-releases/detail/'))) or
             (p.hostname == "data.sec.gov" and any(p.path in {
                 f"/submissions/CIK{cik}.json", f"/api/xbrl/companyfacts/CIK{cik}.json"}
                 for cik in SEC_ISSUERS.values())) or
@@ -979,7 +981,29 @@ def _sec_equity(store, out, now, transport):
                 'tagged_financial_rows_not_yet_available':True,
                 'instruction':'Newer original earnings announcement; reconcile with older tagged facts. Never label its future guidance as reported results.'}
         except Exception:
-            _gap(out['primary_gaps'],'SEC_NEWER_EARNINGS_RELEASE_UNAVAILABLE','latest_earnings_release',url)
+            recovered=False
+            if symbol=='INTC':
+                try:
+                    index=_fetch(store,INTEL_RESULTS,now,transport)
+                    parser=_HTML();parser.feed(base64.b64decode(index['raw_base64']).decode('utf-8-sig'))
+                    links=[urljoin(INTEL_RESULTS,href) for href,label in parser.links
+                        if label.strip().lower()=='earnings release' and _allowed(urljoin(INTEL_RESULTS,href))]
+                    if not links:raise EvidenceError('INTEL_RELEASE_LINK_MISSING')
+                    release=_fetch(store,links[0],now,transport)
+                    if ('Intel Reports' not in release['content'] or 'Financial Results' not in release['content']
+                            or _date(_line(release['content'],DATE).group()) != recent['filingDate'][i]):
+                        raise EvidenceError('INTEL_RELEASE_DATE_MISMATCH')
+                    ev=_evidence(store,release,published_at=publication)
+                    out['primary_evidence'].append(ev)
+                    out['primary_financials']['latest_earnings_release']={
+                        'published_at':publication,'evidence_refs':[ev['id']], 'source_url':ev['source_url'],
+                        'tagged_financial_rows_not_yet_available':True,
+                        'instruction':'Official issuer announcement matched to the SEC Item 2.02 filing date; newer than tagged history. Separate GAAP, non-GAAP and forward guidance.'}
+                    recovered=True
+                except Exception:
+                    pass
+            if not recovered:
+                _gap(out['primary_gaps'],'SEC_NEWER_EARNINGS_RELEASE_UNAVAILABLE','latest_earnings_release',url)
         break  # One latest announced quarter, at most two bounded document fetches.
     if (moment.date() - datetime.fromisoformat(max(r['row']['end'] for r in selected)).date()).days > 200:
         _gap(out['primary_gaps'], 'SEC_LATEST_PERIOD_STALE', symbol)

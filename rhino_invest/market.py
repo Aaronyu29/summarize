@@ -326,6 +326,7 @@ def _primary_verified(store, record):
         official = official or (host=='d18rn0p25nwr6d.cloudfront.net' and parsed.path=='/CIK-0001652044/513183d2-787c-48f5-8da7-8a897b1649e0.html')
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/265218871/files/'))
         official = official or (source['source_url'] == 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html')
+        official = official or (host=='www.intc.com' and parsed.path.startswith('/news-events/press-releases/detail/'))
         if parsed.scheme != 'https' or not official:
             return False
         if hashlib.sha256(source['content'].encode('utf-8')).hexdigest() != source.get('sha256'):

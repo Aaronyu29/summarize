@@ -2,7 +2,7 @@ import copy
 import json
 import unittest
 from unittest.mock import patch
-from rhino_invest.primary_evidence import enrich_primary_fundamentals, SEC_ISSUERS, QQQ_PAGE
+from rhino_invest.primary_evidence import enrich_primary_fundamentals, SEC_ISSUERS, QQQ_PAGE, INTEL_RESULTS
 from rhino_invest.market import normalize_fundamentals
 from rhino_invest.store import Store
 from rhino_invest.common import stable_id, validate_plan, classify_plan_validation
@@ -61,6 +61,23 @@ class PrimaryFollowthroughTests(unittest.TestCase):
             self.assertIsNone(result['instrument_contract']['quote_price_unit'])
             self.assertFalse(result['instrument_contract']['stock_eps_valuation_applicable'])
             self.assertTrue(result['primary_gaps']);self.assertNotIn('etf_valuation',result)
+
+    def test_newer_intel_issuer_fallback_must_match_sec_earnings_date(self):
+        for date,ok in [('October 29, 2026',True),('July 23, 2026',False)]:
+            values=sources('INTC');url=f'https://data.sec.gov/submissions/CIK{SEC_ISSUERS["INTC"]}.json'
+            listing=json.loads(values[url].content)
+            listing['filings']['recent'].update(form=['10-Q','10-Q','8-K'],items=['','','2.02'],
+                accessionNumber=['latest','future','0000050863-26-000188'],
+                acceptanceDateTime=['2026-10-29T20:00:00Z','2026-10-30T06:00:00Z','2026-10-30T01:00:00Z'],
+                primaryDocument=['q.htm','future.htm','intc-20261029.htm'],filingDate=['2026-10-29','2026-10-30','2026-10-29'])
+            values[url]=Response(json.dumps(listing))
+            release='https://www.intc.com/news-events/press-releases/detail/1786/intel-reports-third-quarter-2026-financial-results'
+            values[INTEL_RESULTS]=Response('<html><p>Intel official quarterly financial results and reports for shareholders and public investors</p><a href="'+release+'">Earnings Release</a></html>',kind='text/html')
+            values[release]=Response('Intel Reports Third-Quarter 2026 Financial Results\n'+date+'\nActual GAAP results and separately labelled fourth quarter guidance.')
+            with Store(':memory:') as s:
+                result=enrich_primary_fundamentals(s,'INTC',{},now=NOW,transport=Transport(values))
+                self.assertEqual('latest_earnings_release' in result['primary_financials'],ok)
+                self.assertEqual(bool(result['primary_gaps']),not ok)
 
     def test_every_failed_plan_gets_durable_system_followup_without_paid_retries(self):
         with Store(':memory:') as s:
