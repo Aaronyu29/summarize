@@ -321,6 +321,10 @@ class Runner:
                 enrichment_revision += '-remediation-v1'  # Refresh the issuer's dated NAV/PE/holdings once.
             if symbol=='GOOG' and enrichment_revision:
                 enrichment_revision+='-class-filing-v1'
+            if symbol in {'AMZN','INTC','MSFT'} and enrichment_revision:
+                enrichment_revision+='-sec-facts-v1'
+            if symbol=='QQQ' and enrichment_revision:
+                enrichment_revision+='-issuer-fund-v1'
             refresh_due = False
             if cached and (cached.get("data") or {}).get("primary_refresh_after"):
                 try:
@@ -731,7 +735,7 @@ class Runner:
                         summary["reviewed_count"] += 1
                 self.store.put("review_trigger", key, dict(trigger, processed=True, processed_at=self.clock()))
             from .remediation import update_research_followups
-            update_research_followups(self.store,self.clock())
+            summary['followups'] = update_research_followups(self.store,self.clock())
             summary.update(timestamp=self.clock(), error_count=len(summary["errors"]), deferred_count=len(summary["deferred"]),
                            status="blocked" if summary["errors"] else "deferred" if summary["deferred"] else "completed")
             self.store.put("research_worker", "latest", summary)

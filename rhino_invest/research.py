@@ -141,7 +141,7 @@ VERIFY = '''Reverify every extracted individual level against original transcrip
 including units, currency, dates, adjustment, horizon and conditions. Return
 {"checks":[{"index":0,"verified":false,"issues":[]}]} with exactly one check per level.
 Missing or ambiguous evidence must be verified=false; never repair by guessing.'''
-COMPILE_TEMPLATE = {'plan': {'symbol': None, 'thesis': None, 'horizon_months': None,
+COMPILE_TEMPLATE = {'plan': {'symbol': None, 'research_intent': None, 'thesis': None, 'horizon_months': None,
     'next_review_at': None, 'thesis_valid_from': None, 'horizon_until': None,
     'currency': None, 'price_unit': None, 'is_adr': None,
     'entry': {'low': None, 'high': None, 'amount_usd': None, 'basis': None,
@@ -232,6 +232,10 @@ take_profit=[], with explicit source-backed reasoning and preserved genuine cond
 If valuation cannot be established, use valuation_basis.kind=insufficient_valuation,
 targets=[], and explain the exact evidence gaps; do not fabricate EPS, a target or buy band.
 No-buy research never authorizes execution and does not certify a valuation.
+Always set plan.research_intent explicitly to buy or no_buy INSIDE plan. A prose
+abstention without research_intent=no_buy is an invalid purchase proposal. For
+insufficient_valuation retain only verified facts and explicit gaps, use targets=[],
+and leave unverified price_unit null rather than claiming a verified unit.
 '''
 REVIEW = '''Independently review each target scenario, arithmetic, explicit assumptions,
 financial source periods/units, ADR conversion, downside, entry/stop/TP, thesis invalidation
@@ -626,12 +630,12 @@ def _assess_plan(plan, review, evidence_ids, fundamentals, levels=()):
                 issues.append('Entry source zone bounds unresolved')
     elif entry.get('basis') != 'independent_valuation':
         issues.append('Explicit entry basis required: source_level or independent_valuation')
-    if entry.get('basis') == 'independent_valuation':
+    if entry.get('basis') == 'independent_valuation' and not evidence_limited_no_buy(plan):
         contract = fundamentals.get('instrument_contract') or {}
         if (contract.get('quote_price_unit') != plan.get('price_unit')
                 or contract.get('quote_price_unit') not in {'per_share', 'per_adr'}):
             issues.append('Independent valuation instrument unit lacks verified primary identity')
-    if not isinstance(entry.get('conditions'), list) or not entry['conditions']:
+    if (not isinstance(entry.get('conditions'), list) or not entry['conditions']) and not evidence_limited_no_buy(plan):
         issues.append('Explicit entry conditions required')
     elif entry.get('basis') == 'source_level' and len(selected) == 1:
         if selected[0].get('conditions') not in entry['conditions']:

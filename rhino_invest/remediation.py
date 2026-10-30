@@ -286,17 +286,32 @@ def update_research_followups(store,now):
     """No-buy is an interim result; only a verified priced entry closes follow-up."""
     from .common import validate_plan
     from .decisions import _has_provenance
-    for symbol,followup in store.items('research_followup'):
-        if followup.get('status')!='researching':continue
-        plan=store.get('plan',stable_id('investment-plan',symbol))
-        if not plan:continue
+    summary={'researching':0,'ready':0,'approved_no_buy':0,'awaiting_evidence':0}
+    for _,plan in store.items('plan'):
+        if plan.get('status') in {'superseded','invalidated'}:continue
+        symbol=plan['symbol']
+        followup=store.get('research_followup',symbol) or {'symbol':symbol,'created_at':now,'status':'researching'}
+        if followup.get('status') not in {'researching','ready'}:continue
         ready=(plan.get('status')=='active' and (plan.get('research_assessment') or {}).get('status')=='approved'
                and not validate_plan(plan) and _has_provenance(store,plan))
         progress={'last_plan_revision':plan.get('revision'),'last_fundamental_evidence_id':plan.get('fundamental_evidence_id'),
-                  'last_assessment':(plan.get('research_assessment') or {}).get('status')}
+                  'last_assessment':(plan.get('research_assessment') or {}).get('status'),
+                  'status':'ready' if ready else 'researching',
+                  'source_id':plan.get('research_snapshot_id'),
+                  'system_owned':True}
+        cached=store.get('fundamental_cache',symbol) or {};data=cached.get('data') or {}
+        gaps=[g for g in plan.get('research_gaps',[]) if isinstance(g,dict) and g.get('blocking')]
+        progress.update(evidence_gaps=gaps, primary_gaps=data.get('primary_gaps',[]),
+            next_public_evidence_check=data.get('primary_refresh_after'),
+            next_action='monitor_entry' if ready else 'refresh_public_evidence_then_review',
+            repeat_same_evidence_paid_calls_allowed=False)
+        summary['ready' if ready else 'researching']+=1
+        if progress['last_assessment']=='approved_no_buy':summary['approved_no_buy']+=1
+        if gaps or progress['primary_gaps']:summary['awaiting_evidence']+=1
         if ready:progress.update(status='ready',completed_at=now)
         if any(followup.get(key)!=value for key,value in progress.items()):
             store.put('research_followup',symbol,dict(followup,**progress))
+    return summary
 
 
 def resolution_errors(plan, review, context, known):

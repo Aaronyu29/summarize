@@ -325,6 +325,7 @@ def _primary_verified(store, record):
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/479360582/files/doc_financials/'))
         official = official or (host=='d18rn0p25nwr6d.cloudfront.net' and parsed.path=='/CIK-0001652044/513183d2-787c-48f5-8da7-8a897b1649e0.html')
         official = official or (host == 's206.q4cdn.com' and parsed.path.startswith('/265218871/files/'))
+        official = official or (source['source_url'] == 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html')
         if parsed.scheme != 'https' or not official:
             return False
         if hashlib.sha256(source['content'].encode('utf-8')).hexdigest() != source.get('sha256'):
@@ -485,6 +486,12 @@ def instrument_contract(fundamentals, *, store=None):
     instrument = primary.get('instrument')
     instrument = instrument if isinstance(instrument, dict) else {}
     if primary.get('symbol') == symbol and _primary_verified(store, instrument):
+        if instrument.get('asset_type') == 'etf' and instrument.get('stock_eps_valuation_applicable') is False:
+            asset_type = 'etf'
+            contract.update(asset_type='etf', stock_eps_valuation_applicable=False,
+                classification_basis='Verified official issuer ETF disclosure',
+                financial_report_scope='fund accounting; not operating-company EPS',
+                valuation_gap='ETF NAV, holdings and constituent/index earnings research unavailable')
         unit = instrument.get('quote_price_unit')
         currency = instrument.get('quote_currency')
         excerpt = instrument.get('source_excerpt', '')

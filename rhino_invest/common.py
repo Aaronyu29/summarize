@@ -220,6 +220,16 @@ def classify_plan_validation(plan) -> dict[str, list[str]]:
         and isinstance(conditions, list) and bool(conditions)
         and all(isinstance(value, str) and value.strip() for value in conditions))
     deferred = set()
+    if evidence_limited_no_buy(plan):
+        # An explicit, price-free abstention has no executable price basis.
+        # This only changes research classification: strict execution validation
+        # still rejects no-buy, missing prices, units and entry predicates.
+        deferred.update({'entry.low must be positive', 'entry.high must be positive',
+            'take_profit schedule required', 'stop.price must be positive',
+            'evidenced target scenarios required', 'no-buy research cannot authorize execution',
+            'entry conditions are unparsed', 'entry_conditions_unverified'})
+        if plan.get('price_unit') is None:
+            deferred.add('price_unit must be per_share/per_adr')
     if conditional:
         if plan.get("conditions_parsed") is not True:
             deferred.add("entry conditions are unparsed")

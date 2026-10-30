@@ -33,6 +33,8 @@ GOOGLE_SUBMISSIONS='https://data.sec.gov/submissions/CIK0001652044.json'
 SOXX_PAGE = "https://www.ishares.com/us/products/239705/ishares-phlx-semiconductor-etf"
 SOXX_HOLDINGS = "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf/latest-holdings.csv"
 CIRCLE_IR = "https://investor.circle.com/overview/default.aspx"
+SEC_ISSUERS = {"AMZN": "0001018724", "INTC": "0000050863", "MSFT": "0000789019"}
+QQQ_PAGE = 'https://www.invesco.com/us/en/financial-products/etfs/invesco-qqq-trust-series-1.html'
 CIRCLE_Q2_2026 = "https://s206.q4cdn.com/265218871/files/doc_news/2026/Aug/05/CIRCLE_Q2-2026.pdf"
 CIRCLE_FY2025 = "https://s206.q4cdn.com/265218871/files/doc_earnings/2025/q4/earnings-result/4Q25-Earnings-Release.pdf"
 SOXX_SPLIT_PDF = "https://www.ishares.com/us/literature/summary-prospectus/sp-ishares-phlx-semiconductor-etf-3-31.pdf"
@@ -106,6 +108,12 @@ def _allowed(url):
     if p.scheme != "https" or p.username or p.password or p.port not in (None, 443):
         return False
     return ((p.hostname == "investor.tsmc.com" and p.path.startswith("/english/")) or
+            (url == QQQ_PAGE) or
+            (p.hostname == "data.sec.gov" and any(p.path in {
+                f"/submissions/CIK{cik}.json", f"/api/xbrl/companyfacts/CIK{cik}.json"}
+                for cik in SEC_ISSUERS.values())) or
+            (p.hostname == 'www.sec.gov' and any(p.path.startswith('/Archives/edgar/data/'+str(int(cik))+'/')
+                for cik in SEC_ISSUERS.values()) and p.path.endswith(('.htm','.html'))) or
             (url == GOOGLE_10Q_2026Q2) or
             (url == GOOGLE_SUBMISSIONS) or
             (p.hostname=='www.sec.gov' and p.path.startswith('/Archives/edgar/data/1652044/') and p.path.endswith(('.htm','.html'))) or
@@ -844,17 +852,153 @@ def _soxx(store, out, now, transport):
             source_locator="issuer fund heading and official Historical NAV per Share column")
 
 
+def _qqq(store, out, now, transport):
+    source = _fetch(store, QQQ_PAGE, now, transport)
+    title = 'Invesco QQQ Trust, Series 1'
+    share_text = 'ETF Shares are not individually redeemable'
+    if title not in source['content'] or share_text not in source['content']:
+        raise EvidenceError('QQQ_ISSUER_PAGE_IDENTITY_CHANGED')
+    ev = _evidence(store, source)
+    out['primary_evidence'].append(ev)
+    out['primary_financials']['instrument'] = dict(asset_type='etf', stock_eps_valuation_applicable=False,
+        evidence_refs=[ev['id']], source_excerpt=title, unit_source_excerpt=share_text,
+        source_locator='Official Invesco QQQ issuer page and ETF shares disclosure')
+    # Server-rendered HTML currently omits the dated fund data. Do not turn a
+    # navigation heading, trust-account EPS or guessed endpoint into NAV/PE.
+    _gap(out['primary_gaps'], 'QQQ_DATED_NAV_HOLDINGS_INDEX_EARNINGS_UNAVAILABLE', 'etf_valuation', QQQ_PAGE)
+
+
+def _sec_equity(store, out, now, transport):
+    """Select dated SEC facts, never annualize YTD or infer a share-class split.
+
+    Raw responses remain immutable; the model receives only the selected original
+    JSON rows and their explicit units, accession and original period boundaries.
+    """
+    symbol = out['symbol']; cik = SEC_ISSUERS[symbol]; moment = parse_time(now)
+    listing = _fetch(store, f'https://data.sec.gov/submissions/CIK{cik}.json', now, transport)
+    submission = json.loads(listing['content'])
+    if (int(submission.get('cik', -1)) != int(cik)
+            or symbol not in submission.get('tickers', [])
+            or submission.get('exchanges', [])[submission['tickers'].index(symbol)] != 'Nasdaq'):
+        raise EvidenceError('SEC_INSTRUMENT_IDENTITY_MISMATCH')
+    source = _fetch(store, f'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json', now, transport)
+    data = json.loads(source['content'])
+    if int(data.get('cik', -1)) != int(cik):
+        raise EvidenceError('SEC_FACTS_ISSUER_MISMATCH')
+    recent = submission['filings']['recent']
+    accepted = {a: t for a, t in zip(recent['accessionNumber'], recent['acceptanceDateTime'])}
+    tags = [('eps_diluted', ['EarningsPerShareDiluted'], 'USD/shares'),
+            ('diluted_shares', ['WeightedAverageNumberOfDilutedSharesOutstanding'], 'shares'),
+            ('net_income', ['NetIncomeLoss'], 'USD'),
+            ('operating_income', ['OperatingIncomeLoss'], 'USD'),
+            ('revenue', ['RevenueFromContractWithCustomerExcludingAssessedTax', 'Revenues', 'SalesRevenueNet'], 'USD'),
+            ('income_tax_expense', ['IncomeTaxExpenseBenefit'], 'USD'),
+            ('operating_cash_flow', ['NetCashProvidedByUsedInOperatingActivities'], 'USD'),
+            ('capital_expenditure', ['PaymentsToAcquirePropertyPlantAndEquipment'], 'USD')]
+    selected = []; gaap = data.get('facts', {}).get('us-gaap', {})
+    for metric, alternatives, unit in tags:
+        chosen = []
+        for tag in alternatives:
+            field = gaap.get(tag, {}); candidates = {}
+            for row in field.get('units', {}).get(unit, []):
+                try:
+                    if row.get('form') not in {'10-Q', '10-K'}: continue
+                    start, end = _date(row['start']), _date(row['end'])
+                    publication = accepted.get(row['accn']) or _published(row['filed'])
+                    days = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
+                    kind = 'annual' if 330 <= days <= 380 else 'quarterly' if 60 <= days <= 110 else None
+                    value = decimal_value(row['val'])
+                    if (not kind or not value.is_finite() or parse_time(publication) > moment
+                            or end > str(moment.date()) or start > end): continue
+                    key = (kind, start, end)
+                    if key not in candidates or publication > candidates[key]['published_at']:
+                        candidates[key] = dict(metric=metric, tag=tag, label=field.get('label'), unit=unit,
+                            row=row, published_at=publication, period_type=kind)
+                except (KeyError, ValueError, TypeError):
+                    continue
+            for kind, limit in [('annual', 2), ('quarterly', 4)]:
+                chosen.extend(sorted((v for v in candidates.values() if v['period_type'] == kind),
+                    key=lambda v: (v['row']['end'], v['published_at']), reverse=True)[:limit])
+            if chosen: break  # Do not double count alternate revenue taxonomy tags.
+        selected.extend(chosen)
+    eps = next((r for r in selected if r['metric'] == 'eps_diluted' and r['unit'] == 'USD/shares'), None)
+    if not eps or 'per share' not in str(eps['label']).lower():
+        raise EvidenceError('SEC_DILUTED_COMMON_EPS_UNIT_MISSING')
+    identity = {k: submission[k] for k in ('cik', 'name', 'tickers', 'exchanges')}
+    # Keep the source raw hash linked to the full stored response, but bound the
+    # excerpt before evidence-bundle construction (companyfacts can exceed 4MB).
+    excerpt = json.dumps({'identity': identity, 'entityName': data['entityName'], 'selected_us_gaap': selected},
+        ensure_ascii=False, sort_keys=True)
+    extracted = dict(source, content=excerpt, sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
+        parser=VERSION + ':sec-selected-facts-v1')
+    latest_pub = max(r['published_at'] for r in selected)
+    ev = _evidence(store, extracted, published_at=latest_pub, period_end=max(r['row']['end'] for r in selected))
+    out['primary_evidence'].append(ev)
+    for item in selected:
+        row = item['row']; end = datetime.fromisoformat(row['end'])
+        fiscal_year = end.year + (1 if symbol == 'MSFT' and end.month > 6 else 0)
+        quarter = ((end.month - 1 - (6 if symbol == 'MSFT' else 0)) % 12) // 3 + 1
+        out['primary_financials']['facts'].append(dict(metric=item['metric'], value=str(decimal_value(row['val'])),
+            currency='USD' if item['unit'].startswith('USD') else None,
+            price_unit='per_share' if item['unit'] == 'USD/shares' else None,
+            unit=item['unit'], period_type=item['period_type'], fiscal_year=fiscal_year,
+            fiscal_period='FY' if item['period_type'] == 'annual' else f'Q{quarter}',
+            period_start=row['start'], period_end=row['end'], as_of=row['end'],
+            published_at=item['published_at'], value_kind='reported', evidence_refs=[ev['id']],
+            source_url=ev['source_url'], source_locator='SEC us-gaap/' + item['tag'] + '/' + row['accn'],
+            source_excerpt=json.dumps(item, ensure_ascii=False, sort_keys=True)))
+    out['primary_financials']['instrument'] = dict(is_adr=False, quote_currency='USD',
+        quote_price_unit='per_share', stock_eps_valuation_applicable=True, evidence_refs=[ev['id']],
+        source_excerpt=json.dumps(eps, ensure_ascii=False, sort_keys=True),
+        source_locator='SEC CIK/ticker/exchange identity and reported diluted EPS USD/shares unit')
+    out['primary_financials']['limitations'] = [
+        'Reported GAAP history only; not a forward earnings forecast or verification of non-GAAP adjustments.',
+        'No quarterly cash-flow values are inferred from year-to-date figures; fiscal dates are preserved.']
+    # Earnings releases can precede the tagged 10-Q by a day or more. Discover
+    # Item 2.02 filings; don't present old XBRL history as the latest announcement.
+    for i, form in enumerate(recent.get('form', [])):
+        if form != '8-K' or '2.02' not in recent.get('items', [''] * len(recent['form']))[i]: continue
+        publication = recent['acceptanceDateTime'][i]
+        if parse_time(publication) > moment or parse_time(publication) <= parse_time(latest_pub): continue
+        accession = recent['accessionNumber'][i].replace('-', '')
+        document = recent['primaryDocument'][i]
+        if not re.fullmatch(r'\d{18}', accession) or not re.fullmatch(r'[A-Za-z0-9_.-]+\.html?', document):
+            raise EvidenceError('SEC_EARNINGS_FILING_INDEX_INVALID')
+        url=f'https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{document}'
+        try:
+            filing=_fetch(store,url,now,transport)
+            parser=_HTML();parser.feed(base64.b64decode(filing['raw_base64']).decode('utf-8-sig'))
+            links=[urljoin(url,href) for href,label in parser.links
+                if re.search(r'99[._-]?1|99\.1',href+' '+label,re.I) and _allowed(urljoin(url,href))]
+            if not links:raise EvidenceError('SEC_EARNINGS_EXHIBIT_NOT_FOUND')
+            release=_fetch(store,links[0],now,transport)
+            ev=_evidence(store,release,published_at=publication)
+            out['primary_evidence'].append(ev)
+            out['primary_financials']['latest_earnings_release']={
+                'published_at':publication,'evidence_refs':[ev['id']], 'source_url':ev['source_url'],
+                'tagged_financial_rows_not_yet_available':True,
+                'instruction':'Newer original earnings announcement; reconcile with older tagged facts. Never label its future guidance as reported results.'}
+        except Exception:
+            _gap(out['primary_gaps'],'SEC_NEWER_EARNINGS_RELEASE_UNAVAILABLE','latest_earnings_release',url)
+        break  # One latest announced quarter, at most two bounded document fetches.
+    if (moment.date() - datetime.fromisoformat(max(r['row']['end'] for r in selected)).date()).days > 200:
+        _gap(out['primary_gaps'], 'SEC_LATEST_PERIOD_STALE', symbol)
+
+
 def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transport=None):
     """Return public facts separately from native provider data and forecasts.
 
-    Only TSM, GOOG, GOOGL, CRCL and SOXX are implemented. ``now`` is the information cutoff;
+    Explicit issuer adapters are used. ``now`` is the information cutoff;
     fetching a newer source never changes its source date to that cutoff.
     """
     symbol = symbol_value(symbol)
     now = parse_time(now or utc_now()).isoformat()
     out = copy.deepcopy(fundamentals or {})
     out["symbol"] = symbol
-    if symbol not in {"TSM", "GOOG", "GOOGL", "CRCL", "SOXX"}:
+    if symbol not in {"TSM", "GOOG", "GOOGL", "CRCL", "SOXX", "QQQ", *SEC_ISSUERS}:
+        out['primary_gaps']=[{'code':'PRIMARY_ISSUER_ADAPTER_UNAVAILABLE','field':symbol,
+            'source':'official-primary','blocking':True}]
+        out['primary_refresh_after']=(parse_time(now)+timedelta(hours=6)).isoformat()
         return out
     out.update(primary_financials={"symbol": symbol, "facts": [], "instrument": {}}, primary_evidence=[], primary_gaps=[])
     out.pop("etf_valuation", None)
@@ -862,7 +1006,8 @@ def enrich_primary_fundamentals(store, symbol, fundamentals, *, now=None, transp
         import requests
         transport = requests.Session()
     try:
-        {"TSM": _tsm, "GOOG": _google, "GOOGL": _google, "CRCL": _circle, "SOXX": _soxx}[symbol](store, out, now, transport)
+        collector = _sec_equity if symbol in SEC_ISSUERS else {"TSM": _tsm, "GOOG": _google, "GOOGL": _google, "CRCL": _circle, "SOXX": _soxx, "QQQ": _qqq}[symbol]
+        collector(store, out, now, transport)
     except Exception as exc:
         _gap(out["primary_gaps"], str(exc) if isinstance(exc, EvidenceError) else "PRIMARY_SOURCE_UNAVAILABLE", symbol)
     out["primary_evidence"] = list({item["id"]: item for item in out["primary_evidence"]}.values())
