@@ -47,10 +47,11 @@ def review_abstentions(store,model,now,*,research_since=None):
                 or parse_time(plan['source_published_at'])<parse_time(research_since)):continue
         fundamental=store.get('fundamental_evidence',plan.get('fundamental_evidence_id','')) or {}
         data=fundamental.get('data') or {}
-        identity=[v for v in data.get('identity',[]) if isinstance(v,dict)
+        if not isinstance(data,dict) or not isinstance(data.get('identity'),list):continue
+        identity=[v for v in data['identity'] if isinstance(v,dict)
             and v.get('symbol')==plan['symbol']+'.US' and v.get('currency')=='USD']
         instrument=(data.get('primary_financials') or {}).get('instrument') or {}
-        if not identity or not _primary_verified(store,instrument):continue
+        if not identity or not isinstance(instrument,dict) or not _primary_verified(store,instrument):continue
         identity=[{k:v.get(k) for k in ('symbol','currency','name_en','exchange') if v.get(k) is not None} for v in identity]
         key=stable_id(CONTRACT,source['id'],plan['symbol'])
         if (store.get('research_abstention',key) or {}).get('terminal'):continue
@@ -84,6 +85,8 @@ def review_abstentions(store,model,now,*,research_since=None):
         except (ModelBudgetExceeded,UnknownModelOutcome) as error:
             result['deferred'].append({'symbol':plan['symbol'],'error':type(error).__name__});break
         except Exception as error:
+            if isinstance(error,RuntimeError) and 'worker is stopping' in str(error).lower():
+                result['deferred'].append({'symbol':plan['symbol'],'error':'RuntimeError','reason':'worker_stopping'});break
             store.put('research_abstention',key,{'terminal':True,'status':'review_error','error':type(error).__name__})
             result['errors'].append({'symbol':plan['symbol'],'error':type(error).__name__});continue
         accepted=(isinstance(review,dict) and review.get('accepted') is True and review.get('no_buy_reviewed') is True

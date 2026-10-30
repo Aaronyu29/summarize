@@ -61,9 +61,23 @@ class AbstentionTests(unittest.TestCase):
         self.assertEqual(len(self.s.items('research_abstention_input')),1)
         self.assertEqual(self.run_review(Reviewer())['approved'],1)
 
-    def test_concurrent_new_plan_and_tampered_identity_stay_unapproved(self):
+    def test_concurrent_new_plan_stays_unapproved(self):
         def changed():self.s.put('plan',self.p['id'],dict(self.p,revision=self.p['revision']+1))
         self.run_review(Reviewer(after=changed))
         self.assertIsNone(current_decision(self.s.get('plan',self.p['id'])))
+
+    def test_unverified_or_absent_identity_never_starts_review(self):
+        for identity in (None,[],1):
+            key='bad'+str(identity)
+            self.s.put('fundamental_evidence',key,{'data':{'identity':identity}},immutable=True)
+            self.s.put('plan',self.p['id'],dict(self.p,fundamental_evidence_id=key))
+            model=Reviewer();self.run_review(model);self.assertEqual(model.calls,[])
+
+    def test_graceful_stop_does_not_consume_or_seal_a_review_attempt(self):
+        class Stopped(Reviewer):
+            def run(self,*args,**kwargs):raise RuntimeError('Investment worker is stopping; no new paid call started')
+        result=self.run_review(Stopped());self.assertTrue(result['deferred'])
+        self.assertEqual(self.s.items('research_abstention'),[])
+        self.assertEqual(self.run_review(Reviewer())['approved'],1)
 
 if __name__=='__main__':unittest.main()
